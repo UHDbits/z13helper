@@ -49,7 +49,7 @@ impl Default for Config {
             last_profile_on_battery: "silent".into(),
             power_source_debounce_ms: 2000,
             show_hud: true,
-            fan_clamp_to_grid: true,
+            fan_clamp_to_grid: false,
             profiles: builtin_profiles(),
         }
     }
@@ -128,13 +128,19 @@ impl Config {
     }
 
     /// Ensure the three built-ins exist (re-seed if a user deleted them).
+    /// When a builtin is not applying a custom curve, refresh the preview
+    /// curve from that base's stock table so Silent/Balanced/Turbo differ.
     pub fn ensure_builtins(&mut self) {
         for builtin in builtin_profiles() {
             if !self.profiles.iter().any(|p| p.id == builtin.id) {
                 self.profiles.insert(0, builtin);
             }
         }
-        // Keep builtins first in Silent/Balanced/Turbo order.
+        for p in &mut self.profiles {
+            if p.builtin && !p.apply_fan_curve {
+                p.fan_curve = p.base.stock_fan_curve();
+            }
+        }
         self.profiles.sort_by_key(|p| match p.id.as_str() {
             "silent" => 0,
             "balanced" => 1,

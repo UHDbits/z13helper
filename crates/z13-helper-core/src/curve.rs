@@ -299,7 +299,7 @@ mod tests {
     fn to_wire_format() {
         let c = default_fan_curve();
         let s = to_wire(&c);
-        assert!(s.starts_with("48:2,53:22"));
+        assert!(s.starts_with("58:20,61:43"));
         assert_eq!(s.split(',').count(), 8);
     }
 }

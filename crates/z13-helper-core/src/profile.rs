@@ -25,6 +25,15 @@ impl Base {
         }
     }
 
+    /// Short label for the Power Profile dropdown (no PPD suffix).
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Quiet => "Quiet",
+            Self::Balanced => "Balanced",
+            Self::Performance => "Performance",
+        }
+    }
+
     pub fn ppd_label(self) -> &'static str {
         match self {
             Self::Quiet => "Quiet — PPD: power-saver",
@@ -33,7 +42,6 @@ impl Base {
         }
     }
 
-    /// Accent color hex for the base mode (G-Helper palette).
     pub fn accent(self) -> &'static str {
         match self {
             Self::Quiet => "#06B48A",
@@ -47,6 +55,50 @@ impl Base {
             Self::Quiet => (40, 55, 55),
             Self::Balanced => (52, 71, 70),
             Self::Performance => (70, 86, 86),
+        }
+    }
+
+    /// Default fan curves adapted from G-Helper's CPU presets for each BIOS
+    /// base. Firmware auto mode does not expose distinct readable curves via
+    /// sysfs (points stay unchanged while `pwm_enable=2`), so these are the
+    /// best portable defaults for Silent / Balanced / Turbo.
+    ///
+    /// G-Helper stores fan levels as 0–100; we convert to PWM 0–255.
+    pub fn stock_fan_curve(self) -> [[i32; 2]; 8] {
+        match self {
+            // G-Helper Silent: 30/49/59/66/71/80/90/100 °C × 0/0/3/12/20/28/34/41 %
+            Self::Quiet => [
+                [30, 0],
+                [49, 0],
+                [59, 7],
+                [66, 30],
+                [71, 51],
+                [80, 71],
+                [90, 86],
+                [100, 104],
+            ],
+            // G-Helper Balanced: 58/61/64/68/72/77/81/98 °C × 8/17/22/26/34/41/48/69 %
+            Self::Balanced => [
+                [58, 20],
+                [61, 43],
+                [64, 56],
+                [68, 66],
+                [72, 86],
+                [77, 104],
+                [81, 122],
+                [98, 175],
+            ],
+            // G-Helper Turbo: 30/63/68/72/76/80/84/98 °C × 17/26/34/41/52/67/81/90 %
+            Self::Performance => [
+                [30, 43],
+                [63, 66],
+                [68, 86],
+                [72, 104],
+                [76, 132],
+                [80, 170],
+                [84, 206],
+                [98, 229],
+            ],
         }
     }
 
@@ -89,13 +141,12 @@ impl Profile {
             pl2_sppt: pl2,
             fppt: pl3,
             apply_fan_curve: false,
-            fan_curve: default_fan_curve(),
+            fan_curve: base.stock_fan_curve(),
             apply_undervolt: false,
             cpu_co: 0,
         }
     }
 
-    /// Reset override flags and PPT/curve/UV to the base's stock values.
     pub fn factory_defaults(&mut self) {
         let (pl1, pl2, pl3) = self.base.stock_ppt();
         self.apply_power_limits = false;
@@ -103,21 +154,13 @@ impl Profile {
         self.pl2_sppt = pl2;
         self.fppt = pl3;
         self.apply_fan_curve = false;
-        self.fan_curve = default_fan_curve();
+        self.fan_curve = self.base.stock_fan_curve();
         self.apply_undervolt = false;
         self.cpu_co = 0;
     }
 }
 
+/// Generic example curve (z13ctl docs). Prefer [`Base::stock_fan_curve`].
 pub fn default_fan_curve() -> [[i32; 2]; 8] {
-    [
-        [48, 2],
-        [53, 22],
-        [57, 30],
-        [60, 43],
-        [63, 56],
-        [65, 68],
-        [70, 89],
-        [76, 102],
-    ]
+    Base::Balanced.stock_fan_curve()
 }

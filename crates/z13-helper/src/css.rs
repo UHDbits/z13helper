@@ -8,7 +8,12 @@ const STYLE: &str = r#"
 .mode-button.custom { color: #FF8000; }
 .mode-button.active {
   border-color: currentColor;
-  background-image: linear-gradient(to bottom, alpha(currentColor, 0.18), transparent 40%);
+  background-image: linear-gradient(to bottom, alpha(currentColor, 0.22), transparent 45%);
+  background-color: alpha(currentColor, 0.10);
+}
+switch {
+  min-width: 48px;
+  min-height: 24px;
 }
 .warning { color: #FF8000; }
 .hud {
