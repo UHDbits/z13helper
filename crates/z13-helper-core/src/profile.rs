@@ -33,6 +33,15 @@ impl Base {
         }
     }
 
+    /// Accent color hex for the base mode (G-Helper palette).
+    pub fn accent(self) -> &'static str {
+        match self {
+            Self::Quiet => "#06B48A",
+            Self::Balanced => "#3AAEEF",
+            Self::Performance => "#FF2020",
+        }
+    }
+
     pub fn stock_ppt(self) -> (u32, u32, u32) {
         match self {
             Self::Quiet => (40, 55, 55),
@@ -51,7 +60,7 @@ impl Base {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Profile {
     pub id: String,
     pub name: String,
@@ -84,6 +93,19 @@ impl Profile {
             apply_undervolt: false,
             cpu_co: 0,
         }
+    }
+
+    /// Reset override flags and PPT/curve/UV to the base's stock values.
+    pub fn factory_defaults(&mut self) {
+        let (pl1, pl2, pl3) = self.base.stock_ppt();
+        self.apply_power_limits = false;
+        self.pl1_spl = pl1;
+        self.pl2_sppt = pl2;
+        self.fppt = pl3;
+        self.apply_fan_curve = false;
+        self.fan_curve = default_fan_curve();
+        self.apply_undervolt = false;
+        self.cpu_co = 0;
     }
 }
 
