@@ -1,0 +1,28 @@
+[package]
+name = "z13-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "G-Helper-style GTK4 GUI for z13ctl on the ROG Flow Z13"
+
+[[bin]]
+name = "z13-helper"
+path = "src/main.rs"
+
+[dependencies]
+z13ctl-client = { path = "../z13ctl-client" }
+z13-helper-core = { path = "../z13-helper-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+gtk4 = { version = "0.11.4", features = ["v4_14"] }
+libadwaita = { version = "0.9.2", features = ["v1_5"] }
+glib = "0.22.8"
+gio = "0.22.0"
+cairo-rs = "0.22.0"
+gdk4 = "0.11.4"
+gtk4-layer-shell = "0.8.0"
+gdk4-x11 = "0.11.4"
+x11rb = { version = "0.14.0", features = ["allow-unsafe-code"] }
+zbus = "5.18.0"
+async-channel = "2.3.1"
