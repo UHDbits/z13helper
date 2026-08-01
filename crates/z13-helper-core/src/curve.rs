@@ -157,8 +157,8 @@ pub fn enforce_curve(curve: &mut Curve, idx: usize, min_pwm: i32, clamp_to_grid:
     }
 
     // Final pass: re-clamp everything and fix any residual collisions.
-    for i in 0..POINT_COUNT {
-        clamp_point(&mut curve[i], min_pwm);
+    for p in curve.iter_mut() {
+        clamp_point(p, min_pwm);
     }
     for i in 1..POINT_COUNT {
         if curve[i][0] <= curve[i - 1][0] {
@@ -235,16 +235,8 @@ mod tests {
         c[3][0] = 70;
         enforce_curve(&mut c, 3, 0, false);
         for i in 1..POINT_COUNT {
-            assert!(
-                c[i][0] > c[i - 1][0],
-                "temp not increasing at {i}: {:?}",
-                c
-            );
-            assert!(
-                c[i][1] >= c[i - 1][1],
-                "pwm decreasing at {i}: {:?}",
-                c
-            );
+            assert!(c[i][0] > c[i - 1][0], "temp not increasing at {i}: {:?}", c);
+            assert!(c[i][1] >= c[i - 1][1], "pwm decreasing at {i}: {:?}", c);
         }
     }
 
