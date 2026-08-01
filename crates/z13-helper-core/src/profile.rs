@@ -112,6 +112,14 @@ impl Base {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FanControlMode {
+    #[default]
+    Firmware,
+    Direct,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Profile {
     pub id: String,
@@ -123,6 +131,8 @@ pub struct Profile {
     pub pl2_sppt: u32,
     pub fppt: u32,
     pub apply_fan_curve: bool,
+    #[serde(default)]
+    pub fan_control_mode: FanControlMode,
     pub fan_curve: [[i32; 2]; 8],
     pub apply_undervolt: bool,
     pub cpu_co: i32,
@@ -141,19 +151,31 @@ impl Profile {
             pl2_sppt: pl2,
             fppt: pl3,
             apply_fan_curve: false,
+            fan_control_mode: FanControlMode::Firmware,
             fan_curve: base.stock_fan_curve(),
             apply_undervolt: false,
             cpu_co: 0,
         }
     }
 
+    /// Restore stock PPT, fan curve, and undervolt for this profile's base.
+    /// Built-ins also restore their original Silent/Balanced/Turbo base.
     pub fn factory_defaults(&mut self) {
+        if self.builtin {
+            let base = match self.id.as_str() {
+                "silent" => Base::Quiet,
+                "turbo" => Base::Performance,
+                _ => Base::Balanced,
+            };
+            self.base = base;
+        }
         let (pl1, pl2, pl3) = self.base.stock_ppt();
         self.apply_power_limits = false;
         self.pl1_spl = pl1;
         self.pl2_sppt = pl2;
         self.fppt = pl3;
         self.apply_fan_curve = false;
+        self.fan_control_mode = FanControlMode::Firmware;
         self.fan_curve = self.base.stock_fan_curve();
         self.apply_undervolt = false;
         self.cpu_co = 0;
@@ -163,4 +185,25 @@ impl Profile {
 /// Generic example curve (z13ctl docs). Prefer [`Base::stock_fan_curve`].
 pub fn default_fan_curve() -> [[i32; 2]; 8] {
     Base::Balanced.stock_fan_curve()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn factory_defaults_restores_builtin_stock() {
+        let mut p = Profile::builtin("silent", "Silent", Base::Quiet);
+        p.base = Base::Performance;
+        p.apply_power_limits = true;
+        p.pl1_spl = 10;
+        p.apply_fan_curve = true;
+        p.fan_control_mode = FanControlMode::Direct;
+        p.fan_curve[0] = [1, 2];
+        p.apply_undervolt = true;
+        p.cpu_co = -20;
+        p.factory_defaults();
+        let stock = Profile::builtin("silent", "Silent", Base::Quiet);
+        assert_eq!(p, stock);
+    }
 }

@@ -5,7 +5,7 @@ use std::rc::Rc;
 use gtk4::prelude::*;
 use libadwaita as adw;
 use z13_helper_core::Config;
-use z13ctl_client::Client;
+use z13ctl_client::{Client, ManualFanClient};
 
 use crate::{main_window, subscribe, worker};
 
@@ -16,6 +16,7 @@ pub struct AppState {
     pub config: RefCell<Config>,
     pub config_path: PathBuf,
     pub client: Client,
+    pub manual_fan: ManualFanClient,
     pub applying: Cell<bool>,
     pub on_battery: Cell<bool>,
     pub main_window: RefCell<Option<adw::ApplicationWindow>>,
@@ -34,6 +35,7 @@ impl AppState {
             config: RefCell::new(config),
             config_path,
             client: Client::new(),
+            manual_fan: ManualFanClient::new(),
             applying: Cell::new(false),
             on_battery: Cell::new(false),
             main_window: RefCell::new(None),
@@ -55,6 +57,7 @@ impl AppState {
         }
         let profile = self.config.borrow().active().cloned();
         let client = self.client.clone();
+        let manual_fan = self.manual_fan.clone();
         let done = self.clone();
         let on_battery = self.on_battery.get();
         worker::blocking(
@@ -65,7 +68,7 @@ impl AppState {
                     .unwrap_or(false);
                 profile.map(|profile| {
                     z13_helper_core::apply_profile(
-                        &z13_helper_core::ClientDaemon(&client),
+                        &z13_helper_core::ClientDaemon::new(&client, &manual_fan),
                         &profile,
                         available,
                     )

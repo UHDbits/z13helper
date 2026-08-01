@@ -7,7 +7,7 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use z13_helper_core::apply::{apply_profile, ClientDaemon};
-use z13_helper_core::{Base, Profile};
+use z13_helper_core::{Base, FanControlMode, Profile};
 
 use crate::app::AppState;
 use crate::curve_editor::CurveEditor;
@@ -74,7 +74,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let cpu = build_cpu_page(state, &editor, &editing_id);
     let advanced = build_advanced_page(state, &editing_id);
     stack.add_titled(&cpu.0, Some("cpu"), "CPU");
-    stack.add_titled(&advanced, Some("advanced"), "Advanced");
+    stack.add_titled(&advanced.0, Some("advanced"), "Advanced");
 
     left.append(&switcher);
     left.append(&stack);
@@ -112,6 +112,12 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     sel_row.append(&minus);
     right.append(&sel_row);
 
+    let restore = gtk::Button::with_label("Restore Factory Defaults");
+    restore.set_tooltip_text(Some(
+        "Reset Silent, Balanced, Turbo (or the selected custom) to stock power, fans, and undervolt.",
+    ));
+    right.append(&restore);
+
     let clamp = gtk::CheckButton::with_label("Clamp to Grid");
     clamp.set_active(state.config.borrow().fan_clamp_to_grid);
     let editor_clamp = editor.clone();
@@ -128,6 +134,75 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     fan_toggle.set_active(profile.apply_fan_curve);
     editor.set_muted(!fan_toggle.is_active());
     right.append(&fan_toggle);
+
+    let direct_toggle = gtk::CheckButton::with_label("Direct EC control (experimental)");
+    direct_toggle.set_active(profile.fan_control_mode == FanControlMode::Direct);
+    direct_toggle.set_sensitive(false);
+    direct_toggle.set_tooltip_text(Some(
+        "Requires the privileged z13-helper fan companion service.",
+    ));
+    right.append(&direct_toggle);
+
+    let direct_warning = gtk::Label::new(Some(
+        "Direct mode bypasses the firmware fan-curve algorithm. The companion returns control \
+         to firmware on sensor or EC errors.",
+    ));
+    direct_warning.add_css_class("warning");
+    direct_warning.set_wrap(true);
+    direct_warning.set_xalign(0.0);
+    direct_warning.set_visible(direct_toggle.is_active());
+    right.append(&direct_warning);
+
+    let direct_status = gtk::Label::new(Some("Direct fan service: checking…"));
+    direct_status.add_css_class("dim-label");
+    direct_status.set_xalign(0.0);
+    right.append(&direct_status);
+
+    let manual_probe = state.manual_fan.clone();
+    let direct_probe = direct_toggle.clone();
+    let status_probe = direct_status.clone();
+    worker::blocking(
+        move || manual_probe.probe(),
+        move |result| match result {
+            Ok(status) if status.available => {
+                direct_probe.set_sensitive(true);
+                let target = status
+                    .target_pwm
+                    .map(|pwm| format!("{}%", (pwm * 100 + 127) / 255))
+                    .unwrap_or_else(|| "—".into());
+                let rpms = if status.fan_rpm.is_empty() {
+                    "—".into()
+                } else {
+                    status
+                        .fan_rpm
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                };
+                status_probe.set_label(&format!(
+                    "Direct fan service: {} · target {target} · RPM {rpms}",
+                    if status.active { "active" } else { "ready" }
+                ));
+            }
+            Ok(status) => {
+                direct_probe.set_sensitive(false);
+                status_probe.set_label(&format!(
+                    "Direct fan service unavailable: {}",
+                    status
+                        .fail_safe
+                        .unwrap_or_else(|| "hardware probe rejected".into())
+                ));
+            }
+            Err(error) => {
+                direct_probe.set_sensitive(false);
+                status_probe.set_label(&format!(
+                    "Direct fan service unavailable: {}",
+                    z13ctl_client::ManualFanClient::describe_error(&error)
+                ));
+            }
+        },
+    );
 
     let chart_label = gtk::Label::new(Some("Fan Curve (both fans) — % vs °C"));
     chart_label.add_css_class("dim-label");
@@ -146,6 +221,21 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         }
     });
 
+    let state_direct = state.clone();
+    let editing_direct = editing_id.clone();
+    let warning_direct = direct_warning.clone();
+    direct_toggle.connect_toggled(move |toggle| {
+        warning_direct.set_visible(toggle.is_active());
+        let id = editing_direct.borrow().clone();
+        if let Some(profile) = state_direct.config.borrow_mut().find_mut(&id) {
+            profile.fan_control_mode = if toggle.is_active() {
+                FanControlMode::Direct
+            } else {
+                FanControlMode::Firmware
+            };
+        }
+    });
+
     // Persist curve edits into the profile currently selected in this window.
     let state_curve = state.clone();
     let editing_curve = editing_id.clone();
@@ -156,17 +246,35 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         }
     });
 
-    // Switching profiles in the dropdown: save previous, load next into editors.
-    let state_sel = state.clone();
-    let editor_sel = editor.clone();
-    let editing_sel = editing_id.clone();
-    let fan_toggle_sel = fan_toggle.clone();
     let base_drop = cpu.1.clone();
     let spl = cpu.2.clone();
     let sppt = cpu.3.clone();
     let fppt = cpu.4.clone();
     let apply_power = cpu.5.clone();
+    let uv_scale = advanced.1.clone();
+    let apply_uv = advanced.2.clone();
     let loading = Rc::new(Cell::new(false));
+    let editors = Rc::new(ProfileEditors {
+        editor: editor.clone(),
+        fan_toggle: fan_toggle.clone(),
+        direct_toggle: direct_toggle.clone(),
+        direct_warning: direct_warning.clone(),
+        base_drop: base_drop.clone(),
+        spl: spl.clone(),
+        sppt: sppt.clone(),
+        fppt: fppt.clone(),
+        apply_power: apply_power.clone(),
+        uv: uv_scale.clone(),
+        apply_uv: apply_uv.clone(),
+        loading: loading.clone(),
+    });
+
+    // Switching profiles in the dropdown: save previous, load next into editors.
+    let state_sel = state.clone();
+    let editor_sel = editor.clone();
+    let editing_sel = editing_id.clone();
+    let fan_toggle_sel = fan_toggle.clone();
+    let editors_sel = editors.clone();
     let loading_sel = loading.clone();
     selector.connect_selected_notify(move |drop| {
         if loading_sel.get() {
@@ -188,22 +296,35 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         }
         *editing_sel.borrow_mut() = next.id.clone();
         state_sel.config.borrow_mut().active_profile = next.id.clone();
-        editor_sel.set_curve(next.fan_curve);
-        editor_sel.set_muted(!next.apply_fan_curve);
-        fan_toggle_sel.set_active(next.apply_fan_curve);
-        loading_sel.set(true);
-        base_drop.set_selected(match next.base {
-            Base::Quiet => 0,
-            Base::Balanced => 1,
-            Base::Performance => 2,
-        });
-        spl.set_value(next.pl1_spl as f64);
-        sppt.set_value(next.pl2_sppt as f64);
-        fppt.set_value(next.fppt as f64);
-        apply_power.set_active(next.apply_power_limits);
-        loading_sel.set(false);
+        editors_sel.load(next);
         state_sel.apply_active(false);
     });
+
+    let state_def = state.clone();
+    let editing_def = editing_id.clone();
+    let editors_def = editors.clone();
+    let defaults_adv = advanced.3.clone();
+    let restore_factory = Rc::new(move || {
+        let id = editing_def.borrow().clone();
+        let restored = {
+            let mut cfg = state_def.config.borrow_mut();
+            if let Some(p) = cfg.find_mut(&id) {
+                p.factory_defaults();
+                Some(p.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(p) = restored {
+            editors_def.load(&p);
+            state_def.save_config();
+            state_def.apply_active(false);
+        }
+    });
+    let restore_click = restore_factory.clone();
+    restore.connect_clicked(move |_| restore_click());
+    let restore_adv = restore_factory.clone();
+    defaults_adv.connect_clicked(move |_| restore_adv());
 
     let state_add = state.clone();
     let selector_add = selector.clone();
@@ -397,6 +518,7 @@ fn build_cpu_page(
         let button = button.clone();
         let profile = state_apply.config.borrow().active().cloned();
         let client = state_apply.client.clone();
+        let manual_fan = state_apply.manual_fan.clone();
         let state_done = state_apply.clone();
         worker::blocking(
             move || {
@@ -404,7 +526,8 @@ fn build_cpu_page(
                     .get_state()
                     .map(|s| s.undervolt_available)
                     .unwrap_or(false);
-                profile.map(|p| apply_profile(&ClientDaemon(&client), &p, available))
+                profile
+                    .map(|p| apply_profile(&ClientDaemon::new(&client, &manual_fan), &p, available))
             },
             move |result| {
                 state_done.applying.set(false);
@@ -424,7 +547,10 @@ fn build_cpu_page(
     (page, base_drop, spl.1, sppt.1, fppt.1, apply_power)
 }
 
-fn build_advanced_page(state: &Rc<AppState>, editing_id: &Rc<RefCell<String>>) -> gtk::Box {
+fn build_advanced_page(
+    state: &Rc<AppState>,
+    editing_id: &Rc<RefCell<String>>,
+) -> (gtk::Box, gtk::Scale, gtk::CheckButton, gtk::Button) {
     let page = gtk::Box::new(gtk::Orientation::Vertical, 10);
     page.set_margin_top(12);
     page.set_margin_bottom(12);
@@ -499,17 +625,11 @@ fn build_advanced_page(state: &Rc<AppState>, editing_id: &Rc<RefCell<String>>) -
         },
     );
 
-    let defaults = gtk::Button::with_label("Factory Defaults");
+    let defaults = gtk::Button::with_label("Restore Factory Defaults");
+    defaults.set_tooltip_text(Some(
+        "Same as the button beside the fan curve — resets stock Silent/Balanced/Turbo settings.",
+    ));
     page.append(&defaults);
-    let state_def = state.clone();
-    let editing = editing_id.clone();
-    defaults.connect_clicked(move |_| {
-        let id = editing.borrow().clone();
-        if let Some(p) = state_def.config.borrow_mut().find_mut(&id) {
-            p.factory_defaults();
-        }
-        state_def.save_config();
-    });
 
     let state_uv = state.clone();
     let apply_uv_c = apply_uv.clone();
@@ -530,7 +650,47 @@ fn build_advanced_page(state: &Rc<AppState>, editing_id: &Rc<RefCell<String>>) -
         }
     });
 
-    page
+    (page, uv, apply_uv, defaults)
+}
+
+struct ProfileEditors {
+    editor: CurveEditor,
+    fan_toggle: gtk::CheckButton,
+    direct_toggle: gtk::CheckButton,
+    direct_warning: gtk::Label,
+    base_drop: gtk::DropDown,
+    spl: gtk::Scale,
+    sppt: gtk::Scale,
+    fppt: gtk::Scale,
+    apply_power: gtk::CheckButton,
+    uv: gtk::Scale,
+    apply_uv: gtk::CheckButton,
+    loading: Rc<Cell<bool>>,
+}
+
+impl ProfileEditors {
+    fn load(&self, profile: &Profile) {
+        self.editor.set_curve(profile.fan_curve);
+        self.editor.set_muted(!profile.apply_fan_curve);
+        self.fan_toggle.set_active(profile.apply_fan_curve);
+        self.direct_toggle
+            .set_active(profile.fan_control_mode == FanControlMode::Direct);
+        self.direct_warning
+            .set_visible(profile.fan_control_mode == FanControlMode::Direct);
+        self.loading.set(true);
+        self.base_drop.set_selected(match profile.base {
+            Base::Quiet => 0,
+            Base::Balanced => 1,
+            Base::Performance => 2,
+        });
+        self.spl.set_value(profile.pl1_spl as f64);
+        self.sppt.set_value(profile.pl2_sppt as f64);
+        self.fppt.set_value(profile.fppt as f64);
+        self.apply_power.set_active(profile.apply_power_limits);
+        self.uv.set_value(profile.cpu_co as f64);
+        self.apply_uv.set_active(profile.apply_undervolt);
+        self.loading.set(false);
+    }
 }
 
 fn install_ordering(pl1: &gtk::Scale, pl2: &gtk::Scale, pl3: &gtk::Scale) {

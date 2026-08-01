@@ -1,9 +1,11 @@
 # z13-helper
 
 G-Helper-style GTK4/libadwaita desktop GUI for controlling an **ASUS ROG Flow Z13
-(2025, GZ302EA)** on Linux. It is a frontend for **[z13ctl](https://github.com/dahui/z13ctl)** —
-all hardware access goes through the z13ctl daemon socket. Never write sysfs,
-never open hidraw, never shell out to the `z13ctl` binary from this app.
+(2025, GZ302EA)** on Linux. It is a frontend for **[z13ctl](https://github.com/dahui/z13ctl)**.
+Normal hardware access goes through the z13ctl daemon socket. Optional direct
+fan control uses the separately installed, narrowly privileged
+`z13-helper-fan-service`; the GTK process never accesses sysfs, hidraw, or raw
+I/O ports and never shells out to `z13ctl`.
 
 This project **replaces z13gui** for desktop use. Disable `z13gui.service` so
 both apps do not fight over the Armoury Crate `gui-toggle` event:
@@ -26,6 +28,10 @@ systemctl --user disable --now z13gui.service
    reads `undervolt_available` from the daemon and never probes the SMU itself.
 5. Optional: **power-profiles-daemon**. z13ctl maps stock bases to PPD profiles;
    if PPD is missing, the write is silently ignored.
+6. Optional experimental direct fan control: install and enable the system
+   companion with `sudo make install-fan-service`, then add your user to the
+   `z13-helper` group and re-login. Firmware fan curves continue to work when
+   it is not installed.
 
 ## Build & install
 
@@ -57,6 +63,11 @@ out of the box the app behaves like plain z13ctl.
 2. TDP / PPT (if enabled) — **before** the fan curve.
 3. Fan curve (if enabled).
 4. Undervolt (if enabled and available).
+
+Direct EC fan control is an explicit experimental alternative for step 3. It
+uses the same saved curve but interpolates and applies duty through a privileged
+companion instead of asking firmware to run the curve. Do not issue independent
+`z13ctl profile` commands while direct mode is active.
 
 ### Why base and PPD are one control
 

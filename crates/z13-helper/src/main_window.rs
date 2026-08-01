@@ -54,21 +54,13 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     mode_header.append(&telemetry);
     content.append(&mode_header);
 
-    let mode_scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .propagate_natural_height(true)
-        .max_content_height(160)
-        .build();
-    let mode_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    mode_scroll.set_child(Some(&mode_box));
-
+    // Built-in row always visible; only custom profiles scroll if they overflow.
     let mode_grid = gtk::Grid::builder()
         .column_spacing(8)
         .row_spacing(8)
         .column_homogeneous(true)
         .build();
-    mode_box.append(&mode_grid);
+    content.append(&mode_grid);
 
     let mode_buttons: Rc<RefCell<Vec<(String, gtk::Button)>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -106,34 +98,50 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     fans.connect_clicked(move |_| fans_window::present(&state_fans, &parent));
     mode_grid.attach(&fans, 3, 0, 1, 1);
 
-    let custom_box = gtk::FlowBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .homogeneous(true)
-        .max_children_per_line(4)
-        .min_children_per_line(2)
-        .column_spacing(8)
-        .row_spacing(8)
-        .build();
-    for profile in state.config.borrow().profiles.iter().filter(|p| !p.builtin) {
-        let button = gtk::Button::with_label(&profile.name);
-        button.add_css_class("mode-button");
-        button.add_css_class("custom");
-        let id = profile.id.clone();
-        let state_click = state.clone();
-        let label = mode_label_w.clone();
-        let buttons = mode_buttons.clone();
-        button.connect_clicked(move |_| {
-            select_profile(&state_click, &id);
-            label.set_label(&current_label(&state_click));
-            refresh_active_buttons(&buttons, &state_click.config.borrow().active_profile);
-        });
-        mode_buttons
-            .borrow_mut()
-            .push((profile.id.clone(), button.clone()));
-        custom_box.append(&button);
+    let custom_profiles: Vec<_> = state
+        .config
+        .borrow()
+        .profiles
+        .iter()
+        .filter(|p| !p.builtin)
+        .cloned()
+        .collect();
+    if !custom_profiles.is_empty() {
+        let custom_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .propagate_natural_height(true)
+            .max_content_height(120)
+            .build();
+        let custom_box = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .homogeneous(true)
+            .max_children_per_line(4)
+            .min_children_per_line(2)
+            .column_spacing(8)
+            .row_spacing(8)
+            .build();
+        for profile in custom_profiles {
+            let button = gtk::Button::with_label(&profile.name);
+            button.add_css_class("mode-button");
+            button.add_css_class("custom");
+            let id = profile.id.clone();
+            let state_click = state.clone();
+            let label = mode_label_w.clone();
+            let buttons = mode_buttons.clone();
+            button.connect_clicked(move |_| {
+                select_profile(&state_click, &id);
+                label.set_label(&current_label(&state_click));
+                refresh_active_buttons(&buttons, &state_click.config.borrow().active_profile);
+            });
+            mode_buttons
+                .borrow_mut()
+                .push((profile.id.clone(), button.clone()));
+            custom_box.append(&button);
+        }
+        custom_scroll.set_child(Some(&custom_box));
+        content.append(&custom_scroll);
     }
-    mode_box.append(&custom_box);
-    content.append(&mode_scroll);
     refresh_active_buttons(&mode_buttons, &state.config.borrow().active_profile);
 
     // --- Display ---

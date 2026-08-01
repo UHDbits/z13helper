@@ -1,14 +1,27 @@
 # Architecture
 
-z13-helper is a three-crate Cargo workspace:
+z13-helper is a four-crate Cargo workspace:
 
 | Crate | Role |
 |---|---|
 | `z13ctl-client` | NDJSON Unix-socket client for the z13ctl daemon |
 | `z13-helper-core` | Pure logic: profiles, apply sequencing, curve math, config, debounce |
 | `z13-helper` | Thin GTK4 / libadwaita UI |
+| `z13-helper-fan-service` | Root system companion for opt-in direct EC fan control |
 
 `cargo test` covers the first two; the GTK layer is exercised manually.
+
+## Direct fan companion
+
+The optional `z13-helper-fan-service` is the only component allowed to request
+`CAP_SYS_RAWIO`. It exposes a narrow NDJSON Unix socket and only accesses the
+ASUS EC fan mailbox registers. The GTK app reaches it through
+`z13ctl-client::ManualFanClient`; it never opens raw ports itself.
+
+The service owns temperature interpolation and fail-safes. It returns the EC to
+automatic mode on sensor/transaction errors, shutdown, and suspend. It starts
+in automatic mode after every boot or crash. z13ctl remains authoritative for
+profiles, TDP, firmware fan curves, and every other hardware feature.
 
 ## Threading
 
@@ -16,7 +29,7 @@ Never call the daemon from the GTK thread (commands have a 10 s deadline).
 Pattern:
 
 1. Snapshot widget values on the UI thread.
-2. `worker::blocking` runs the socket I/O on a std thread.
+2. `worker::blocking` runs z13ctl and companion socket I/O on a std thread.
 3. The result is delivered back on the GLib main context via `async_channel`.
 
 An `applying` in-flight guard serialises profile applies. Telemetry is a 1 Hz

@@ -7,14 +7,16 @@
 //! 4. Undervolt (if apply_undervolt && available)
 
 use crate::curve::{self, CurveError};
-use crate::profile::{Base, Profile};
+use crate::profile::{Base, FanControlMode, Profile};
 use z13ctl_client::DaemonError;
 
 /// Hardware operations needed by the apply algorithm.
 pub trait Daemon {
     fn profile_set(&self, base: Base) -> Result<(), DaemonError>;
+    fn manual_fan_release(&self) -> Result<(), DaemonError>;
     fn tdp_set(&self, pl1: u32, pl2: u32, pl3: u32, force: bool) -> Result<(), DaemonError>;
     fn fan_curve_set(&self, curve: &[[i32; 2]; 8]) -> Result<(), DaemonError>;
+    fn manual_fan_set(&self, curve: &[[i32; 2]; 8]) -> Result<(), DaemonError>;
     fn undervolt_set(&self, cpu_co: i32) -> Result<(), DaemonError>;
 }
 
@@ -28,6 +30,9 @@ pub fn apply_profile(
 ) -> Result<(), DaemonError> {
     // 1. Unconditional stock base — clears prior overrides and sets PPD.
     daemon.profile_set(profile.base)?;
+    // Direct EC control is outside z13ctl. Release any outgoing direct mode
+    // after the stock base succeeds, before power/fan overrides are applied.
+    daemon.manual_fan_release()?;
 
     // Effective PL1 for fan-floor checks: custom if applying, else stock.
     let effective_pl1 = if profile.apply_power_limits {
@@ -52,7 +57,10 @@ pub fn apply_profile(
                 curve::TDP_MAX_SAFE
             )));
         }
-        daemon.fan_curve_set(&profile.fan_curve)?;
+        match profile.fan_control_mode {
+            FanControlMode::Firmware => daemon.fan_curve_set(&profile.fan_curve)?,
+            FanControlMode::Direct => daemon.manual_fan_set(&profile.fan_curve)?,
+        }
     }
 
     // 4. Undervolt (conditional on availability).
@@ -63,25 +71,64 @@ pub fn apply_profile(
     Ok(())
 }
 
+fn companion_apply_error(error: DaemonError) -> DaemonError {
+    match error {
+        DaemonError::NotRunning | DaemonError::PermissionDenied | DaemonError::Timeout => {
+            DaemonError::Rejected(z13ctl_client::ManualFanClient::describe_error(&error))
+        }
+        other => other,
+    }
+}
+
 /// Adapter that implements [`Daemon`] for [`z13ctl_client::Client`].
-pub struct ClientDaemon<'a>(pub &'a z13ctl_client::Client);
+pub struct ClientDaemon<'a> {
+    pub daemon: &'a z13ctl_client::Client,
+    pub manual_fan: &'a z13ctl_client::ManualFanClient,
+}
+
+impl<'a> ClientDaemon<'a> {
+    pub fn new(
+        daemon: &'a z13ctl_client::Client,
+        manual_fan: &'a z13ctl_client::ManualFanClient,
+    ) -> Self {
+        Self { daemon, manual_fan }
+    }
+}
 
 impl Daemon for ClientDaemon<'_> {
     fn profile_set(&self, base: Base) -> Result<(), DaemonError> {
-        self.0.profile_set(base.as_str())
+        self.daemon.profile_set(base.as_str())
+    }
+
+    fn manual_fan_release(&self) -> Result<(), DaemonError> {
+        match self.manual_fan.release() {
+            // Firmware mode must remain usable when the optional companion is
+            // not installed. A running companion still must acknowledge release.
+            Err(DaemonError::NotRunning) => Ok(()),
+            Err(error) => Err(companion_apply_error(error)),
+            Ok(()) => Ok(()),
+        }
     }
 
     fn tdp_set(&self, pl1: u32, pl2: u32, pl3: u32, force: bool) -> Result<(), DaemonError> {
         // `set` is mandatory even when pl1/pl2/pl3 are supplied.
-        self.0.tdp_set(pl1, Some(pl1), Some(pl2), Some(pl3), force)
+        self.daemon
+            .tdp_set(pl1, Some(pl1), Some(pl2), Some(pl3), force)
     }
 
     fn fan_curve_set(&self, curve: &[[i32; 2]; 8]) -> Result<(), DaemonError> {
-        self.0.fan_curve_set(curve)
+        self.daemon.fan_curve_set(curve)
+    }
+
+    fn manual_fan_set(&self, curve: &[[i32; 2]; 8]) -> Result<(), DaemonError> {
+        self.manual_fan
+            .enable(curve)
+            .map(|_| ())
+            .map_err(companion_apply_error)
     }
 
     fn undervolt_set(&self, cpu_co: i32) -> Result<(), DaemonError> {
-        self.0.undervolt_set(cpu_co)
+        self.daemon.undervolt_set(cpu_co)
     }
 }
 
@@ -104,6 +151,11 @@ mod tests {
             self.check_fail("profile_set")
         }
 
+        fn manual_fan_release(&self) -> Result<(), DaemonError> {
+            self.calls.borrow_mut().push("manual_fan_release".into());
+            self.check_fail("manual_fan_release")
+        }
+
         fn tdp_set(&self, pl1: u32, pl2: u32, pl3: u32, force: bool) -> Result<(), DaemonError> {
             self.calls
                 .borrow_mut()
@@ -114,6 +166,11 @@ mod tests {
         fn fan_curve_set(&self, _curve: &[[i32; 2]; 8]) -> Result<(), DaemonError> {
             self.calls.borrow_mut().push("fan_curve_set".into());
             self.check_fail("fan_curve_set")
+        }
+
+        fn manual_fan_set(&self, _curve: &[[i32; 2]; 8]) -> Result<(), DaemonError> {
+            self.calls.borrow_mut().push("manual_fan_set".into());
+            self.check_fail("manual_fan_set")
         }
 
         fn undervolt_set(&self, cpu_co: i32) -> Result<(), DaemonError> {
@@ -155,6 +212,7 @@ mod tests {
             *d.calls.borrow(),
             vec![
                 "profile_set:balanced".to_string(),
+                "manual_fan_release".to_string(),
                 "tdp_set:60:70:70:force=false".to_string(),
                 "fan_curve_set".to_string(),
                 "undervolt_set:-20".to_string(),
@@ -167,7 +225,13 @@ mod tests {
         let d = RecordingDaemon::default();
         let p = Profile::builtin("balanced", "Balanced", Base::Balanced);
         apply_profile(&d, &p, false).unwrap();
-        assert_eq!(*d.calls.borrow(), vec!["profile_set:balanced".to_string()]);
+        assert_eq!(
+            *d.calls.borrow(),
+            vec![
+                "profile_set:balanced".to_string(),
+                "manual_fan_release".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -182,7 +246,7 @@ mod tests {
             pt[1] = 210;
         }
         apply_profile(&d, &p, false).unwrap();
-        assert!(d.calls.borrow()[1].contains("force=true"));
+        assert!(d.calls.borrow()[2].contains("force=true"));
     }
 
     #[test]
@@ -214,6 +278,42 @@ mod tests {
         let tdp = calls.iter().position(|c| c.starts_with("tdp_set")).unwrap();
         let fan = calls.iter().position(|c| c == "fan_curve_set").unwrap();
         assert!(tdp < fan);
+    }
+
+    #[test]
+    fn direct_mode_uses_companion_in_fan_step() {
+        let d = RecordingDaemon::default();
+        let mut p = full_custom();
+        p.fan_control_mode = FanControlMode::Direct;
+        apply_profile(&d, &p, false).unwrap();
+        let calls = d.calls.borrow();
+        assert!(calls.iter().any(|call| call == "manual_fan_set"));
+        assert!(!calls.iter().any(|call| call == "fan_curve_set"));
+        let tdp = calls
+            .iter()
+            .position(|call| call.starts_with("tdp_set"))
+            .unwrap();
+        let fan = calls
+            .iter()
+            .position(|call| call == "manual_fan_set")
+            .unwrap();
+        assert!(tdp < fan);
+    }
+
+    #[test]
+    fn release_failure_stops_before_tdp() {
+        let d = RecordingDaemon {
+            fail_at: RefCell::new(Some("manual_fan_release".into())),
+            ..Default::default()
+        };
+        assert!(apply_profile(&d, &full_custom(), true).is_err());
+        assert_eq!(
+            *d.calls.borrow(),
+            vec![
+                "profile_set:balanced".to_string(),
+                "manual_fan_release".to_string()
+            ]
+        );
     }
 
     #[test]

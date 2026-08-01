@@ -9,4 +9,4 @@ pub mod profile;
 
 pub use apply::{apply_profile, ClientDaemon, Daemon};
 pub use config::Config;
-pub use profile::{Base, Profile};
+pub use profile::{Base, FanControlMode, Profile};

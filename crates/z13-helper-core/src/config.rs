@@ -313,6 +313,19 @@ mod tests {
     }
 
     #[test]
+    fn existing_profiles_default_to_firmware_fan_control() {
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        for profile in value["profiles"].as_array_mut().unwrap() {
+            profile.as_object_mut().unwrap().remove("fan_control_mode");
+        }
+        let cfg: Config = serde_json::from_value(value).unwrap();
+        assert!(cfg
+            .profiles
+            .iter()
+            .all(|profile| profile.fan_control_mode == crate::profile::FanControlMode::Firmware));
+    }
+
+    #[test]
     fn add_rename_remove_custom() {
         let mut cfg = Config::default();
         let p = cfg.add_custom();
