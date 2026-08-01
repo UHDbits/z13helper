@@ -157,12 +157,7 @@ impl Config {
 
     /// Create a custom profile by copying the currently active one.
     pub fn add_custom(&mut self) -> &Profile {
-        let next_n = self
-            .profiles
-            .iter()
-            .filter(|p| !p.builtin)
-            .count()
-            + 1;
+        let next_n = self.profiles.iter().filter(|p| !p.builtin).count() + 1;
         let source = self
             .active()
             .cloned()
@@ -213,10 +208,7 @@ impl Config {
 }
 
 fn migrate(mut value: Value) -> Result<Value, ConfigError> {
-    let version = value
-        .get("version")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+    let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
     if version > CONFIG_VERSION {
         return Err(ConfigError::UnsupportedVersion(version));
@@ -263,8 +255,10 @@ mod tests {
     #[test]
     fn roundtrip_save_load() {
         let path = tmp_path("roundtrip");
-        let mut cfg = Config::default();
-        cfg.active_profile = "turbo".into();
+        let cfg = Config {
+            active_profile: "turbo".into(),
+            ..Config::default()
+        };
         cfg.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.active_profile, "turbo");
@@ -276,8 +270,10 @@ mod tests {
         let path = tmp_path("bak");
         let cfg = Config::default();
         cfg.save(&path).unwrap();
-        let mut cfg2 = Config::default();
-        cfg2.active_profile = "silent".into();
+        let cfg2 = Config {
+            active_profile: "silent".into(),
+            ..Config::default()
+        };
         cfg2.save(&path).unwrap();
         assert!(path.with_extension("json.bak").exists());
         let _ = fs::remove_file(&path);

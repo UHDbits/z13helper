@@ -68,12 +68,11 @@ impl Client {
 
     fn exchange(&self, req: &Request) -> Result<Response, DaemonError> {
         let mut stream = self.dial()?;
-        let body = serde_json::to_string(req)
-            .map_err(|e| DaemonError::Protocol(e.to_string()))?;
+        let body = serde_json::to_string(req).map_err(|e| DaemonError::Protocol(e.to_string()))?;
         stream
             .write_all(body.as_bytes())
             .and_then(|_| stream.write_all(b"\n"))
-            .map_err(|e| map_io_error(e))?;
+            .map_err(map_io_error)?;
 
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
@@ -307,8 +306,7 @@ impl Client {
             events: Some(events.iter().map(|s| (*s).to_string()).collect()),
             ..Default::default()
         };
-        let body =
-            serde_json::to_string(&req).map_err(|e| DaemonError::Protocol(e.to_string()))?;
+        let body = serde_json::to_string(&req).map_err(|e| DaemonError::Protocol(e.to_string()))?;
         stream
             .write_all(body.as_bytes())
             .and_then(|_| stream.write_all(b"\n"))
@@ -422,9 +420,7 @@ fn read_line_raw(stream: &mut UnixStream) -> Result<String, DaemonError> {
     loop {
         match stream.read(&mut byte) {
             Ok(0) => {
-                return Err(DaemonError::Protocol(
-                    "no response from daemon".into(),
-                ));
+                return Err(DaemonError::Protocol("no response from daemon".into()));
             }
             Ok(_) => {
                 if byte[0] == b'\n' {
