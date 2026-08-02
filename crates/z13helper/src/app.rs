@@ -19,6 +19,7 @@ pub struct AppState {
     config_writable: Cell<bool>,
     pub client: Client,
     pub applying: Cell<bool>,
+    apply_pending: Cell<bool>,
     pub on_battery: Cell<bool>,
     pub undervolt_available: Cell<Option<bool>>,
     pub main_window: RefCell<Option<adw::ApplicationWindow>>,
@@ -51,6 +52,7 @@ impl AppState {
             config_writable: Cell::new(config_writable),
             client: Client::new(),
             applying: Cell::new(false),
+            apply_pending: Cell::new(false),
             on_battery: Cell::new(false),
             undervolt_available: Cell::new(None),
             main_window: RefCell::new(None),
@@ -94,6 +96,7 @@ impl AppState {
     /// clicks pass `false` (G-Helper convention — the highlight is enough).
     pub fn apply_active(self: &Rc<Self>, _notify: bool) {
         if self.applying.replace(true) {
+            self.apply_pending.set(true);
             return;
         }
         let profile = self.config.borrow().active().cloned();
@@ -120,6 +123,9 @@ impl AppState {
                     }
                     Some(Err(error)) => done.report_error(&error.to_string()),
                     None => {}
+                }
+                if done.apply_pending.replace(false) {
+                    done.apply_active(false);
                 }
             },
         );

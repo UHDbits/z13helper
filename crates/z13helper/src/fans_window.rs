@@ -13,6 +13,8 @@ use crate::services::worker;
 use crate::ui::curve_editor::CurveEditor;
 use crate::ui::sync::SyncGuard;
 
+type ApplySchedule = Rc<RefCell<Option<glib::SourceId>>>;
+
 pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let window = adw::Window::builder()
         .application(&state.app)
@@ -56,12 +58,17 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     root.set_margin_end(12);
     let toast_overlay = adw::ToastOverlay::new();
     state.register_toast_overlay(&toast_overlay);
-    let body = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    body.set_vexpand(true);
     let left = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    left.set_size_request(300, -1);
+    left.set_margin_top(12);
+    left.set_margin_bottom(12);
+    left.set_margin_start(12);
+    left.set_margin_end(12);
     let right = gtk::Box::new(gtk::Orientation::Vertical, 8);
     right.set_hexpand(true);
+    right.set_margin_top(12);
+    right.set_margin_bottom(12);
+    right.set_margin_start(12);
+    right.set_margin_end(12);
 
     let stack = gtk::Stack::new();
     let switcher = gtk::StackSwitcher::new();
@@ -89,9 +96,10 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     // Shared "currently editing" profile id for the editor.
     let editing_id = Rc::new(RefCell::new(profile.id.clone()));
     let loading = SyncGuard::default();
+    let apply_schedule: ApplySchedule = Rc::new(RefCell::new(None));
 
-    let cpu = build_cpu_page(state, &editing_id, &loading);
-    let advanced = build_advanced_page(state, &editing_id, &loading);
+    let cpu = build_cpu_page(state, &editing_id, &loading, &apply_schedule);
+    let advanced = build_advanced_page(state, &editing_id, &loading, &apply_schedule);
     stack.add_titled(&cpu.0, Some("cpu"), "CPU");
     stack.add_titled(&advanced.0, Some("advanced"), "Advanced");
 
@@ -237,6 +245,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let state_fan = state.clone();
     let editing_fan = editing_id.clone();
     let loading_fan = loading.clone();
+    let apply_schedule_fan = apply_schedule.clone();
     fan_toggle.connect_toggled(move |t| {
         if loading_fan.active() {
             return;
@@ -247,12 +256,14 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         if let Some(p) = state_fan.config.borrow_mut().find_mut(&id) {
             p.apply_fan_curve = t.is_active();
         }
+        schedule_apply(&state_fan, &apply_schedule_fan);
     });
 
     let state_direct = state.clone();
     let editing_direct = editing_id.clone();
     let warning_direct = direct_warning.clone();
     let loading_direct = loading.clone();
+    let apply_schedule_direct = apply_schedule.clone();
     direct_toggle.connect_toggled(move |toggle| {
         if loading_direct.active() {
             return;
@@ -266,12 +277,14 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                 FanControlMode::Firmware
             };
         }
+        schedule_apply(&state_direct, &apply_schedule_direct);
     });
 
     // Persist curve edits into the profile currently selected in this window.
     let state_curve = state.clone();
     let editing_curve = editing_id.clone();
     let loading_curve = loading.clone();
+    let apply_schedule_curve = apply_schedule.clone();
     editor.set_changed(move |curve| {
         if loading_curve.active() {
             return;
@@ -280,10 +293,12 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         if let Some(p) = state_curve.config.borrow_mut().find_mut(&id) {
             p.fan_curves[0] = curve;
         }
+        schedule_apply(&state_curve, &apply_schedule_curve);
     });
     let state_curve = state.clone();
     let editing_curve = editing_id.clone();
     let loading_curve = loading.clone();
+    let apply_schedule_curve = apply_schedule.clone();
     editor2.set_changed(move |curve| {
         if loading_curve.active() {
             return;
@@ -292,6 +307,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         if let Some(profile) = state_curve.config.borrow_mut().find_mut(&id) {
             profile.fan_curves[1] = curve;
         }
+        schedule_apply(&state_curve, &apply_schedule_curve);
     });
 
     let base_drop = cpu.1.clone();
@@ -550,34 +566,33 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         dialog.present(Some(&parent_ren));
     });
 
-    let apply = gtk::Button::with_label("Apply Profile");
-    apply.add_css_class("suggested-action");
-    apply.set_hexpand(true);
-    let state_apply = state.clone();
-    apply.connect_clicked(move |_| state_apply.apply_active(false));
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.append(&restore);
-    actions.append(&apply);
-    body.append(&left);
-    body.append(&right);
-    let scroller = gtk::ScrolledWindow::builder()
+    let left_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .hexpand(true)
         .vexpand(true)
-        .child(&body)
+        .child(&left)
         .build();
-    let adaptive_body = body.clone();
-    let adaptive_left = left.clone();
-    window.connect_notify_local(Some("width"), move |window, _| {
-        let narrow = window.width() < 760;
-        adaptive_body.set_orientation(if narrow {
-            gtk::Orientation::Vertical
-        } else {
-            gtk::Orientation::Horizontal
-        });
-        adaptive_left.set_size_request(if narrow { -1 } else { 300 }, -1);
-    });
-    root.append(&scroller);
+    let right_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .hexpand(true)
+        .vexpand(true)
+        .child(&right)
+        .build();
+    let sidebar_page = adw::NavigationPage::new(&left_scroll, "Power & Undervolt");
+    let content_page = adw::NavigationPage::new(&right_scroll, "Fan Curves & Controls");
+    let split_view = adw::NavigationSplitView::builder()
+        .sidebar(&sidebar_page)
+        .content(&content_page)
+        .min_sidebar_width(300.0)
+        .max_sidebar_width(380.0)
+        .sidebar_width_fraction(0.36)
+        .build();
+    split_view.set_vexpand(true);
+    root.append(&split_view);
     root.append(&actions);
     toast_overlay.set_child(Some(&root));
     toolbar.set_content(Some(&toast_overlay));
@@ -590,6 +605,7 @@ fn build_cpu_page(
     state: &Rc<AppState>,
     editing_id: &Rc<RefCell<String>>,
     loading: &SyncGuard,
+    apply_schedule: &ApplySchedule,
 ) -> (
     gtk::Box,
     gtk::DropDown,
@@ -696,6 +712,7 @@ fn build_cpu_page(
         let pl2 = sppt.1.clone();
         let pl3 = fppt.1.clone();
         let loading = loading.clone();
+        let apply_schedule = apply_schedule.clone();
         Rc::new(move || {
             if loading.active() {
                 return;
@@ -716,6 +733,7 @@ fn build_cpu_page(
                 profile.pl1_spl = pl1.value() as u32;
                 profile.pl2_sppt = pl2.value() as u32;
                 profile.fppt = pl3.value() as u32;
+                schedule_apply(&state, &apply_schedule);
             }
         })
     };
@@ -737,6 +755,7 @@ fn build_advanced_page(
     state: &Rc<AppState>,
     editing_id: &Rc<RefCell<String>>,
     loading: &SyncGuard,
+    apply_schedule: &ApplySchedule,
 ) -> (gtk::Box, gtk::Scale, gtk::CheckButton) {
     let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     page.set_margin_top(12);
@@ -833,6 +852,7 @@ fn build_advanced_page(
         let release = release.1.clone();
         let duty = duty.1.clone();
         let dwell = dwell.1.clone();
+        let apply_schedule = apply_schedule.clone();
         Rc::new(move || {
             let engage_temp_c = engage.value() as i32;
             let max_release = engage_temp_c - 5;
@@ -845,7 +865,7 @@ fn build_advanced_page(
                 duty: duty.value() as u8,
                 dwell_ms: dwell.value() as u64 * 1000,
             };
-            state.save_config();
+            schedule_apply(&state, &apply_schedule);
         })
     };
     for scale in [&engage.1, &release.1, &duty.1, &dwell.1] {
@@ -862,6 +882,7 @@ fn build_advanced_page(
     let apply_uv_c = apply_uv.clone();
     let editing = editing_id.clone();
     let loading_uv = loading.clone();
+    let apply_schedule_uv = apply_schedule.clone();
     uv.connect_value_changed(move |scale| {
         if loading_uv.active() {
             return;
@@ -871,10 +892,12 @@ fn build_advanced_page(
             p.cpu_co = scale.value() as i32;
             p.apply_undervolt = apply_uv_c.is_active();
         }
+        schedule_apply(&state_uv, &apply_schedule_uv);
     });
     let state_chk = state.clone();
     let editing = editing_id.clone();
     let loading_uv = loading.clone();
+    let apply_schedule_uv = apply_schedule.clone();
     apply_uv.connect_toggled(move |chk| {
         if loading_uv.active() {
             return;
@@ -883,9 +906,26 @@ fn build_advanced_page(
         if let Some(p) = state_chk.config.borrow_mut().find_mut(&id) {
             p.apply_undervolt = chk.is_active();
         }
+        schedule_apply(&state_chk, &apply_schedule_uv);
     });
 
     (page, uv, apply_uv)
+}
+
+fn schedule_apply(state: &Rc<AppState>, schedule: &ApplySchedule) {
+    if let Some(source) = schedule.borrow_mut().take() {
+        source.remove();
+    }
+    let state = state.clone();
+    let schedule_done = schedule.clone();
+    *schedule.borrow_mut() = Some(glib::timeout_add_local_once(
+        std::time::Duration::from_millis(200),
+        move || {
+            schedule_done.borrow_mut().take();
+            state.save_config();
+            state.apply_active(false);
+        },
+    ));
 }
 
 struct ProfileEditorView {
