@@ -1,12 +1,25 @@
 use std::fs;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use z13helper_core::curve::{validate, Curve};
 use z13helper_core::protocol::{BatteryTelemetry, TdpState};
 
 const STRIX_HALO_TCTL_COMMAND: u32 = 0x19;
 const STRIX_HALO_CHTC_COMMAND: u32 = 0x63;
+// Strix Halo is in RyzenAdj's modern mobile-family command group. The
+// 0x4f/0x3e/0x5f group is for Dragon/Firerange and does not update these
+// limits on this platform.
+const STRIX_HALO_STAPM_COMMAND: u32 = 0x14;
+const STRIX_HALO_FAST_LIMIT_COMMAND: u32 = 0x15;
+const STRIX_HALO_SLOW_LIMIT_COMMAND: u32 = 0x16;
+const STRIX_HALO_APU_SLOW_LIMIT_COMMAND: u32 = 0x23;
+const STRIX_HALO_STAPM_PM_TABLE_OFFSET: usize = 0;
+const STRIX_HALO_FAST_LIMIT_PM_TABLE_OFFSET: usize = 2 * size_of::<f32>();
+const STRIX_HALO_SLOW_LIMIT_PM_TABLE_OFFSET: usize = 4 * size_of::<f32>();
+const STRIX_HALO_APU_SLOW_LIMIT_PM_TABLE_OFFSET: usize = 6 * size_of::<f32>();
 const STRIX_HALO_TCTL_PM_TABLE_OFFSET: usize = 22 * size_of::<f32>();
 
 #[derive(Clone, Debug)]
@@ -69,6 +82,13 @@ impl Sysfs {
             ("ppt_platform_sppt", state.platform_sppt),
         ] {
             self.write_text(self.ppt_path(name), value)?;
+        }
+        // The ASUS WMI attributes are writable echoes on this platform. They
+        // do not reliably update the effective SMU limits after PPD changes,
+        // so reassert the limits through the same MP1 interface used by
+        // ryzenadj and verify the PM table before reporting success.
+        if self.smu_path("mp1_smu_cmd").exists() && self.smu_path("pm_table").exists() {
+            self.set_strix_halo_tdp(state)?;
         }
         Ok(())
     }
@@ -300,6 +320,90 @@ impl Sysfs {
             .map_err(|error| format!("read SMU PM table: {error}"))?;
         decode_strix_halo_tctl(&table)
     }
+
+    fn set_strix_halo_tdp(&self, state: TdpState) -> Result<(), String> {
+        let expected = [
+            (STRIX_HALO_STAPM_COMMAND, state.pl2_sppt, "STAPM limit"),
+            (STRIX_HALO_FAST_LIMIT_COMMAND, state.fppt, "PPT fast limit"),
+            (
+                STRIX_HALO_SLOW_LIMIT_COMMAND,
+                state.pl1_spl,
+                "PPT slow limit",
+            ),
+            (
+                STRIX_HALO_APU_SLOW_LIMIT_COMMAND,
+                state.apu_sppt,
+                "APU PPT limit",
+            ),
+        ];
+
+        let mut last_error = String::from("SMU power-limit verification failed");
+        for attempt in 0..3 {
+            let result = (|| {
+                for &(command, watts, operation) in &expected {
+                    let milliwatts = u32::try_from(watts)
+                        .ok()
+                        .and_then(|watts| watts.checked_mul(1_000))
+                        .ok_or_else(|| format!("{operation} is outside the SMU range"))?;
+                    self.send_smu_command(command, encode_smu_u32(milliwatts), operation)?;
+                }
+                self.verify_strix_halo_tdp(state)
+            })();
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last_error = error;
+                    if attempt < 2 {
+                        // PPD can asynchronously restore its policy for a
+                        // short period after ActiveProfile changes.
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    fn verify_strix_halo_tdp(&self, state: TdpState) -> Result<(), String> {
+        let table = fs::read(self.smu_path("pm_table"))
+            .map_err(|error| format!("read SMU PM table: {error}"))?;
+        let actual = [
+            decode_smu_f32(&table, STRIX_HALO_STAPM_PM_TABLE_OFFSET, "STAPM limit")?,
+            decode_smu_f32(
+                &table,
+                STRIX_HALO_FAST_LIMIT_PM_TABLE_OFFSET,
+                "PPT fast limit",
+            )?,
+            decode_smu_f32(
+                &table,
+                STRIX_HALO_SLOW_LIMIT_PM_TABLE_OFFSET,
+                "PPT slow limit",
+            )?,
+            decode_smu_f32(
+                &table,
+                STRIX_HALO_APU_SLOW_LIMIT_PM_TABLE_OFFSET,
+                "APU PPT limit",
+            )?,
+        ];
+        let expected = [
+            state.pl2_sppt as f32,
+            state.fppt as f32,
+            state.pl1_spl as f32,
+            state.apu_sppt as f32,
+        ];
+        if actual
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| (actual - expected).abs() < 0.5)
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "SMU power-limit verification failed: requested {:?} W, firmware reports {:?} W",
+                expected, actual
+            ))
+        }
+    }
 }
 
 fn battery_health_percent(full: u64, design: u64) -> Option<u8> {
@@ -327,6 +431,26 @@ fn encode_smu_temp_limit(temperature_c: u8) -> Result<[u8; 24], String> {
     let mut args = [0u8; 24];
     args[..4].copy_from_slice(&u32::from(temperature_c).to_le_bytes());
     Ok(args)
+}
+
+fn encode_smu_u32(value: u32) -> [u8; 24] {
+    let mut args = [0u8; 24];
+    args[..4].copy_from_slice(&value.to_le_bytes());
+    args
+}
+
+fn decode_smu_f32(table: &[u8], offset: usize, name: &str) -> Result<f32, String> {
+    let end = offset + size_of::<f32>();
+    let bytes: [u8; 4] = table
+        .get(offset..end)
+        .ok_or_else(|| format!("SMU PM table is too short to verify the {name}"))?
+        .try_into()
+        .expect("slice length was checked above");
+    let value = f32::from_le_bytes(bytes);
+    if !value.is_finite() || !(0.0..=255.0).contains(&value) {
+        return Err(format!("SMU PM table returned invalid {name} {value}"));
+    }
+    Ok(value)
 }
 
 fn decode_strix_halo_tctl(table: &[u8]) -> Result<u8, String> {
