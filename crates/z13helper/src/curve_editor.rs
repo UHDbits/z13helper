@@ -4,7 +4,6 @@ use std::rc::Rc;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use z13helper_core::curve::{self, Curve, POINT_COUNT};
-use z13helper_core::FanFloorConfig;
 
 type ChangedCallback = Box<dyn Fn(Curve)>;
 
@@ -19,7 +18,7 @@ pub struct CurveEditor {
     curve: Rc<RefCell<Curve>>,
     selected: Rc<Cell<usize>>,
     muted: Rc<Cell<bool>>,
-    floor: Rc<Cell<FanFloorConfig>>,
+    high_power_protection: Rc<Cell<bool>>,
     changed: Rc<RefCell<Option<ChangedCallback>>>,
 }
 
@@ -40,7 +39,7 @@ impl CurveEditor {
             curve: Rc::new(RefCell::new(curve)),
             selected: Rc::new(Cell::new(0)),
             muted: Rc::new(Cell::new(false)),
-            floor: Rc::new(Cell::new(FanFloorConfig::default())),
+            high_power_protection: Rc::new(Cell::new(false)),
             changed: Rc::new(RefCell::new(None)),
         };
         this.update_accessibility();
@@ -54,7 +53,12 @@ impl CurveEditor {
     }
 
     pub fn curve(&self) -> Curve {
-        *self.curve.borrow()
+        let curve = *self.curve.borrow();
+        if self.high_power_protection.get() {
+            curve::high_power_curve(&curve)
+        } else {
+            curve
+        }
     }
 
     pub fn set_curve(&self, curve: Curve) {
@@ -72,8 +76,9 @@ impl CurveEditor {
         self.area.set_sensitive(editable);
     }
 
-    pub fn set_floor_config(&self, floor: FanFloorConfig) {
-        self.floor.set(floor);
+    pub fn set_high_power_protection(&self, enabled: bool) {
+        self.high_power_protection.set(enabled);
+        self.update_accessibility();
         self.area.queue_draw();
     }
 
@@ -83,7 +88,7 @@ impl CurveEditor {
 
     fn emit_changed(&self) {
         if let Some(callback) = self.changed.borrow().as_ref() {
-            callback(*self.curve.borrow());
+            callback(self.curve());
         }
         self.update_accessibility();
         self.area.queue_draw();
@@ -112,7 +117,7 @@ impl CurveEditor {
 
     fn update_accessibility(&self) {
         let index = self.selected.get();
-        let point = self.curve.borrow()[index];
+        let point = self.curve()[index];
         let value = format!(
             "Point {} of {POINT_COUNT}: {} degrees Celsius, {} percent fan speed",
             index + 1,
@@ -132,7 +137,7 @@ impl CurveEditor {
         let curve = self.curve.clone();
         let selected = self.selected.clone();
         let muted = self.muted.clone();
-        let floor = self.floor.clone();
+        let high_power_protection = self.high_power_protection.clone();
         self.area.set_draw_func(move |area, cr, width, height| {
             let w = width as f64;
             let h = height as f64;
@@ -196,25 +201,12 @@ impl CurveEditor {
             cr.move_to(left + cw / 2.0 - 12.0, h - 4.0);
             let _ = cr.show_text("°C");
 
-            // High-TDP floor.
-            let floor = floor.get();
-            {
-                set_color(&foreground, 0.72);
-                cr.set_dash(&[4.0, 4.0], 0.0);
-                cr.move_to(x(floor.engage_temp_c), y(i32::from(floor.duty)));
-                cr.line_to(left + cw, y(i32::from(floor.duty)));
-                let _ = cr.stroke();
-                cr.set_dash(&[], 0.0);
-                cr.set_font_size(font_size * 0.9);
-                cr.move_to(x(floor.engage_temp_c) + 4.0, y(i32::from(floor.duty)) - 4.0);
-                let _ = cr.show_text(&format!(
-                    "{}% floor above {}°C at >75W",
-                    curve::pwm_to_percent(i32::from(floor.duty)),
-                    floor.engage_temp_c
-                ));
-            }
-
-            let points = *curve.borrow();
+            let authored = *curve.borrow();
+            let points = if high_power_protection.get() {
+                curve::high_power_curve(&authored)
+            } else {
+                authored
+            };
             if muted.get() {
                 set_color(&foreground, 0.45);
             } else {
@@ -295,6 +287,18 @@ impl CurveEditor {
                 _ => return glib::Propagation::Proceed,
             };
             let mut curve = editor.curve.borrow_mut();
+            if editor.high_power_protection.get() && idx == 7 {
+                return glib::Propagation::Stop;
+            }
+            if editor.high_power_protection.get() && idx == 6 {
+                curve[idx][0] = curve::HIGH_POWER_POINT_TEMP_C;
+                let pwm_step = curve::percent_to_pwm(dp) - curve::percent_to_pwm(0);
+                curve[idx][1] =
+                    (curve[idx][1] + pwm_step).clamp(curve::HIGH_POWER_POINT_PWM, curve::PWM_MAX);
+                drop(curve);
+                editor.emit_changed();
+                return glib::Propagation::Stop;
+            }
             curve[idx][0] += dt;
             curve[idx][1] += curve::percent_to_pwm(dp) - curve::percent_to_pwm(0);
             curve::enforce_curve(&mut curve, idx);
@@ -311,8 +315,8 @@ impl CurveEditor {
         let (left, top, cw, ch) = Self::chart_geom(w, h, Self::font_size(&self.area));
         let x = |t: i32| left + (t - CHART_TEMP_MIN) as f64 / CHART_TEMP_RANGE * cw;
         let y = |p: i32| top + (1.0 - p as f64 / 255.0) * ch;
-        self.curve
-            .borrow()
+        let curve = self.curve();
+        curve
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
@@ -333,6 +337,16 @@ impl CurveEditor {
             .clamp(CHART_TEMP_MIN as f64, CHART_TEMP_MAX as f64) as i32;
         let pwm = ((1.0 - (py - top) / ch) * 255.0).round() as i32;
         let mut curve = self.curve.borrow_mut();
+        if self.high_power_protection.get() && idx == 7 {
+            return;
+        }
+        if self.high_power_protection.get() && idx == 6 {
+            curve[idx][0] = curve::HIGH_POWER_POINT_TEMP_C;
+            curve[idx][1] = pwm.clamp(curve::HIGH_POWER_POINT_PWM, curve::PWM_MAX);
+            drop(curve);
+            self.emit_changed();
+            return;
+        }
         if vertical_only {
             let delta = pwm - curve[idx][1];
             curve::shift_curve_vertical(&mut curve, delta);

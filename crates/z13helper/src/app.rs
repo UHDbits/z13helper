@@ -151,13 +151,15 @@ impl AppState {
             return;
         }
         let profile = self.config.borrow().active().cloned();
-        let floor = self.config.borrow().fan_floor;
+        let disable_high_power = self.config.borrow().disable_high_power_fan_protection;
         let client = self.client.clone();
         let done = self.clone();
         let on_battery = self.on_battery.get();
         worker::blocking(
             move || {
-                profile.map(|profile| client.apply(ApplyRequest::from_profile(&profile, floor)))
+                profile.map(|profile| {
+                    client.apply(ApplyRequest::from_profile(&profile, disable_high_power))
+                })
             },
             move |result| {
                 done.applying.set(false);

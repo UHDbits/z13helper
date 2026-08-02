@@ -1,6 +1,6 @@
 //! Fail-closed hardware apply sequencing.
 
-use crate::curve::{Curve, TDP_MAX_SAFE};
+use crate::curve::{Curve, HIGH_POWER_THRESHOLD_W};
 use crate::error::DaemonError;
 use crate::profile::{stock_fan_curves, FanControlMode};
 use crate::protocol::{ApplyRequest, TdpState};
@@ -61,14 +61,14 @@ pub fn apply_request(
     let pl1 = request.effective_pl1();
     let limits = request.effective_power_limits();
     let curves = selected_curves(request);
-    if pl1 > TDP_MAX_SAFE {
+    if pl1 >= HIGH_POWER_THRESHOLD_W && !request.disable_high_power_fan_protection {
         set_fans(daemon, request, &curves, pl1)?;
         if let Some(limits) = limits {
             daemon.tdp_set(limits, true)?;
         }
     } else {
         if let Some(limits) = limits {
-            daemon.tdp_set(limits, false)?;
+            daemon.tdp_set(limits, pl1 >= HIGH_POWER_THRESHOLD_W)?;
         }
         if request.fan_curves.is_some() {
             set_fans(daemon, request, &curves, pl1)?;
@@ -93,7 +93,6 @@ mod tests {
 
     use super::*;
     use crate::profile::Profile;
-    use crate::protocol::FanFloorConfig;
 
     #[derive(Default)]
     struct RecordingDaemon {
@@ -150,7 +149,7 @@ mod tests {
         profile.pl2_sppt = pl1.max(80);
         profile.fppt = pl1.max(90);
         profile.apply_fan_curve = true;
-        ApplyRequest::from_profile(&profile, FanFloorConfig::default())
+        ApplyRequest::from_profile(&profile, false)
     }
 
     #[test]
@@ -174,6 +173,18 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_override_does_not_install_protected_fans() {
+        let mut request = request(80);
+        request.disable_high_power_fan_protection = true;
+        request.fan_curves = None;
+        let mut daemon = RecordingDaemon::default();
+        apply_request(&mut daemon, &request).unwrap();
+        let calls = daemon.calls.into_inner();
+        assert!(calls.iter().any(|call| call == "fans-release"));
+        assert!(!calls.iter().any(|call| call == "firmware-fans"));
+    }
+
+    #[test]
     fn safe_power_is_lowered_before_fans() {
         let mut daemon = RecordingDaemon::default();
         apply_request(&mut daemon, &request(60)).unwrap();
@@ -186,7 +197,7 @@ mod tests {
     #[test]
     fn ppd_runs_and_stock_releases_fans() {
         let profile = Profile::builtin("balanced", "Balanced");
-        let request = ApplyRequest::from_profile(&profile, FanFloorConfig::default());
+        let request = ApplyRequest::from_profile(&profile, false);
         let mut daemon = RecordingDaemon::default();
         apply_request(&mut daemon, &request).unwrap();
         assert_eq!(
@@ -207,7 +218,7 @@ mod tests {
             ("turbo", "tdp:70/86/86/70/70:force=false"),
         ] {
             let profile = Profile::builtin(id, id);
-            let request = ApplyRequest::from_profile(&profile, FanFloorConfig::default());
+            let request = ApplyRequest::from_profile(&profile, false);
             let mut daemon = RecordingDaemon::default();
             apply_request(&mut daemon, &request).unwrap();
             assert!(daemon

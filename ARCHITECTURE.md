@@ -59,23 +59,23 @@ For an ordinary or lower-power apply:
 3. Install firmware or direct fan control.
 4. Restore the requested undervolt offset.
 
-When raising PL1 above 75 W, step 3 moves before the power write. A fan-setup
+When raising PL1 to 80 W or above, step 3 moves before the power write. A fan-setup
 failure abandons the power increase. If a later step fails, the daemon attempts
 rollback without dropping safety fan protection; incomplete rollback sets
 `degraded` and records warnings in `DaemonState`.
 
 ## Fan policy
 
-Profiles carry two authored eight-point curves and select firmware or direct
-mode. Authored values are immutable inputs to the runtime safety layer.
+Profiles carry two authored eight-point curves, directional hysteresis, and
+select firmware or direct mode.
 
-- Firmware mode applies the configured high-power floor to a temporary hardware
-  copy and verifies both ASUS `pwm_enable` interfaces. It reports
-  `firmware_armed`; release hysteresis and dwell do not apply.
-- Direct mode interpolates each authored curve in the EC loop. `FloorGate`
-  engages at the configured temperature, releases only below the release point
-  after dwell, and reports `direct_engaged` or `direct_released`.
-- At or below 75 W the state is `inactive`.
+- At 80 W and above, unless the confirmed Advanced override is enabled, a temporary
+  hardware copy locks point 7 to 80°C and at least 80% PWM and point 8 to 90°C
+  and 100%. Firmware mode verifies both ASUS `pwm_enable` interfaces.
+- Direct mode interpolates the effective curve and writes raw 0–255 PWM duty to
+  the EC. RPM is separate telemetry. Its 1–5 speed-up and slow-down hysteresis
+  values are per profile and default to 3/3.
+- Below 80 W endpoint protection is inactive.
 - No temperature-only 96°C full-speed override exists. CPU and firmware thermal
   throttling remain the final authority.
 

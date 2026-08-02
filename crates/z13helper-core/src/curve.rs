@@ -1,4 +1,4 @@
-//! Fan curve authoring math. Runtime safety floors are daemon-owned.
+//! Fan curve authoring math and high-power endpoint protection.
 //!
 //! Fan-curve validation and editing constraints.
 
@@ -9,7 +9,10 @@ pub const TEMP_MIN: i32 = 20;
 pub const TEMP_MAX: i32 = 110;
 pub const PWM_MIN: i32 = 0;
 pub const PWM_MAX: i32 = 255;
-pub const TDP_MAX_SAFE: u32 = 75;
+pub const HIGH_POWER_THRESHOLD_W: u32 = 80;
+pub const HIGH_POWER_POINT_TEMP_C: i32 = 80;
+pub const HIGH_POWER_POINT_PWM: i32 = 204;
+pub const HIGH_POWER_FINAL_TEMP_C: i32 = 90;
 
 pub type Curve = [[i32; 2]; POINT_COUNT]; // [temp, pwm]
 
@@ -27,7 +30,7 @@ pub enum CurveError {
     PwmDecreasing,
 }
 
-/// Validate a curve against the daemon's rules (without the high-TDP floor).
+/// Validate a curve against the daemon's rules.
 pub fn validate(curve: &Curve) -> Result<(), CurveError> {
     // ASUS factory tables may repeat a temperature breakpoint (Silent does at
     // 71°C), so only a backwards step is invalid here. Editor normalization
@@ -110,6 +113,22 @@ pub fn enforce_curve(curve: &mut Curve, idx: usize) {
     }
 }
 
+/// Return the hardware copy used at 80 W and above. Authored points remain intact.
+/// The penultimate point may be raised, but never lowered below 80%.
+pub fn high_power_curve(authored: &Curve) -> Curve {
+    let mut curve = *authored;
+    curve[6] = [
+        HIGH_POWER_POINT_TEMP_C,
+        curve[6][1].max(curve[5][1]).max(HIGH_POWER_POINT_PWM),
+    ];
+    curve[7] = [HIGH_POWER_FINAL_TEMP_C, PWM_MAX];
+    for index in (0..6).rev() {
+        curve[index][0] = curve[index][0].min(curve[index + 1][0]);
+        curve[index][1] = curve[index][1].min(curve[index + 1][1]);
+    }
+    curve
+}
+
 /// Shift every point's PWM by `delta` across the full authoring range.
 pub fn shift_curve_vertical(curve: &mut Curve, delta: i32) {
     for pt in curve.iter_mut() {
@@ -167,11 +186,22 @@ mod tests {
     }
 
     #[test]
-    fn enforce_does_not_apply_runtime_floor() {
+    fn ordinary_editing_does_not_apply_high_power_protection() {
         let mut c = default_fan_curve();
         c[0][1] = 0;
         enforce_curve(&mut c, 0);
         assert_eq!(c[0][1], 0);
+    }
+
+    #[test]
+    fn high_power_copy_locks_last_two_points_without_mutating_authored_curve() {
+        let authored = default_fan_curve();
+        let protected = high_power_curve(&authored);
+        assert_eq!(protected[6][0], 80);
+        assert!(protected[6][1] >= 204);
+        assert_eq!(protected[7], [90, 255]);
+        assert_ne!(authored, protected);
+        validate(&protected).unwrap();
     }
 
     #[test]

@@ -9,40 +9,21 @@ use crate::profile::{stock_ppt, FanControlMode, Profile};
 pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct FanFloorConfig {
-    pub engage_temp_c: i32,
-    pub release_temp_c: i32,
-    pub duty: u8,
-    pub dwell_ms: u64,
+pub struct FanHysteresis {
+    pub up: u8,
+    pub down: u8,
 }
 
-impl Default for FanFloorConfig {
+impl Default for FanHysteresis {
     fn default() -> Self {
-        Self {
-            engage_temp_c: 70,
-            release_temp_c: 65,
-            duty: 204,
-            dwell_ms: 5_000,
-        }
+        Self { up: 3, down: 3 }
     }
 }
 
-impl FanFloorConfig {
+impl FanHysteresis {
     pub fn validate(self) -> Result<Self, String> {
-        if !(60..=70).contains(&self.engage_temp_c) {
-            return Err("floor engage temperature must be between 60 and 70°C".into());
-        }
-        if !(50..=65).contains(&self.release_temp_c) {
-            return Err("floor release temperature must be between 50 and 65°C".into());
-        }
-        if self.release_temp_c > self.engage_temp_c - 5 {
-            return Err("floor release temperature must be at least 5°C below engage".into());
-        }
-        if self.duty < 204 {
-            return Err("high-power floor cannot be lower than 204 PWM".into());
-        }
-        if !(5_000..=30_000).contains(&self.dwell_ms) {
-            return Err("floor dwell must be between 5 and 30 seconds".into());
+        if !(1..=5).contains(&self.up) || !(1..=5).contains(&self.down) {
+            return Err("fan hysteresis values must be between 1 and 5".into());
         }
         Ok(self)
     }
@@ -99,24 +80,6 @@ pub struct OverrideState {
     pub power: bool,
     pub fans: bool,
     pub undervolt: bool,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FloorEnforcement {
-    #[default]
-    Inactive,
-    FirmwareArmed,
-    DirectReleased,
-    DirectEngaged,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct FloorState {
-    pub enforcement: FloorEnforcement,
-    pub armed: bool,
-    pub engaged: bool,
-    pub effective_min_duty: u8,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -188,9 +151,13 @@ pub struct DaemonState {
     #[serde(default)]
     pub fan_rpms: [u32; 2],
     #[serde(default)]
-    pub floor_config: FanFloorConfig,
+    pub fan_hysteresis: FanHysteresis,
     #[serde(default)]
-    pub floor: FloorState,
+    pub direct_fan_duties: [u8; 2],
+    #[serde(default)]
+    pub high_power_fan_protection: bool,
+    #[serde(default)]
+    pub disable_high_power_fan_protection: bool,
     #[serde(default)]
     pub capabilities: Capabilities,
     #[serde(default)]
@@ -230,8 +197,10 @@ impl Default for DaemonState {
             undervolt_available: false,
             temperature: None,
             fan_rpms: [0; 2],
-            floor_config: FanFloorConfig::default(),
-            floor: FloorState::default(),
+            fan_hysteresis: FanHysteresis::default(),
+            direct_fan_duties: [0; 2],
+            high_power_fan_protection: false,
+            disable_high_power_fan_protection: false,
             capabilities: Capabilities::default(),
             telemetry: Telemetry::default(),
             health: Health::default(),
@@ -248,11 +217,14 @@ pub struct ApplyRequest {
     pub fan_mode: FanControlMode,
     pub fan_curves: Option<[Curve; 2]>,
     pub undervolt: Option<i32>,
-    pub floor: FanFloorConfig,
+    #[serde(default)]
+    pub fan_hysteresis: FanHysteresis,
+    #[serde(default)]
+    pub disable_high_power_fan_protection: bool,
 }
 
 impl ApplyRequest {
-    pub fn from_profile(profile: &Profile, floor: FanFloorConfig) -> Self {
+    pub fn from_profile(profile: &Profile, disable_high_power_fan_protection: bool) -> Self {
         let power_limits = profile.apply_power_limits.then_some(TdpState {
             pl1_spl: profile.pl1_spl as i32,
             pl2_sppt: profile.pl2_sppt as i32,
@@ -260,13 +232,24 @@ impl ApplyRequest {
             apu_sppt: profile.pl2_sppt as i32,
             platform_sppt: profile.pl2_sppt as i32,
         });
+        let effective_pl1 = power_limits
+            .or_else(|| stock_tdp(profile.ppd_profile.as_deref()))
+            .map(|tdp| tdp.pl1_spl.max(0) as u32)
+            .unwrap_or(0);
+        let needs_protected_curve = effective_pl1 >= crate::curve::HIGH_POWER_THRESHOLD_W
+            && !disable_high_power_fan_protection;
         Self {
             ppd_profile: profile.ppd_profile.clone(),
             power_limits,
             fan_mode: profile.fan_control_mode,
-            fan_curves: profile.apply_fan_curve.then_some(profile.fan_curves),
+            fan_curves: (profile.apply_fan_curve || needs_protected_curve)
+                .then_some(profile.fan_curves),
             undervolt: profile.apply_undervolt.then_some(profile.cpu_co),
-            floor,
+            fan_hysteresis: FanHysteresis {
+                up: profile.fan_hysteresis_up,
+                down: profile.fan_hysteresis_down,
+            },
+            disable_high_power_fan_protection,
         }
     }
 
@@ -282,7 +265,7 @@ impl ApplyRequest {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        self.floor.validate()?;
+        self.fan_hysteresis.validate()?;
         if let Some(curves) = &self.fan_curves {
             for curve in curves {
                 crate::curve::validate(curve).map_err(|error| error.to_string())?;
@@ -428,17 +411,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn floor_bounds_reject_weaker_policy() {
-        let config = FanFloorConfig {
-            duty: 203,
-            ..FanFloorConfig::default()
-        };
-        assert!(config.validate().is_err());
-        let config = FanFloorConfig {
-            release_temp_c: 68,
-            ..FanFloorConfig::default()
-        };
-        assert!(config.validate().is_err());
+    fn hysteresis_bounds_match_exposed_levels() {
+        assert!(FanHysteresis { up: 1, down: 5 }.validate().is_ok());
+        assert!(FanHysteresis { up: 0, down: 3 }.validate().is_err());
+        assert!(FanHysteresis { up: 3, down: 6 }.validate().is_err());
     }
 
     #[test]
@@ -507,11 +483,26 @@ mod tests {
         profile.pl1_spl = 80;
         profile.pl2_sppt = 90;
         profile.fppt = 121;
-        let request = ApplyRequest::from_profile(&profile, FanFloorConfig::default());
+        let request = ApplyRequest::from_profile(&profile, false);
         assert!(request.validate().is_err());
 
         profile.fppt = 120;
-        let request = ApplyRequest::from_profile(&profile, FanFloorConfig::default());
+        let request = ApplyRequest::from_profile(&profile, false);
         assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn high_power_request_carries_profiles_measured_curve_for_protection() {
+        let mut profile = Profile::builtin("turbo", "Turbo");
+        profile.apply_power_limits = true;
+        profile.pl1_spl = 81;
+        profile.pl2_sppt = 90;
+        profile.fppt = 100;
+        profile.fan_curves[0][0] = [42, 43];
+        let request = ApplyRequest::from_profile(&profile, false);
+        assert_eq!(request.fan_curves.unwrap()[0][0], [42, 43]);
+
+        let overridden = ApplyRequest::from_profile(&profile, true);
+        assert!(overridden.fan_curves.is_none());
     }
 }

@@ -23,11 +23,19 @@ pub struct Profile {
     pub apply_fan_curve: bool,
     #[serde(default)]
     pub fan_control_mode: FanControlMode,
+    #[serde(default = "default_fan_hysteresis")]
+    pub fan_hysteresis_up: u8,
+    #[serde(default = "default_fan_hysteresis")]
+    pub fan_hysteresis_down: u8,
     pub fan_curves: [FanCurve; 2],
     #[serde(default)]
     pub factory_fan_curves_loaded: bool,
     pub apply_undervolt: bool,
     pub cpu_co: i32,
+}
+
+pub const fn default_fan_hysteresis() -> u8 {
+    3
 }
 
 fn builtin_ppd(id: &str) -> &'static str {
@@ -142,6 +150,8 @@ impl Profile {
             fppt: pl3,
             apply_fan_curve: false,
             fan_control_mode: FanControlMode::Firmware,
+            fan_hysteresis_up: default_fan_hysteresis(),
+            fan_hysteresis_down: default_fan_hysteresis(),
             fan_curves: stock_fan_curves(Some(ppd_profile)),
             factory_fan_curves_loaded: false,
             apply_undervolt: false,
@@ -163,6 +173,8 @@ impl Profile {
         self.fppt = pl3;
         self.apply_fan_curve = false;
         self.fan_control_mode = FanControlMode::Firmware;
+        self.fan_hysteresis_up = default_fan_hysteresis();
+        self.fan_hysteresis_down = default_fan_hysteresis();
         self.fan_curves = stock_fan_curves(ppd_profile);
         self.factory_fan_curves_loaded = false;
         self.apply_undervolt = false;

@@ -1,9 +1,7 @@
-use std::time::Instant;
-
 use z13helper_core::curve::Curve;
-use z13helper_core::protocol::{FanFloorConfig, ProbeReply};
+use z13helper_core::protocol::{FanHysteresis, ProbeReply};
 
-use crate::curve::{controlled_duty, FloorGate};
+use crate::curve::{duty_at, hysteretic_temperature, HysteresisState};
 use crate::ec::{EcMailbox, PortIo};
 use crate::sensors::{self, SensorSnapshot};
 
@@ -26,11 +24,10 @@ pub struct Controller<P, S> {
     ec: EcMailbox<P>,
     sensors: S,
     curves: Option<[Curve; 2]>,
-    floor: FanFloorConfig,
-    gate: FloorGate,
+    hysteresis: FanHysteresis,
+    hysteresis_state: HysteresisState,
     last_duty: [u8; 2],
     consecutive_ec_errors: u32,
-    epoch: Instant,
 }
 
 impl<P: PortIo, S: SensorSource> Controller<P, S> {
@@ -39,11 +36,10 @@ impl<P: PortIo, S: SensorSource> Controller<P, S> {
             ec,
             sensors,
             curves: None,
-            floor: FanFloorConfig::default(),
-            gate: FloorGate::default(),
+            hysteresis: FanHysteresis::default(),
+            hysteresis_state: HysteresisState::default(),
             last_duty: [0; 2],
             consecutive_ec_errors: 0,
-            epoch: Instant::now(),
         }
     }
 
@@ -66,20 +62,20 @@ impl<P: PortIo, S: SensorSource> Controller<P, S> {
         })
     }
 
-    pub fn enable(&mut self, curves: [Curve; 2], floor: FanFloorConfig) -> Result<(), String> {
+    pub fn enable(&mut self, curves: [Curve; 2], hysteresis: FanHysteresis) -> Result<(), String> {
         self.ec
             .set_global_mode(true)
             .map_err(|error| self.note_ec_error(error.to_string()))?;
         self.curves = Some(curves);
-        self.floor = floor;
-        self.gate = FloorGate::default();
+        self.hysteresis = hysteresis;
+        self.hysteresis_state = HysteresisState::default();
         self.consecutive_ec_errors = 0;
         self.tick()
     }
 
     pub fn release(&mut self) -> Result<(), String> {
         self.curves = None;
-        self.gate = FloorGate::default();
+        self.hysteresis_state = HysteresisState::default();
         match self.ec.set_global_mode(false) {
             Ok(()) => {
                 self.last_duty = [0; 2];
@@ -101,24 +97,15 @@ impl<P: PortIo, S: SensorSource> Controller<P, S> {
                 return Err(format!("sensor failure; EC control released: {error}"));
             }
         };
-        let now = self.epoch.elapsed().as_millis() as u64;
-        let (first, gate) = controlled_duty(
-            &curves[0],
+        let (temperature, hysteresis_state) = hysteretic_temperature(
             snapshot.apu_temperature_c,
-            snapshot.pl1_w,
-            self.floor,
-            self.gate,
-            now,
+            self.hysteresis.up,
+            self.hysteresis.down,
+            self.hysteresis_state,
         );
-        let (second, gate) = controlled_duty(
-            &curves[1],
-            snapshot.apu_temperature_c,
-            snapshot.pl1_w,
-            self.floor,
-            gate,
-            now,
-        );
-        self.gate = gate;
+        self.hysteresis_state = hysteresis_state;
+        let first = duty_at(&curves[0], temperature);
+        let second = duty_at(&curves[1], temperature);
         let duties = [first, second];
         for (fan, duty) in duties.into_iter().enumerate() {
             if let Err(error) = self.ec.set_duty(fan as u8, duty) {
@@ -132,10 +119,6 @@ impl<P: PortIo, S: SensorSource> Controller<P, S> {
 
     pub fn direct_enabled(&self) -> bool {
         self.curves.is_some()
-    }
-
-    pub fn gate(&self) -> FloorGate {
-        self.gate
     }
 
     pub fn last_duty(&self) -> [u8; 2] {
@@ -154,7 +137,7 @@ impl<P: PortIo, S: SensorSource> Controller<P, S> {
 
     fn release_best_effort(&mut self) {
         self.curves = None;
-        self.gate = FloorGate::default();
+        self.hysteresis_state = HysteresisState::default();
         if let Err(error) = self.ec.set_global_mode(false) {
             tracing::error!(%error, "failed to release EC automatic mode");
         }

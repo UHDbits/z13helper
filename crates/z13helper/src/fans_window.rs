@@ -6,7 +6,9 @@ use std::rc::Rc;
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use z13helper_core::{stock_fan_curves, stock_ppt, ApplyRequest, FanControlMode, Profile};
+use z13helper_core::{
+    stock_fan_curves, stock_ppt, ApplyRequest, FanControlMode, Profile, HIGH_POWER_THRESHOLD_W,
+};
 
 use crate::app::AppState;
 use crate::services::worker;
@@ -87,16 +89,35 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         .unwrap_or_else(|| Profile::builtin("balanced", "Balanced"));
     let editor = CurveEditor::new(profile.fan_curves[0], "Fan 1 curve");
     let editor2 = CurveEditor::new(profile.fan_curves[1], "Fan 2 curve");
-    editor.set_floor_config(state.config.borrow().fan_floor);
-    editor2.set_floor_config(state.config.borrow().fan_floor);
+    let protection_disabled = state.config.borrow().disable_high_power_fan_protection;
+    let protection_active = profile.apply_power_limits
+        && profile.pl1_spl >= HIGH_POWER_THRESHOLD_W
+        && !protection_disabled;
+    editor.set_high_power_protection(protection_active);
+    editor2.set_high_power_protection(protection_active);
 
     // Shared "currently editing" profile id for the editor.
     let editing_id = Rc::new(RefCell::new(profile.id.clone()));
     let loading = SyncGuard::default();
     let apply_schedule: ApplySchedule = Rc::new(RefCell::new(None));
 
-    let cpu = build_cpu_page(state, &editing_id, &loading, &apply_schedule);
-    let advanced = build_advanced_page(state, &editing_id, &loading, &apply_schedule);
+    let cpu = build_cpu_page(
+        state,
+        &editing_id,
+        &loading,
+        &apply_schedule,
+        &editor,
+        &editor2,
+    );
+    let advanced = build_advanced_page(
+        state,
+        &editing_id,
+        &loading,
+        &apply_schedule,
+        &window,
+        &editor,
+        &editor2,
+    );
     stack.add_titled(&cpu.0, Some("cpu"), "CPU");
     stack.add_titled(&advanced.0, Some("advanced"), "Advanced");
 
@@ -169,6 +190,31 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     direct_warning.set_visible(direct_toggle.is_active());
     right.append(&direct_warning);
 
+    let hysteresis_group = adw::PreferencesGroup::builder()
+        .title("Direct EC Hysteresis")
+        .description(
+            "Directional temperature deadbands for direct EC control. Values 1–5 mirror \
+             G-Helper and default to 3/3; firmware mode manages its own hysteresis.",
+        )
+        .build();
+    let hysteresis_up = slider_row(
+        "Fan speed-up hysteresis",
+        u32::from(profile.fan_hysteresis_up),
+        1,
+        5,
+    );
+    let hysteresis_down = slider_row(
+        "Fan slow-down hysteresis",
+        u32::from(profile.fan_hysteresis_down),
+        1,
+        5,
+    );
+    hysteresis_up.1.set_sensitive(direct_toggle.is_active());
+    hysteresis_down.1.set_sensitive(direct_toggle.is_active());
+    hysteresis_group.add(&hysteresis_up.0);
+    hysteresis_group.add(&hysteresis_down.0);
+    right.append(&hysteresis_group);
+
     let direct_status = gtk::Label::new(Some("Direct EC control: checking…"));
     direct_status.add_css_class("dim-label");
     direct_status.set_xalign(0.0);
@@ -179,6 +225,8 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let status_probe = direct_status.clone();
     let ppd_probe = cpu.5.clone();
     let state_probe = state.clone();
+    let hysteresis_up_probe = hysteresis_up.1.clone();
+    let hysteresis_down_probe = hysteresis_down.1.clone();
     let uv_probe = advanced.1.clone();
     let apply_uv_probe = advanced.2.clone();
     let manual_uv_probe = advanced.3.clone();
@@ -194,23 +242,36 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                 manual_uv_probe.set_sensitive(status.undervolt_available);
                 sync_ppd_choices(&ppd_probe, &status.capabilities.ppd_profiles, &state_probe);
                 direct_probe.set_sensitive(status.capabilities.direct_fans);
+                hysteresis_up_probe.set_sensitive(
+                    status.capabilities.direct_fans
+                        && status.fan_control_mode == FanControlMode::Direct,
+                );
+                hysteresis_down_probe.set_sensitive(
+                    status.capabilities.direct_fans
+                        && status.fan_control_mode == FanControlMode::Direct,
+                );
                 if !status.capabilities.direct_fans {
                     status_probe.set_label("Direct EC control is unavailable");
                     return;
                 }
-                let target = format!(
-                    "{}%",
-                    (i32::from(status.floor.effective_min_duty) * 100 + 127) / 255
-                );
+                let duties = status
+                    .direct_fan_duties
+                    .map(|duty| (i32::from(duty) * 100 + 127) / 255);
                 let rpms = format!("{} / {}", status.fan_rpms[0], status.fan_rpms[1]);
-                status_probe.set_label(&format!(
-                    "Direct control: {:?} · floor {target} · RPM {rpms}",
-                    status.floor.enforcement
-                ));
+                if status.fan_control_mode == FanControlMode::Direct {
+                    status_probe.set_label(&format!(
+                        "Direct EC PWM: {}% / {}% · RPM {rpms}",
+                        duties[0], duties[1]
+                    ));
+                } else {
+                    status_probe.set_label(&format!("Firmware fan control · RPM {rpms}"));
+                }
             }
             Err(error) => {
                 ppd_probe.set_sensitive(false);
                 direct_probe.set_sensitive(false);
+                hysteresis_up_probe.set_sensitive(false);
+                hysteresis_down_probe.set_sensitive(false);
                 uv_probe.set_sensitive(false);
                 apply_uv_probe.set_sensitive(false);
                 manual_uv_probe.set_sensitive(false);
@@ -257,11 +318,15 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let warning_direct = direct_warning.clone();
     let loading_direct = loading.clone();
     let apply_schedule_direct = apply_schedule.clone();
+    let hysteresis_up_direct = hysteresis_up.1.clone();
+    let hysteresis_down_direct = hysteresis_down.1.clone();
     direct_toggle.connect_toggled(move |toggle| {
         if loading_direct.active() {
             return;
         }
         warning_direct.set_visible(toggle.is_active());
+        hysteresis_up_direct.set_sensitive(toggle.is_active());
+        hysteresis_down_direct.set_sensitive(toggle.is_active());
         let id = editing_direct.borrow().clone();
         if let Some(profile) = state_direct.config.borrow_mut().find_mut(&id) {
             profile.fan_control_mode = if toggle.is_active() {
@@ -272,6 +337,27 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         }
         schedule_apply(&state_direct, &apply_schedule_direct);
     });
+
+    for (scale, upwards) in [(&hysteresis_up.1, true), (&hysteresis_down.1, false)] {
+        let state = state.clone();
+        let editing = editing_id.clone();
+        let loading = loading.clone();
+        let apply_schedule = apply_schedule.clone();
+        scale.connect_value_changed(move |scale| {
+            if loading.active() {
+                return;
+            }
+            let id = editing.borrow().clone();
+            if let Some(profile) = state.config.borrow_mut().find_mut(&id) {
+                if upwards {
+                    profile.fan_hysteresis_up = scale.value() as u8;
+                } else {
+                    profile.fan_hysteresis_down = scale.value() as u8;
+                }
+            }
+            schedule_apply(&state, &apply_schedule);
+        });
+    }
 
     // Persist curve edits into the profile currently selected in this window.
     let state_curve = state.clone();
@@ -316,6 +402,8 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             enabled: fan_toggle.clone(),
             direct: direct_toggle.clone(),
             direct_explanation: direct_warning.clone(),
+            hysteresis_up: hysteresis_up.1.clone(),
+            hysteresis_down: hysteresis_down.1.clone(),
         },
         power: PowerEditorView {
             spl: spl.clone(),
@@ -363,7 +451,10 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         }
         *editing_sel.borrow_mut() = next.id.clone();
         state_sel.config.borrow_mut().active_profile = next.id.clone();
-        editors_sel.load(next);
+        editors_sel.load(
+            next,
+            state_sel.config.borrow().disable_high_power_fan_protection,
+        );
         set_profile_action_sensitivity(&state_sel, &next.id, &rename_sel, &remove_sel);
         state_sel.apply_active(false);
     });
@@ -379,7 +470,10 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         };
         restored.factory_defaults();
         let ppd_profile = restored.ppd_profile.clone();
-        let request = ApplyRequest::from_profile(&restored, state_def.config.borrow().fan_floor);
+        let request = ApplyRequest::from_profile(
+            &restored,
+            state_def.config.borrow().disable_high_power_fan_protection,
+        );
         let client = state_def.client.clone();
         let state_done = state_def.clone();
         let editors_done = editors_def.clone();
@@ -414,7 +508,10 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                     if let Some(profile) = state_done.config.borrow_mut().find_mut(&id) {
                         *profile = restored.clone();
                     }
-                    editors_done.load(&restored);
+                    editors_done.load(
+                        &restored,
+                        state_done.config.borrow().disable_high_power_fan_protection,
+                    );
                     state_done.save_config();
                     toast_done.add_toast(adw::Toast::new("Factory defaults restored"));
                     if !warnings.is_empty() {
@@ -498,7 +595,10 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                 selector_rm.set_selected(selected as u32);
                 if let Some(profile) = profiles.get(selected) {
                     *editing_rm.borrow_mut() = profile.id.clone();
-                    editors_rm.load(profile);
+                    editors_rm.load(
+                        profile,
+                        state_rm.config.borrow().disable_high_power_fan_protection,
+                    );
                 }
             });
             set_profile_action_sensitivity(&state_rm, &active, &rename_rm, &remove_rm);
@@ -635,6 +735,8 @@ fn build_cpu_page(
     editing_id: &Rc<RefCell<String>>,
     loading: &SyncGuard,
     apply_schedule: &ApplySchedule,
+    first_editor: &CurveEditor,
+    second_editor: &CurveEditor,
 ) -> (
     gtk::Box,
     gtk::Scale,
@@ -707,16 +809,16 @@ fn build_cpu_page(
     page.append(&power_group);
 
     let warning = gtk::Label::new(Some(
-        "PL1 above 75 W requires force and clamps fans to an 80% floor.",
+        "At 80 W and above, the final points are protected at 80°C / at least 80% and 90°C / 100%.",
     ));
     warning.add_css_class("warning");
     warning.set_wrap(true);
-    warning.set_visible(pl1 > 75);
+    warning.set_visible(pl1 >= HIGH_POWER_THRESHOLD_W);
     page.append(&warning);
 
     let warning_vis = warning.clone();
     spl.1.connect_value_changed(move |s| {
-        warning_vis.set_visible(s.value() > 75.0);
+        warning_vis.set_visible(s.value() >= f64::from(HIGH_POWER_THRESHOLD_W));
     });
     install_ordering(&spl.1, &sppt.1, &fppt.1, loading);
 
@@ -730,11 +832,14 @@ fn build_cpu_page(
         let pl3 = fppt.1.clone();
         let loading = loading.clone();
         let apply_schedule = apply_schedule.clone();
+        let first_editor = first_editor.clone();
+        let second_editor = second_editor.clone();
         Rc::new(move || {
             if loading.active() {
                 return;
             }
             let id = editing.borrow().clone();
+            let high_power_disabled = state.config.borrow().disable_high_power_fan_protection;
             if let Some(profile) = state.config.borrow_mut().find_mut(&id) {
                 let ppd_profile = ppd
                     .selected_item()
@@ -764,6 +869,11 @@ fn build_cpu_page(
                 profile.pl1_spl = pl1.value() as u32;
                 profile.pl2_sppt = pl2.value() as u32;
                 profile.fppt = pl3.value() as u32;
+                let protection = profile.apply_power_limits
+                    && profile.pl1_spl >= HIGH_POWER_THRESHOLD_W
+                    && !high_power_disabled;
+                first_editor.set_high_power_protection(protection);
+                second_editor.set_high_power_protection(protection);
                 schedule_apply(&state, &apply_schedule);
             }
         })
@@ -798,6 +908,9 @@ fn build_advanced_page(
     editing_id: &Rc<RefCell<String>>,
     loading: &SyncGuard,
     apply_schedule: &ApplySchedule,
+    parent: &adw::Window,
+    first_editor: &CurveEditor,
+    second_editor: &CurveEditor,
 ) -> (gtk::Box, gtk::Scale, gtk::CheckButton, gtk::Button) {
     let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     page.set_margin_top(12);
@@ -867,64 +980,72 @@ fn build_advanced_page(
     note.set_xalign(0.0);
     page.append(&note);
 
-    let floor_group = adw::PreferencesGroup::builder()
-        .title("High-Power Fan Floor")
+    let protection_group = adw::PreferencesGroup::builder()
+        .title("High-Power Fan Protection")
         .description(
-            "At sustained power above 75W, firmware curves are transformed on write. \
-             Engage/release hysteresis and dwell are applied by direct EC control.",
+            "At 80 W and above, point 7 is locked to 80°C and at least 80%, and point 8 to \
+             90°C and 100%. Disabling this removes that safety constraint.",
         )
         .build();
-    let floor = state.config.borrow().fan_floor;
-    let engage = slider_row(
-        "Engage temperature (°C)",
-        floor.engage_temp_c as u32,
-        60,
-        70,
-    );
-    let release = slider_row(
-        "Release temperature (°C)",
-        floor.release_temp_c as u32,
-        50,
-        65,
-    );
-    let duty = slider_row("Minimum duty (PWM)", u32::from(floor.duty), 204, 255);
-    let dwell = slider_row(
-        "Minimum dwell (seconds)",
-        floor.dwell_ms as u32 / 1000,
-        5,
-        30,
-    );
-    floor_group.add(&engage.0);
-    floor_group.add(&release.0);
-    floor_group.add(&duty.0);
-    floor_group.add(&dwell.0);
-    page.append(&floor_group);
-    let update_floor = {
-        let state = state.clone();
-        let engage = engage.1.clone();
-        let release = release.1.clone();
-        let duty = duty.1.clone();
-        let dwell = dwell.1.clone();
-        let apply_schedule = apply_schedule.clone();
-        Rc::new(move || {
-            let engage_temp_c = engage.value() as i32;
-            let max_release = engage_temp_c - 5;
-            if release.value() as i32 > max_release {
-                release.set_value(max_release as f64);
-            }
-            state.config.borrow_mut().fan_floor = z13helper_core::FanFloorConfig {
-                engage_temp_c,
-                release_temp_c: release.value() as i32,
-                duty: duty.value() as u8,
-                dwell_ms: dwell.value() as u64 * 1000,
-            };
-            schedule_apply(&state, &apply_schedule);
-        })
-    };
-    for scale in [&engage.1, &release.1, &duty.1, &dwell.1] {
-        let update = update_floor.clone();
-        scale.connect_value_changed(move |_| update());
-    }
+    let disable_protection = gtk::CheckButton::with_label("Disable high-power fan protection");
+    disable_protection.set_active(state.config.borrow().disable_high_power_fan_protection);
+    protection_group.add(&disable_protection);
+    page.append(&protection_group);
+
+    let state_protection = state.clone();
+    let loading_protection = loading.clone();
+    let apply_schedule_protection = apply_schedule.clone();
+    let parent_protection = parent.clone();
+    let first_protection = first_editor.clone();
+    let second_protection = second_editor.clone();
+    disable_protection.connect_toggled(move |toggle| {
+        if loading_protection.active() {
+            return;
+        }
+        if toggle.is_active() {
+            loading_protection.run(|| toggle.set_active(false));
+            let dialog = adw::AlertDialog::new(
+                Some("Disable High-Power Fan Protection?"),
+                Some(
+                    "This allows fan curves below the protected 80°C / 80% and 90°C / 100% \
+                     endpoints while PL1 is 80 W or above. This can increase thermal risk.",
+                ),
+            );
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("disable", "Disable Protection");
+            dialog.set_close_response("cancel");
+            dialog.set_response_appearance("disable", adw::ResponseAppearance::Destructive);
+            let toggle = toggle.clone();
+            let state = state_protection.clone();
+            let schedule = apply_schedule_protection.clone();
+            let loading = loading_protection.clone();
+            let first = first_protection.clone();
+            let second = second_protection.clone();
+            dialog.connect_response(Some("disable"), move |_, _| {
+                state.config.borrow_mut().disable_high_power_fan_protection = true;
+                loading.run(|| toggle.set_active(true));
+                first.set_high_power_protection(false);
+                second.set_high_power_protection(false);
+                schedule_apply(&state, &schedule);
+            });
+            dialog.present(Some(&parent_protection));
+        } else {
+            state_protection
+                .config
+                .borrow_mut()
+                .disable_high_power_fan_protection = false;
+            let active = state_protection
+                .config
+                .borrow()
+                .active()
+                .is_some_and(|profile| {
+                    profile.apply_power_limits && profile.pl1_spl >= HIGH_POWER_THRESHOLD_W
+                });
+            first_protection.set_high_power_protection(active);
+            second_protection.set_high_power_protection(active);
+            schedule_apply(&state_protection, &apply_schedule_protection);
+        }
+    });
 
     if let Some(available) = state.undervolt_available.get() {
         uv.set_sensitive(available);
@@ -1030,6 +1151,8 @@ struct FanEditorView {
     enabled: gtk::CheckButton,
     direct: gtk::CheckButton,
     direct_explanation: gtk::Label,
+    hysteresis_up: gtk::Scale,
+    hysteresis_down: gtk::Scale,
 }
 
 struct PowerEditorView {
@@ -1046,10 +1169,15 @@ struct UndervoltEditorView {
 }
 
 impl ProfileEditorView {
-    fn load(&self, profile: &Profile) {
+    fn load(&self, profile: &Profile, disable_high_power_fan_protection: bool) {
         self.loading.run(|| {
             self.fans.first.set_curve(profile.fan_curves[0]);
             self.fans.second.set_curve(profile.fan_curves[1]);
+            let high_power = profile.apply_power_limits
+                && profile.pl1_spl >= HIGH_POWER_THRESHOLD_W
+                && !disable_high_power_fan_protection;
+            self.fans.first.set_high_power_protection(high_power);
+            self.fans.second.set_high_power_protection(high_power);
             self.fans.first.set_muted(!profile.apply_fan_curve);
             self.fans.second.set_muted(!profile.apply_fan_curve);
             self.fans.first.set_editable(profile.apply_fan_curve);
@@ -1061,6 +1189,18 @@ impl ProfileEditorView {
             self.fans
                 .direct_explanation
                 .set_visible(profile.fan_control_mode == FanControlMode::Direct);
+            self.fans
+                .hysteresis_up
+                .set_value(f64::from(profile.fan_hysteresis_up));
+            self.fans
+                .hysteresis_down
+                .set_value(f64::from(profile.fan_hysteresis_down));
+            self.fans
+                .hysteresis_up
+                .set_sensitive(profile.fan_control_mode == FanControlMode::Direct);
+            self.fans
+                .hysteresis_down
+                .set_sensitive(profile.fan_control_mode == FanControlMode::Direct);
             self.power.spl.set_value(profile.pl1_spl as f64);
             self.power.sppt.set_value(profile.pl2_sppt as f64);
             self.power.fppt.set_value(profile.fppt as f64);

@@ -67,14 +67,16 @@ mode, so untouched profiles restore their measured per-PPD five-value table.
 Each apply is validated and serialized by `z13helperd`. PPD selects the firmware
 power policy, after which the daemon applies optional PPT, two eight-point fan
 curves, and undervolt state in a fail-closed order. A PL1
-above 75 W is permitted only after fan protection has been prepared; lowering
+at 80 W or above is permitted only after fan protection has been prepared; lowering
 power happens before relaxing that protection.
 
-The high-power fan floor defaults to 204 PWM, engages at 70°C, releases at 65°C,
-and has a five-second dwell. Firmware mode transforms only the curve copy sent
-to firmware. Direct mode uses live engage/release hysteresis and dwell. Authored
-curves are never modified. There is intentionally no 96°C panic override: CPU
-and firmware throttling remain authoritative.
+At 80 W and above, the hardware copy locks point 7 to 80°C and at least 80% PWM and
+point 8 to 90°C and 100%. An Advanced override can disable this protection only
+after confirmation. Direct mode interpolates the curve into raw 0–255 EC PWM
+duty and provides per-profile 1–5 speed-up and slow-down temperature hysteresis,
+defaulting to 3/3 like G-Helper. RPM is read separately for telemetry. There is
+intentionally no 96°C panic override: CPU and firmware throttling remain
+authoritative.
 
 ## CLI
 

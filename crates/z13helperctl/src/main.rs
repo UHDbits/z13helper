@@ -38,7 +38,8 @@ fn current_request(client: &Client) -> Result<ApplyRequest, DaemonError> {
             .then_some(state.undervolt)
             .flatten()
             .map(|value| value.cpu_co),
-        floor: state.floor_config,
+        fan_hysteresis: state.fan_hysteresis,
+        disable_high_power_fan_protection: state.disable_high_power_fan_protection,
     })
 }
 

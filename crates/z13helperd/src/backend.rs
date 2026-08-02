@@ -1,16 +1,14 @@
 use std::collections::HashMap;
 
 use z13helper_core::apply::{apply_request, Daemon};
-use z13helper_core::curve::{Curve, TDP_MAX_SAFE};
+use z13helper_core::curve::{high_power_curve, Curve, HIGH_POWER_THRESHOLD_W};
 use z13helper_core::error::DaemonError;
 use z13helper_core::protocol::{
-    ApplyRequest, ApplyResponse, Capabilities, DaemonState, FanFloorConfig, FloorEnforcement,
-    FloorState, Health, LightingState, OverrideState, ProbeReply, TdpState, Telemetry,
-    UndervoltState,
+    ApplyRequest, ApplyResponse, Capabilities, DaemonState, FanHysteresis, Health, LightingState,
+    OverrideState, ProbeReply, TdpState, Telemetry, UndervoltState,
 };
 
 use crate::aura::AuraDevices;
-use crate::curve::firmware_curve;
 use crate::ec::{EcMailbox, LinuxPortIo};
 use crate::sensors;
 use crate::service::{Controller, HwmonSensors};
@@ -21,7 +19,8 @@ pub struct PlatformHardware {
     sysfs: Sysfs,
     aura: AuraDevices,
     direct: Controller<LinuxPortIo, HwmonSensors>,
-    floor: FanFloorConfig,
+    fan_hysteresis: FanHysteresis,
+    disable_high_power_fan_protection: bool,
     undervolt_available: bool,
     ppd_profiles: Vec<String>,
     ppd_profile: Option<String>,
@@ -42,7 +41,8 @@ impl PlatformHardware {
                 sysfs,
                 aura,
                 direct,
-                floor: FanFloorConfig::default(),
+                fan_hysteresis: FanHysteresis::default(),
+                disable_high_power_fan_protection: false,
                 undervolt_available,
                 ppd_profiles,
                 ppd_profile,
@@ -51,8 +51,9 @@ impl PlatformHardware {
         ))
     }
 
-    pub fn set_floor(&mut self, floor: FanFloorConfig) {
-        self.floor = floor;
+    pub fn set_fan_policy(&mut self, hysteresis: FanHysteresis, disable_high_power: bool) {
+        self.fan_hysteresis = hysteresis;
+        self.disable_high_power_fan_protection = disable_high_power;
     }
 
     pub fn tick(&mut self) -> Result<(), String> {
@@ -145,10 +146,12 @@ impl Daemon for PlatformHardware {
         curves: &[Curve; 2],
         effective_pl1: u32,
     ) -> Result<(), DaemonError> {
-        let written = [
-            firmware_curve(&curves[0], effective_pl1, self.floor),
-            firmware_curve(&curves[1], effective_pl1, self.floor),
-        ];
+        let written =
+            if effective_pl1 >= HIGH_POWER_THRESHOLD_W && !self.disable_high_power_fan_protection {
+                [high_power_curve(&curves[0]), high_power_curve(&curves[1])]
+            } else {
+                *curves
+            };
         self.sysfs
             .set_firmware_curves(&written)
             .map_err(DaemonError::Rejected)?;
@@ -158,10 +161,16 @@ impl Daemon for PlatformHardware {
     fn direct_fans_set(
         &mut self,
         curves: &[Curve; 2],
-        _effective_pl1: u32,
+        effective_pl1: u32,
     ) -> Result<(), DaemonError> {
+        let written =
+            if effective_pl1 >= HIGH_POWER_THRESHOLD_W && !self.disable_high_power_fan_protection {
+                [high_power_curve(&curves[0]), high_power_curve(&curves[1])]
+            } else {
+                *curves
+            };
         self.direct
-            .enable(*curves, self.floor)
+            .enable(written, self.fan_hysteresis)
             .map_err(DaemonError::Rejected)
     }
 
@@ -251,13 +260,19 @@ impl Backend {
     pub fn apply(&mut self, request: ApplyRequest) -> Result<ApplyResponse, DaemonError> {
         self.prevalidate(&request)?;
         let previous = self.persisted.desired.clone();
-        self.hardware.set_floor(request.floor);
+        self.hardware.set_fan_policy(
+            request.fan_hysteresis,
+            request.disable_high_power_fan_protection,
+        );
         let warnings = match apply_request(&mut self.hardware, &request) {
             Ok(warnings) => warnings,
             Err(error) => {
                 match previous {
                     Some(previous) => {
-                        self.hardware.set_floor(previous.floor);
+                        self.hardware.set_fan_policy(
+                            previous.fan_hysteresis,
+                            previous.disable_high_power_fan_protection,
+                        );
                         if let Err(rollback) = apply_request(&mut self.hardware, &previous) {
                             self.persisted.state.degraded = true;
                             self.persisted.state.warnings.push(format!(
@@ -302,7 +317,9 @@ impl Backend {
                 z13helper_core::stock_fan_curves(request.ppd_profile.as_deref())
             }));
         self.persisted.state.fan_control_mode = request.fan_mode;
-        self.persisted.state.floor_config = request.floor;
+        self.persisted.state.fan_hysteresis = request.fan_hysteresis;
+        self.persisted.state.disable_high_power_fan_protection =
+            request.disable_high_power_fan_protection;
         self.persisted.state.undervolt = request.undervolt.map(|cpu_co| UndervoltState {
             cpu_co,
             active: self.hardware.undervolt_available,
@@ -376,7 +393,10 @@ impl Backend {
         })();
 
         let restore = if let Some(previous) = previous {
-            self.hardware.set_floor(previous.floor);
+            self.hardware.set_fan_policy(
+                previous.fan_hysteresis,
+                previous.disable_high_power_fan_protection,
+            );
             apply_request(&mut self.hardware, &previous).map(|_| ())
         } else if let Some(original_ppd) = original_ppd {
             PlatformHardware::ppd_set_blocking(&original_ppd)
@@ -473,10 +493,15 @@ impl Backend {
             .persisted
             .state
             .tdp
-            .is_some_and(|tdp| tdp.pl1_spl > TDP_MAX_SAFE as i32)
+            .is_some_and(|tdp| tdp.pl1_spl >= HIGH_POWER_THRESHOLD_W as i32)
+            && !self
+                .persisted
+                .desired
+                .as_ref()
+                .is_some_and(|request| request.disable_high_power_fan_protection)
         {
             return Err(DaemonError::Rejected(
-                "lower PL1 to 75 W or below before releasing fan protection".into(),
+                "lower PL1 below 80 W before releasing fan protection".into(),
             ));
         }
         self.hardware.fans_release()?;
@@ -485,7 +510,6 @@ impl Backend {
         }
         self.persisted.state.fan_curves = None;
         self.persisted.state.overrides.fans = false;
-        self.persisted.state.floor = FloorState::default();
         self.bump_and_save()
     }
 
@@ -564,35 +588,9 @@ impl Backend {
             .tdp
             .map(|state| state.pl1_spl.max(0) as u32)
             .unwrap_or(0);
-        let direct = self.hardware.direct.direct_enabled();
-        let gate = self.hardware.direct.gate();
-        self.persisted.state.floor = if direct {
-            FloorState {
-                enforcement: if gate.engaged {
-                    FloorEnforcement::DirectEngaged
-                } else {
-                    FloorEnforcement::DirectReleased
-                },
-                armed: pl1 > TDP_MAX_SAFE,
-                engaged: gate.engaged,
-                effective_min_duty: if gate.engaged {
-                    self.persisted.state.floor_config.duty
-                } else {
-                    0
-                },
-            }
-        } else if pl1 > TDP_MAX_SAFE && self.persisted.state.fan_curves.is_some() {
-            FloorState {
-                enforcement: FloorEnforcement::FirmwareArmed,
-                armed: true,
-                engaged: self.persisted.state.temperature.is_some_and(|temperature| {
-                    temperature >= self.persisted.state.floor_config.engage_temp_c
-                }),
-                effective_min_duty: self.persisted.state.floor_config.duty,
-            }
-        } else {
-            FloorState::default()
-        };
+        self.persisted.state.direct_fan_duties = self.hardware.direct.last_duty();
+        self.persisted.state.high_power_fan_protection =
+            pl1 >= HIGH_POWER_THRESHOLD_W && !self.hardware.disable_high_power_fan_protection;
         self.persisted.state.telemetry = Telemetry {
             temperature_c: self.persisted.state.temperature,
             fan_rpms: self.persisted.state.fan_rpms,
@@ -684,7 +682,7 @@ fn effective_battery_limit(one_time_charge: bool, normal_limit: Option<i32>) -> 
 
 fn validate_factory_curve_query_power(tdp: Option<TdpState>) -> Result<(), DaemonError> {
     let pl1 = tdp.map(|tdp| tdp.pl1_spl.max(0) as u32).unwrap_or(0);
-    if pl1 > TDP_MAX_SAFE {
+    if pl1 >= HIGH_POWER_THRESHOLD_W {
         return Err(DaemonError::Rejected(format!(
             "factory fan curves cannot be read while PL1 is {pl1} W; lower power first"
         )));
@@ -733,8 +731,8 @@ mod tests {
             pl1_spl: pl1,
             ..TdpState::default()
         };
-        assert!(validate_factory_curve_query_power(Some(tdp(75))).is_ok());
-        assert!(validate_factory_curve_query_power(Some(tdp(76))).is_err());
+        assert!(validate_factory_curve_query_power(Some(tdp(79))).is_ok());
+        assert!(validate_factory_curve_query_power(Some(tdp(80))).is_err());
     }
 
     #[test]

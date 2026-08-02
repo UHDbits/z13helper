@@ -36,7 +36,8 @@ pub struct Config {
     pub show_hud: bool,
     #[serde(default)]
     pub panel_overdrive_always_on: bool,
-    pub fan_floor: crate::protocol::FanFloorConfig,
+    #[serde(default)]
+    pub disable_high_power_fan_protection: bool,
     pub profiles: Vec<Profile>,
 }
 
@@ -51,7 +52,7 @@ impl Default for Config {
             power_source_debounce_ms: 2000,
             show_hud: true,
             panel_overdrive_always_on: false,
-            fan_floor: crate::protocol::FanFloorConfig::default(),
+            disable_high_power_fan_protection: false,
             profiles: builtin_profiles(),
         }
     }
@@ -107,12 +108,6 @@ impl Config {
             return Err(ConfigError::UnsupportedVersion(version));
         }
         let mut cfg: Config = serde_json::from_value(value)?;
-        cfg.fan_floor.validate().map_err(|message| {
-            ConfigError::Json(serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                message,
-            )))
-        })?;
         cfg.ensure_builtins();
         Ok(cfg)
     }
