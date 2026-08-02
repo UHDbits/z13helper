@@ -22,7 +22,11 @@ fn main() {
         }
     }
 
+    let prefer_dark = consume_legacy_dark_preference();
     let app = adw::Application::new(Some(APPLICATION_ID), gio::ApplicationFlags::empty());
+    if prefer_dark {
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::PreferDark);
+    }
     app.connect_startup(|_| {
         resources::register();
         css::install();
@@ -41,6 +45,18 @@ fn main() {
         state.activate();
     });
     app.run();
+}
+
+fn consume_legacy_dark_preference() -> bool {
+    gtk4::init().expect("GTK could not connect to the display");
+    let Some(settings) = gtk4::Settings::default() else {
+        return false;
+    };
+    let prefer_dark = settings.is_gtk_application_prefer_dark_theme();
+    if prefer_dark {
+        settings.set_gtk_application_prefer_dark_theme(false);
+    }
+    prefer_dark
 }
 
 fn install_standard_actions(app: &adw::Application) {

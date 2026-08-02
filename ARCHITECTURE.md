@@ -132,6 +132,11 @@ and active-window routing apply consistently. Window headers expose close
 controls without minimize controls. Icon-only and profile action buttons expose
 explicit accessible names and tooltips.
 
+On KDE, the process consumes the legacy GTK dark-theme preference before
+libadwaita initializes and transfers it to `AdwStyleManager::PreferDark`. This
+preserves Plasma's dark appearance without using libadwaita's unsupported
+`gtk-application-prefer-dark-theme` path or modifying the user's GTK settings.
+
 ## Lifecycle and packaging
 
 The systemd unit uses `RuntimeDirectory=z13helper`,
