@@ -59,14 +59,15 @@ pub fn apply_request(
     }
 
     let pl1 = request.effective_pl1();
+    let limits = request.effective_power_limits();
     let curves = selected_curves(request);
     if pl1 > TDP_MAX_SAFE {
         set_fans(daemon, request, &curves, pl1)?;
-        if let Some(limits) = request.power_limits {
+        if let Some(limits) = limits {
             daemon.tdp_set(limits, true)?;
         }
     } else {
-        if let Some(limits) = request.power_limits {
+        if let Some(limits) = limits {
             daemon.tdp_set(limits, false)?;
         }
         if request.fan_curves.is_some() {
@@ -120,7 +121,10 @@ mod tests {
             Ok(None)
         }
         fn tdp_set(&mut self, limits: TdpState, force: bool) -> Result<(), DaemonError> {
-            self.call(format!("tdp:{}:force={force}", limits.pl1_spl))
+            self.call(format!(
+                "tdp:{}/{}/{}/{}/{}:force={force}",
+                limits.pl1_spl, limits.pl2_sppt, limits.fppt, limits.apu_sppt, limits.platform_sppt
+            ))
         }
         fn firmware_fans_set(&mut self, _: &[Curve; 2], _: u32) -> Result<(), DaemonError> {
             self.call("firmware-fans")
@@ -185,6 +189,32 @@ mod tests {
         let request = ApplyRequest::from_profile(&profile, FanFloorConfig::default());
         let mut daemon = RecordingDaemon::default();
         apply_request(&mut daemon, &request).unwrap();
-        assert_eq!(daemon.calls.into_inner(), ["ppd:balanced", "fans-release"]);
+        assert_eq!(
+            daemon.calls.into_inner(),
+            [
+                "ppd:balanced",
+                "tdp:52/71/70/70/70:force=false",
+                "fans-release"
+            ]
+        );
+    }
+
+    #[test]
+    fn stock_profiles_write_distinct_power_tables() {
+        for (id, expected) in [
+            ("silent", "tdp:40/55/55/70/70:force=false"),
+            ("balanced", "tdp:52/71/70/70/70:force=false"),
+            ("turbo", "tdp:70/86/86/70/70:force=false"),
+        ] {
+            let profile = Profile::builtin(id, id);
+            let request = ApplyRequest::from_profile(&profile, FanFloorConfig::default());
+            let mut daemon = RecordingDaemon::default();
+            apply_request(&mut daemon, &request).unwrap();
+            assert!(daemon
+                .calls
+                .into_inner()
+                .iter()
+                .any(|call| call == expected));
+        }
     }
 }

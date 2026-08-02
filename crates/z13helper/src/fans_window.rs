@@ -6,7 +6,7 @@ use std::rc::Rc;
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use z13helper_core::{stock_fan_curves, ApplyRequest, FanControlMode, Profile};
+use z13helper_core::{stock_fan_curves, stock_ppt, ApplyRequest, FanControlMode, Profile};
 
 use crate::app::AppState;
 use crate::services::worker;
@@ -718,7 +718,7 @@ fn build_cpu_page(
     spl.1.connect_value_changed(move |s| {
         warning_vis.set_visible(s.value() > 75.0);
     });
-    install_ordering(&spl.1, &sppt.1, &fppt.1);
+    install_ordering(&spl.1, &sppt.1, &fppt.1, loading);
 
     let update = {
         let state = state.clone();
@@ -747,6 +747,18 @@ fn build_cpu_page(
                     if !profile.apply_fan_curve {
                         profile.fan_curves = stock_fan_curves(profile.ppd_profile.as_deref());
                     }
+                    if !profile.apply_power_limits {
+                        let (stock_pl1, stock_pl2, stock_fppt) =
+                            stock_ppt(profile.ppd_profile.as_deref());
+                        profile.pl1_spl = stock_pl1;
+                        profile.pl2_sppt = stock_pl2;
+                        profile.fppt = stock_fppt;
+                        loading.run(|| {
+                            pl1.set_value(profile.pl1_spl as f64);
+                            pl2.set_value(profile.pl2_sppt as f64);
+                            pl3.set_value(profile.fppt as f64);
+                        });
+                    }
                 }
                 profile.apply_power_limits = power.is_active();
                 profile.pl1_spl = pl1.value() as u32;
@@ -764,6 +776,10 @@ fn build_cpu_page(
     let fppt_toggle = fppt.1.clone();
     apply_power.connect_toggled(move |toggle| {
         let enabled = toggle.is_active();
+        if enabled {
+            sppt_toggle.set_value(sppt_toggle.value().max(spl_toggle.value()));
+            fppt_toggle.set_value(fppt_toggle.value().max(sppt_toggle.value()));
+        }
         spl_toggle.set_sensitive(enabled);
         sppt_toggle.set_sensitive(enabled);
         fppt_toggle.set_sensitive(enabled);
@@ -1062,10 +1078,14 @@ impl ProfileEditorView {
     }
 }
 
-fn install_ordering(pl1: &gtk::Scale, pl2: &gtk::Scale, pl3: &gtk::Scale) {
+fn install_ordering(pl1: &gtk::Scale, pl2: &gtk::Scale, pl3: &gtk::Scale, loading: &SyncGuard) {
     let pl2c = pl2.clone();
     let pl3c = pl3.clone();
+    let loading_pl1 = loading.clone();
     pl1.connect_value_changed(move |s| {
+        if loading_pl1.active() {
+            return;
+        }
         if pl2c.value() < s.value() {
             pl2c.set_value(s.value());
         }
@@ -1075,7 +1095,11 @@ fn install_ordering(pl1: &gtk::Scale, pl2: &gtk::Scale, pl3: &gtk::Scale) {
     });
     let pl1c = pl1.clone();
     let pl3c = pl3.clone();
+    let loading_pl2 = loading.clone();
     pl2.connect_value_changed(move |s| {
+        if loading_pl2.active() {
+            return;
+        }
         if s.value() < pl1c.value() {
             s.set_value(pl1c.value());
         }
@@ -1084,7 +1108,11 @@ fn install_ordering(pl1: &gtk::Scale, pl2: &gtk::Scale, pl3: &gtk::Scale) {
         }
     });
     let pl2c = pl2.clone();
+    let loading_pl3 = loading.clone();
     pl3.connect_value_changed(move |s| {
+        if loading_pl3.active() {
+            return;
+        }
         if s.value() < pl2c.value() {
             s.set_value(pl2c.value());
         }

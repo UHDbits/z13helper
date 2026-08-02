@@ -61,6 +61,8 @@ only in the user configuration. PPD is independently selectable when
 power-profiles-daemon is available. On first use, the GUI asks the daemon to
 load each built-in profile's factory CPU and GPU curve tables from firmware;
 the bundled G-Helper-derived curves remain the fallback when that query fails.
+ASUS PPT attributes retain the last values written and have no factory-read
+mode, so untouched profiles restore their measured per-PPD five-value table.
 
 Each apply is validated and serialized by `z13helperd`. PPD selects the firmware
 power policy, after which the daemon applies optional PPT, two eight-point fan

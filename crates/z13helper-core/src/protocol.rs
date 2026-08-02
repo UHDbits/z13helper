@@ -73,6 +73,21 @@ pub struct TdpState {
     pub platform_sppt: i32,
 }
 
+/// Measured complete stock table for each PPD-selected firmware policy.
+/// ASUS PPT sysfs nodes retain the last values written and expose no reset or
+/// factory-read operation, so selecting an unmodified profile rewrites this
+/// table explicitly.
+pub fn stock_tdp(ppd_profile: Option<&str>) -> Option<TdpState> {
+    let (pl1_spl, pl2_sppt, fppt) = stock_ppt(ppd_profile);
+    ppd_profile.map(|_| TdpState {
+        pl1_spl: pl1_spl as i32,
+        pl2_sppt: pl2_sppt as i32,
+        fppt: fppt as i32,
+        apu_sppt: 70,
+        platform_sppt: 70,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UndervoltState {
     pub cpu_co: i32,
@@ -255,8 +270,13 @@ impl ApplyRequest {
         }
     }
 
-    pub fn effective_pl1(&self) -> u32 {
+    pub fn effective_power_limits(&self) -> Option<TdpState> {
         self.power_limits
+            .or_else(|| stock_tdp(self.ppd_profile.as_deref()))
+    }
+
+    pub fn effective_pl1(&self) -> u32 {
+        self.effective_power_limits()
             .map(|tdp| tdp.pl1_spl.max(0) as u32)
             .unwrap_or_else(|| stock_ppt(self.ppd_profile.as_deref()).0)
     }

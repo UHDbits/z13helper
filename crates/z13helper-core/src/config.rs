@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::profile::{stock_fan_curves, Profile};
+use crate::profile::{stock_fan_curves, stock_ppt, Profile};
 
 pub const CONFIG_VERSION: u32 = 1;
 
@@ -139,8 +139,7 @@ impl Config {
     }
 
     /// Ensure the three built-ins exist (re-seed if a user deleted them).
-    /// When a builtin is not applying a custom curve, refresh the preview
-    /// curve from the corresponding PPD fallback so the modes differ.
+    /// Keep inactive built-in controls on their per-PPD stock values.
     pub fn ensure_builtins(&mut self) {
         for builtin in builtin_profiles() {
             if !self.profiles.iter().any(|p| p.id == builtin.id) {
@@ -150,6 +149,12 @@ impl Config {
         for p in &mut self.profiles {
             if p.builtin && !p.apply_fan_curve && !p.factory_fan_curves_loaded {
                 p.fan_curves = stock_fan_curves(p.ppd_profile.as_deref());
+            }
+            if p.builtin && !p.apply_power_limits {
+                let (pl1, pl2, fppt) = stock_ppt(p.ppd_profile.as_deref());
+                p.pl1_spl = pl1;
+                p.pl2_sppt = pl2;
+                p.fppt = fppt;
             }
         }
         self.profiles.sort_by_key(|p| match p.id.as_str() {
