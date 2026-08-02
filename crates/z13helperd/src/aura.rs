@@ -44,7 +44,12 @@ impl AuraDevices {
                 None
             };
             if let Some(name) = name {
-                found.insert(name.to_owned(), self.dev_root.join(entry.file_name()));
+                let descriptor = entry.path().join("device/report_descriptor");
+                if has_aura_report(&descriptor) {
+                    found
+                        .entry(name.to_owned())
+                        .or_insert_with(|| self.dev_root.join(entry.file_name()));
+                }
             }
         }
         self.devices.retain(|name, _| found.contains_key(name));
@@ -74,6 +79,14 @@ impl AuraDevices {
             .ok_or_else(|| format!("Aura {device} device is not connected"))?;
         apply_to_writer(file, state)
     }
+}
+
+fn has_aura_report(path: &std::path::Path) -> bool {
+    fs::read(path).is_ok_and(|descriptor| descriptor_has_aura_report(&descriptor))
+}
+
+fn descriptor_has_aura_report(descriptor: &[u8]) -> bool {
+    descriptor.windows(2).any(|item| item == [0x85, REPORT_ID])
 }
 
 fn apply_to_writer(writer: &mut impl Write, state: &LightingState) -> Result<(), String> {
@@ -188,6 +201,13 @@ mod tests {
         assert!(parse_color("black").is_err());
         assert_eq!(mode_byte("rainbow").unwrap(), 3);
         assert_eq!(speed_byte("fast").unwrap(), 0xF5);
+    }
+
+    #[test]
+    fn only_aura_report_descriptors_are_accepted() {
+        assert!(descriptor_has_aura_report(&[0x05, 0x0C, 0x85, 0x5D, 0x09]));
+        assert!(!descriptor_has_aura_report(&[0x05, 0x0C, 0x85, 0x5A, 0x09]));
+        assert!(!descriptor_has_aura_report(&[0x5D, 0x85]));
     }
 
     #[test]
