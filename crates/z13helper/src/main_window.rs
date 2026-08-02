@@ -14,12 +14,14 @@ use crate::services::worker;
 use crate::ui::fans_window;
 use crate::ui::sync::SyncGuard;
 
+const MAIN_WINDOW_WIDTH: i32 = 368;
+
 pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     let window = adw::ApplicationWindow::builder()
         .application(&state.app)
         .title("z13helper")
-        .default_width(460)
-        .default_height(640)
+        .default_width(MAIN_WINDOW_WIDTH)
+        .resizable(false)
         .build();
 
     let toolbar = adw::ToolbarView::new();
@@ -56,7 +58,8 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     mode_header.append(&telemetry);
     content.append(&mode_header);
 
-    // Built-in row always visible; only custom profiles scroll if they overflow.
+    // Keep quick mode switching focused on the three built-ins. Custom profiles
+    // are created, selected, and edited in Fans + Power.
     let mode_grid = gtk::Grid::builder()
         .column_spacing(8)
         .row_spacing(8)
@@ -104,7 +107,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         mode_buttons.borrow_mut().push((id.to_string(), button));
     }
 
-    let fans = gtk::Button::with_label("Fans + Power");
+    let fans = gtk::Button::with_label("Fans +\nPower");
     fans.add_css_class("editor-button");
     fans.set_hexpand(true);
     let parent = window.clone();
@@ -112,61 +115,6 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     fans.connect_clicked(move |_| fans_window::present(&state_fans, &parent));
     mode_grid.attach(&fans, 3, 0, 1, 1);
 
-    let custom_profiles: Vec<_> = state
-        .config
-        .borrow()
-        .profiles
-        .iter()
-        .filter(|p| !p.builtin)
-        .cloned()
-        .collect();
-    if !custom_profiles.is_empty() {
-        let custom_scroll = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .propagate_natural_height(true)
-            .max_content_height(120)
-            .build();
-        let custom_box = gtk::FlowBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .homogeneous(true)
-            .max_children_per_line(4)
-            .min_children_per_line(2)
-            .column_spacing(8)
-            .row_spacing(8)
-            .build();
-        for profile in custom_profiles {
-            let button = gtk::ToggleButton::with_label(&profile.name);
-            button.add_css_class("mode-button");
-            button.add_css_class("custom");
-            if let Some(group) = mode_group.as_ref() {
-                button.set_group(Some(group));
-            } else {
-                mode_group = Some(button.clone());
-            }
-            let id = profile.id.clone();
-            let state_click = state.clone();
-            let label = mode_label_w.clone();
-            let buttons = mode_buttons.clone();
-            let mode_sync = sync.clone();
-            button.connect_toggled(move |button| {
-                if mode_sync.active() || !button.is_active() {
-                    return;
-                }
-                select_profile(&state_click, &id);
-                label.set_label(&current_label(&state_click));
-                mode_sync.run(|| {
-                    refresh_active_buttons(&buttons, &state_click.config.borrow().active_profile)
-                });
-            });
-            mode_buttons
-                .borrow_mut()
-                .push((profile.id.clone(), button.clone()));
-            custom_box.append(&button);
-        }
-        custom_scroll.set_child(Some(&custom_box));
-        content.append(&custom_scroll);
-    }
     sync.run(|| refresh_active_buttons(&mode_buttons, &state.config.borrow().active_profile));
 
     // --- Display ---
@@ -316,6 +264,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
         .child(&clamp)
         .build();
     let toast_overlay = adw::ToastOverlay::new();
