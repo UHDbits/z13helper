@@ -239,6 +239,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let manual_uv_probe = advanced.3.clone();
     let undervolt_note_probe = advanced.4.clone();
     let cpu_temp_probe = advanced.5.clone();
+    let loading_probe = loading.clone();
     worker::blocking(
         move || manual_probe.get_state(),
         move |result| match result {
@@ -251,7 +252,12 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                 manual_uv_probe.set_sensitive(status.undervolt_available);
                 cpu_temp_probe.set_sensitive(status.undervolt_available);
                 undervolt_note_probe.set_visible(!status.undervolt_available);
-                sync_ppd_choices(&ppd_probe, &status.capabilities.ppd_profiles, &state_probe);
+                sync_ppd_choices(
+                    &ppd_probe,
+                    &status.capabilities.ppd_profiles,
+                    &state_probe,
+                    &loading_probe,
+                );
                 direct_probe.set_sensitive(status.capabilities.direct_fans);
                 hysteresis_up_probe.set_sensitive(
                     status.capabilities.direct_fans
@@ -1433,11 +1439,15 @@ fn slider_row_with_margin(
     (row, scale)
 }
 
-fn sync_ppd_choices(dropdown: &adw::ComboRow, profiles: &[String], state: &AppState) {
+fn sync_ppd_choices(
+    dropdown: &adw::ComboRow,
+    profiles: &[String],
+    state: &AppState,
+    loading: &SyncGuard,
+) {
     let mut choices = profiles.to_vec();
     choices.push("disabled".into());
     let references: Vec<&str> = choices.iter().map(String::as_str).collect();
-    dropdown.set_model(Some(&gtk::StringList::new(&references)));
     let selected = state
         .config
         .borrow()
@@ -1445,8 +1455,11 @@ fn sync_ppd_choices(dropdown: &adw::ComboRow, profiles: &[String], state: &AppSt
         .and_then(|profile| profile.ppd_profile.as_ref())
         .and_then(|selected| profiles.iter().position(|profile| profile == selected))
         .unwrap_or(profiles.len());
-    dropdown.set_selected(selected as u32);
-    dropdown.set_sensitive(!profiles.is_empty());
+    loading.run(|| {
+        dropdown.set_model(Some(&gtk::StringList::new(&references)));
+        dropdown.set_selected(selected as u32);
+        dropdown.set_sensitive(!profiles.is_empty());
+    });
 }
 
 fn select_dropdown_string(dropdown: &adw::ComboRow, target: &str) {
