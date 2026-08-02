@@ -158,8 +158,6 @@ pub struct DaemonState {
     #[serde(default)]
     pub battery: BatteryTelemetry,
     #[serde(default)]
-    pub boot_sound: Option<i32>,
-    #[serde(default)]
     pub panel_overdrive: Option<i32>,
     #[serde(default)]
     pub fan_curves: Option<[Curve; 2]>,
@@ -211,7 +209,6 @@ impl Default for DaemonState {
             battery_limit: None,
             battery_one_time_charge: false,
             battery: BatteryTelemetry::default(),
-            boot_sound: None,
             panel_overdrive: None,
             fan_curves: None,
             fan_control_mode: FanControlMode::Firmware,
@@ -323,9 +320,6 @@ pub enum Command {
         enabled: bool,
     },
     SetPanelOverdrive {
-        enabled: bool,
-    },
-    SetBootSound {
         enabled: bool,
     },
     SetLighting {

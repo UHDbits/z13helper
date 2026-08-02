@@ -12,7 +12,7 @@ fn usage() -> ! {
          fans <firmware|direct|off> [curves-json-file]\n\
          lighting <keyboard|lightbar> <off|mode> [color] [brightness]\n\
          battery-limit <40..100>\n  battery-charge-once <on|off>\n  panel-overdrive <on|off>\n\
-         boot-sound <on|off>\n  release-fans"
+         release-fans"
     );
     std::process::exit(2)
 }
@@ -213,14 +213,6 @@ fn run() -> Result<(), String> {
         "panel-overdrive" => {
             client
                 .panel_overdrive_set(i32::from(parse_bool(
-                    &args.next().unwrap_or_else(|| usage()),
-                )?))
-                .map_err(|e| e.to_string())?;
-            print_ok()?;
-        }
-        "boot-sound" => {
-            client
-                .boot_sound_set(i32::from(parse_bool(
                     &args.next().unwrap_or_else(|| usage()),
                 )?))
                 .map_err(|e| e.to_string())?;

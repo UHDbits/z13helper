@@ -107,13 +107,6 @@ impl Client {
         Ok(())
     }
 
-    pub fn boot_sound_set(&self, value: i32) -> Result<(), DaemonError> {
-        self.exchange(Command::SetBootSound {
-            enabled: value != 0,
-        })?;
-        Ok(())
-    }
-
     pub fn apply_lighting(
         &self,
         mode: &str,

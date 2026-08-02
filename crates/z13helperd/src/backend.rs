@@ -377,15 +377,6 @@ impl Backend {
         self.bump_and_save()
     }
 
-    pub fn set_boot_sound(&mut self, enabled: bool) -> Result<(), DaemonError> {
-        self.hardware
-            .sysfs
-            .set_armoury_bool("boot_sound", enabled)
-            .map_err(DaemonError::Rejected)?;
-        self.persisted.state.boot_sound = Some(i32::from(enabled));
-        self.bump_and_save()
-    }
-
     pub fn set_lighting(
         &mut self,
         device: String,
@@ -478,9 +469,6 @@ impl Backend {
         self.complete_one_time_charge_if_full();
         if let Ok(value) = self.hardware.sysfs.read_armoury_bool("panel_overdrive") {
             self.persisted.state.panel_overdrive = Some(value);
-        }
-        if let Ok(value) = self.hardware.sysfs.read_armoury_bool("boot_sound") {
-            self.persisted.state.boot_sound = Some(value);
         }
         if let Ok(snapshot) = sensors::read_snapshot() {
             self.persisted.state.temperature = Some(snapshot.apu_temperature_c);

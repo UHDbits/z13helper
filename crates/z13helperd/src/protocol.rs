@@ -44,7 +44,6 @@ fn dispatch(backend: &mut Backend, command: Command) -> Result<WireResponse, Dae
             backend.set_battery_one_time_charge(enabled)?
         }
         Command::SetPanelOverdrive { enabled } => backend.set_panel_overdrive(enabled)?,
-        Command::SetBootSound { enabled } => backend.set_boot_sound(enabled)?,
         Command::SetLighting { device, state } => backend.set_lighting(device, state)?,
         Command::ReleaseFans => backend.release_fans()?,
         Command::Subscribe { .. } => unreachable!(),
