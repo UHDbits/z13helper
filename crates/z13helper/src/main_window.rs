@@ -192,7 +192,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     // --- Battery ---
     let battery = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let batt_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let batt_icon = gtk::Image::from_icon_name("battery-symbolic");
+    let batt_icon = gtk::Image::from_icon_name("z13helper-battery-limit-symbolic");
     let batt_titles = gtk::Box::new(gtk::Orientation::Vertical, 0);
     batt_titles.set_hexpand(true);
     let batt_title = gtk::Label::new(Some("Battery Charge Limit"));

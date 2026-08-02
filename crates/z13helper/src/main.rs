@@ -1,6 +1,7 @@
 //! z13helper — G-Helper-style control panel for z13helperd.
 mod app;
 mod css;
+mod resources;
 mod services;
 mod ui;
 
@@ -26,7 +27,10 @@ fn main() {
     }
 
     let app = adw::Application::new(Some(APPLICATION_ID), gio::ApplicationFlags::empty());
-    app.connect_startup(|_| css::install());
+    app.connect_startup(|_| {
+        resources::register();
+        css::install();
+    });
     let state = Rc::new(RefCell::new(None));
     app.connect_activate(move |app| {
         let state = state

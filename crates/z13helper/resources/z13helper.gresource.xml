@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/com/ashtonantila/z13helper/icons">
+    <file alias="scalable/status/z13helper-battery-limit-symbolic.svg">z13helper-battery-limit-symbolic.svg</file>
+  </gresource>
+</gresources>
