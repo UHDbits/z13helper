@@ -39,16 +39,24 @@ ProtectClock=yes
 ProtectControlGroups=yes
 ProtectKernelLogs=yes
 ProtectKernelModules=yes
-ProtectKernelTunables=yes
+# ProtectKernelTunables remounts the sysfs superblock read-only. A nested
+# ReadWritePaths bind cannot undo that superblock flag, so use explicit
+# read-only mounts and grant only the hardware endpoints below.
+ProtectKernelTunables=no
 ProtectProc=invisible
 ProcSubset=pid
+ReadOnlyPaths=/sys -/proc/sys -/proc/sysrq-trigger -/proc/latency_stats
+ReadOnlyPaths=-/proc/acpi -/proc/timer_stats -/proc/fs -/proc/irq
+InaccessiblePaths=-/proc/kallsyms -/proc/kcore
 ReadWritePaths=/run/z13helper /var/lib/z13helper
+# /sys/class entries are symlinks, so grant the resolved GZ302EA backends
+# instead of relying on writable-looking class directories.
+ReadWritePaths=-/sys/devices/platform/AMDI0105:00/platform-profile
 ReadWritePaths=-/sys/devices/platform/asus-nb-wmi
-ReadWritePaths=-/sys/class/platform-profile
 ReadWritePaths=-/sys/firmware/acpi/platform_profile
-ReadWritePaths=-/sys/class/hwmon
-ReadWritePaths=-/sys/class/power_supply
-ReadWritePaths=-/sys/class/firmware-attributes/asus-armoury
+ReadWritePaths=-/sys/class/power_supply/BAT0/charge_control_end_threshold
+ReadWritePaths=-/sys/class/power_supply/BAT1/charge_control_end_threshold
+ReadWritePaths=-/sys/devices/virtual/firmware-attributes/asus-armoury
 ReadWritePaths=-/sys/kernel/ryzen_smu_drv
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
