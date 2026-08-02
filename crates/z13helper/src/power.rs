@@ -35,6 +35,9 @@ pub fn start(state: &Rc<AppState>) {
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(on_battery) = rx.recv().await {
+            // Keep manual profile selections associated with the currently
+            // observed source even while auto-switch debounce is pending.
+            state.on_battery.set(on_battery);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -51,6 +54,7 @@ pub fn start(state: &Rc<AppState>) {
 }
 
 fn on_confirmed_transition(state: &Rc<AppState>, on_battery: bool) {
+    state.on_battery.set(on_battery);
     if !state.config.borrow().auto_switch_on_power_source {
         return;
     }
@@ -68,6 +72,7 @@ fn on_confirmed_transition(state: &Rc<AppState>, on_battery: bool) {
         .find(&id)
         .map(|p| p.name.clone())
         .unwrap_or_else(|| id.clone());
+    tracing::info!(%id, on_battery, "applying remembered power-source profile");
     state.config.borrow_mut().active_profile = id;
     // notify=true: HUD should show (non-button path).
     state.apply_active(true);
@@ -91,11 +96,12 @@ fn upower_watch(tx: async_channel::Sender<bool>) -> Result<(), Box<dyn std::erro
         .deserialize::<zbus::zvariant::OwnedValue>()?
         .try_into()
         .map_err(|e: zbus::zvariant::Error| e.to_string())?;
-    let _ = tx.send_blocking(on_battery);
+    if tx.send_blocking(on_battery).is_err() {
+        return Ok(());
+    }
 
     // Poll Properties via periodic Get — simpler and reliable vs signal proxy setup.
     // (A full PropertiesChanged subscription is nicer but heavier to wire with zbus 5.)
-    let mut last = on_battery;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let Ok(reply) = conn.call_method(
@@ -113,9 +119,10 @@ fn upower_watch(tx: async_channel::Sender<bool>) -> Result<(), Box<dyn std::erro
         let Ok(current) = bool::try_from(value) else {
             continue;
         };
-        if current != last {
-            last = current;
-            let _ = tx.send_blocking(current);
+        // PowerDebouncer confirms stability from repeated samples, so publish
+        // every successful read rather than changes alone.
+        if tx.send_blocking(current).is_err() {
+            return Ok(());
         }
     }
 }
