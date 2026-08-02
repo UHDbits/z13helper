@@ -72,38 +72,48 @@ impl AuraDevices {
             .devices
             .get_mut(device)
             .ok_or_else(|| format!("Aura {device} device is not connected"))?;
-        write_report(file, &[REPORT_ID, 0xB9])?;
-        write_report(file, b"]ASUS Tech.Inc.")?;
-        write_report(file, &[REPORT_ID, 0x05, 0x20, 0x31, 0x00, 0x1A])?;
-        write_report(file, &[REPORT_ID, 0xC0, 0x03, 0x01])?;
-        if !state.enabled {
-            write_report(file, &[REPORT_ID, 0xBD, 0x01, 0, 0, 0, 0, 0xFF])?;
-            return write_report(file, &[REPORT_ID, 0xBA, 0xC5, 0xC4, 0]);
-        }
-        write_report(file, &[REPORT_ID, 0xBD, 0x01, 0xFF, 0x1F, 0xFF, 0xFF, 0xFF])?;
+        apply_to_writer(file, state)
+    }
+}
+
+fn apply_to_writer(writer: &mut impl Write, state: &LightingState) -> Result<(), String> {
+    write_report(writer, &[REPORT_ID, 0xB9])?;
+    write_report(writer, b"]ASUS Tech.Inc.")?;
+    write_report(writer, &[REPORT_ID, 0x05, 0x20, 0x31, 0x00, 0x1A])?;
+    write_report(writer, &[REPORT_ID, 0xC0, 0x03, 0x01])?;
+    if !state.enabled {
+        write_report(writer, &[REPORT_ID, 0xBD, 0x01, 0, 0, 0, 0, 0xFF])?;
+        return write_report(writer, &[REPORT_ID, 0xBA, 0xC5, 0xC4, 0]);
+    }
+    write_report(
+        writer,
+        &[REPORT_ID, 0xBD, 0x01, 0xFF, 0x1F, 0xFF, 0xFF, 0xFF],
+    )?;
+    write_report(
+        writer,
+        &[
+            REPORT_ID,
+            0xBA,
+            0xC5,
+            0xC4,
+            state.brightness.clamp(0, 3) as u8,
+        ],
+    )?;
+    let [red, green, blue] = parse_color(&state.color)?;
+    let [red2, green2, blue2] = parse_color(&state.color2)?;
+    let mode = mode_byte(&state.mode)?;
+    let random = if [red, green, blue] == [0, 0, 0] {
+        0xFF
+    } else if mode == 0x01 {
+        0x01
+    } else {
+        0
+    };
+    // The Z13 protocol requires both zone packets for every physical Aura
+    // device. Each device consumes its own zone and ignores the other one.
+    for zone in [0, 1] {
         write_report(
-            file,
-            &[
-                REPORT_ID,
-                0xBA,
-                0xC5,
-                0xC4,
-                state.brightness.clamp(0, 3) as u8,
-            ],
-        )?;
-        let [red, green, blue] = parse_color(&state.color)?;
-        let [red2, green2, blue2] = parse_color(&state.color2)?;
-        let mode = mode_byte(&state.mode)?;
-        let random = if [red, green, blue] == [0, 0, 0] {
-            0xFF
-        } else if mode == 0x01 {
-            0x01
-        } else {
-            0
-        };
-        let zone = if device == "lightbar" { 1 } else { 0 };
-        write_report(
-            file,
+            writer,
             &[
                 REPORT_ID,
                 0xB3,
@@ -120,12 +130,13 @@ impl AuraDevices {
                 blue2,
             ],
         )?;
-        write_report(file, &[REPORT_ID, 0xB5, 0, 0, 0])?;
-        write_report(file, &[REPORT_ID, 0xB4])
+        write_report(writer, &[REPORT_ID, 0xB5, 0, 0, 0])?;
+        write_report(writer, &[REPORT_ID, 0xB4])?;
     }
+    Ok(())
 }
 
-fn write_report(writer: &mut File, bytes: &[u8]) -> Result<(), String> {
+fn write_report(writer: &mut impl Write, bytes: &[u8]) -> Result<(), String> {
     let mut report = [0u8; 64];
     let length = bytes.len().min(report.len());
     report[..length].copy_from_slice(&bytes[..length]);
@@ -177,5 +188,28 @@ mod tests {
         assert!(parse_color("black").is_err());
         assert_eq!(mode_byte("rainbow").unwrap(), 3);
         assert_eq!(speed_byte("fast").unwrap(), 0xF5);
+    }
+
+    #[test]
+    fn apply_writes_selected_color_to_both_z13_zones() {
+        let mut reports = Vec::new();
+        let state = LightingState {
+            enabled: true,
+            mode: "static".into(),
+            color: "F6D32D".into(),
+            color2: "000000".into(),
+            speed: "normal".into(),
+            brightness: 3,
+        };
+
+        apply_to_writer(&mut reports, &state).unwrap();
+
+        let mode_reports = reports
+            .chunks_exact(64)
+            .filter(|report| report[..2] == [REPORT_ID, 0xB3])
+            .collect::<Vec<_>>();
+        assert_eq!(mode_reports.len(), 2);
+        assert_eq!(mode_reports[0][2..8], [0, 0, 0xF6, 0xD3, 0x2D, 0xEB]);
+        assert_eq!(mode_reports[1][2..8], [1, 0, 0xF6, 0xD3, 0x2D, 0xEB]);
     }
 }
