@@ -188,7 +188,6 @@ impl Sysfs {
             validate(curve).map_err(|error| error.to_string())?;
         }
         let curve_dir = self.find_hwmon("asus_custom_fan_curve")?;
-        let readings_dir = self.find_hwmon("asus").ok();
         for (fan, curve) in curves.iter().enumerate() {
             let index = fan + 1;
             for (point, [temperature, duty]) in curve.iter().copied().enumerate() {
@@ -202,21 +201,14 @@ impl Sysfs {
                 )?;
             }
             self.write_and_verify(curve_dir.join(format!("pwm{index}_enable")), 1)?;
-            if let Some(directory) = &readings_dir {
-                self.write_and_verify(directory.join(format!("pwm{index}_enable")), 1)?;
-            }
         }
         Ok(())
     }
 
     pub fn release_firmware_fans(&self) -> Result<(), String> {
         let curve_dir = self.find_hwmon("asus_custom_fan_curve")?;
-        let readings_dir = self.find_hwmon("asus").ok();
         for index in 1..=2 {
             self.write_and_verify(curve_dir.join(format!("pwm{index}_enable")), 2)?;
-            if let Some(directory) = &readings_dir {
-                self.write_and_verify(directory.join(format!("pwm{index}_enable")), 2)?;
-            }
         }
         Ok(())
     }
@@ -397,9 +389,47 @@ mod tests {
             fs::read_to_string(curve.join("pwm1_enable")).unwrap(),
             "1\n"
         );
+        // The generic `asus` hwmon endpoint is for coarse fan control and
+        // tachometer readings. Custom-curve writes must not change it.
         assert_eq!(
             fs::read_to_string(readings.join("pwm2_enable")).unwrap(),
-            "1\n"
+            "2\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn firmware_release_disables_both_curves_without_generic_fan_writes() {
+        let root = root();
+        let curve = root.join("class/hwmon/hwmon0");
+        let readings = root.join("class/hwmon/hwmon1");
+        fs::create_dir_all(&curve).unwrap();
+        fs::create_dir_all(&readings).unwrap();
+        fs::write(curve.join("name"), "asus_custom_fan_curve\n").unwrap();
+        fs::write(readings.join("name"), "asus\n").unwrap();
+        for index in 1..=2 {
+            fs::write(curve.join(format!("pwm{index}_enable")), "1\n").unwrap();
+        }
+        fs::write(readings.join("pwm1_enable"), "2\n").unwrap();
+        fs::write(readings.join("pwm2_enable"), "0\n").unwrap();
+
+        Sysfs::new(&root).release_firmware_fans().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(curve.join("pwm1_enable")).unwrap(),
+            "2\n"
+        );
+        assert_eq!(
+            fs::read_to_string(curve.join("pwm2_enable")).unwrap(),
+            "2\n"
+        );
+        assert_eq!(
+            fs::read_to_string(readings.join("pwm1_enable")).unwrap(),
+            "2\n"
+        );
+        assert_eq!(
+            fs::read_to_string(readings.join("pwm2_enable")).unwrap(),
+            "0\n"
         );
         let _ = fs::remove_dir_all(root);
     }
