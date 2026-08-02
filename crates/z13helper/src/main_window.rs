@@ -24,8 +24,16 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         .resizable(false)
         .build();
 
+    // Keep the UI process resident for the hardware toggle button. Closing the
+    // main window only hides it; AppState retains it for the next presentation.
+    window.connect_close_request(|window| {
+        window.set_visible(false);
+        glib::Propagation::Stop
+    });
+
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
+    header.set_decoration_layout(Some(":close"));
     header.set_title_widget(Some(&gtk::Label::new(Some("z13helper"))));
     toolbar.add_top_bar(&header);
 
@@ -198,7 +206,6 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     limit.set_digits(0);
     limit.set_round_digits(0);
     let full = gtk::Button::with_label("100%");
-    full.add_css_class("pill");
     full.set_valign(gtk::Align::Center);
     full.set_size_request(64, -1);
     full.set_tooltip_text(Some("Set charge limit to 100%"));
@@ -249,12 +256,13 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
             );
         });
     }
-    let quit = gtk::Button::with_label("Quit");
-    let app = state.app.clone();
-    quit.connect_clicked(move |_| app.quit());
+    let hide = gtk::Button::with_label("Hide");
+    hide.set_tooltip_text(Some("Hide z13helper"));
+    let window_hide = window.clone();
+    hide.connect_clicked(move |_| window_hide.set_visible(false));
     footer.append(&version);
     footer.append(&boot);
-    footer.append(&quit);
+    footer.append(&hide);
     content.append(&footer);
 
     let clamp = adw::Clamp::new();

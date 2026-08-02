@@ -23,9 +23,13 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
 
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
+    header.set_show_start_title_buttons(false);
+    header.set_show_end_title_buttons(false);
     header.set_title_widget(Some(&gtk::Label::new(Some("Fans + Power"))));
     let close = gtk::Button::from_icon_name("window-close-symbolic");
     close.add_css_class("flat");
+    close.set_tooltip_text(Some("Close Fans + Power"));
+    close.update_property(&[gtk::accessible::Property::Label("Close Fans + Power")]);
     let win_close = window.clone();
     close.connect_clicked(move |_| win_close.close());
     header.pack_end(&close);
@@ -115,11 +119,14 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     selector.set_selected(selected as u32);
     selector.set_hexpand(true);
     let plus = gtk::Button::with_label("Add");
-    plus.set_tooltip_text(Some("Add Profile"));
+    plus.set_tooltip_text(Some("Add profile"));
+    plus.update_property(&[gtk::accessible::Property::Label("Add profile")]);
     let minus = gtk::Button::with_label("Remove");
-    minus.set_tooltip_text(Some("Remove Profile"));
+    minus.set_tooltip_text(Some("Remove selected profile"));
+    minus.update_property(&[gtk::accessible::Property::Label("Remove selected profile")]);
     let rename = gtk::Button::with_label("Rename");
-    rename.set_tooltip_text(Some("Rename Profile"));
+    rename.set_tooltip_text(Some("Rename selected profile"));
+    rename.update_property(&[gtk::accessible::Property::Label("Rename selected profile")]);
     set_profile_action_sensitivity(state, &profile.id, &rename, &minus);
     sel_row.append(&selector);
     sel_row.append(&plus);
@@ -132,7 +139,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         "Reset Silent, Balanced, Turbo (or the selected custom) to stock power, fans, and undervolt.",
     ));
 
-    let clamp = gtk::CheckButton::with_label("Clamp to Grid");
+    let clamp = gtk::CheckButton::with_label("Clamp to grid");
     clamp.set_active(state.config.borrow().fan_clamp_to_grid);
     let editor_clamp = editor.clone();
     let editor2_clamp = editor2.clone();
@@ -146,7 +153,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     });
     right.append(&clamp);
 
-    let fan_toggle = gtk::CheckButton::with_label("Apply Custom Fan Curve");
+    let fan_toggle = gtk::CheckButton::with_label("Apply custom fan curve");
     fan_toggle.set_active(profile.apply_fan_curve);
     editor.set_muted(!fan_toggle.is_active());
     editor2.set_muted(!fan_toggle.is_active());
@@ -639,7 +646,7 @@ fn build_cpu_page(
     let power_group = adw::PreferencesGroup::builder()
         .title("Power Limits")
         .build();
-    let apply_power = gtk::CheckButton::with_label("Apply Power Limits");
+    let apply_power = gtk::CheckButton::with_label("Apply power limits");
     let (pl1, pl2, pl3) = state
         .config
         .borrow()

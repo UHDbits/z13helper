@@ -27,6 +27,7 @@ fn main() {
         resources::register();
         css::install();
     });
+    install_standard_actions(&app);
     let state = Rc::new(RefCell::new(None));
     app.connect_activate(move |app| {
         let state = state
@@ -40,6 +41,30 @@ fn main() {
         state.activate();
     });
     app.run();
+}
+
+fn install_standard_actions(app: &adw::Application) {
+    let close = gio::SimpleAction::new("close", None);
+    let weak_app = app.downgrade();
+    close.connect_activate(move |_, _| {
+        if let Some(window) = weak_app.upgrade().and_then(|app| app.active_window()) {
+            window.close();
+        }
+    });
+    app.add_action(&close);
+    app.set_accels_for_action("app.close", &["<Primary>w"]);
+
+    let hide_all = gio::SimpleAction::new("hide-all", None);
+    let weak_app = app.downgrade();
+    hide_all.connect_activate(move |_, _| {
+        if let Some(app) = weak_app.upgrade() {
+            for window in app.windows() {
+                window.close();
+            }
+        }
+    });
+    app.add_action(&hide_all);
+    app.set_accels_for_action("app.hide-all", &["<Primary>q"]);
 }
 
 #[cfg(test)]
