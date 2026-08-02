@@ -12,10 +12,11 @@ socket protocol, lifecycle restoration, or threading.
   `DaemonState.undervolt_available` only.
 - Never perform socket calls on the GTK main thread or touch widgets from worker
   threads. Use the UI worker service and return results to GLib.
-- Do not run with z13ctl, the legacy fan service, or `z13gui.service`.
-- Do not read, migrate, alias, move, or delete data from `z13-helper`. The new
-  config begins at schema 1 in `$XDG_CONFIG_HOME/z13helper/config.json`.
-- Do not add compatibility aliases or installers that remove legacy data/units.
+- Do not discover, read, migrate, alias, move, or delete data outside the
+  current application paths. Config begins at schema 1 in
+  `$XDG_CONFIG_HOME/z13helper/config.json`.
+- Do not add compatibility aliases, predecessor-path checks, or installers that
+  remove unrelated data or units.
 - Keep scope to the existing GZ302EA product; no stretch features.
 
 ## Workspace

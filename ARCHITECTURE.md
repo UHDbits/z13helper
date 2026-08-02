@@ -36,7 +36,7 @@ deadline. Complete applies are serialized so the last successful request wins.
 ## State ownership
 
 User-facing profile names and UI preferences live in the fresh schema-version-1
-file `$XDG_CONFIG_HOME/z13helper/config.json`. There are no legacy migrations.
+file `$XDG_CONFIG_HOME/z13helper/config.json`. There are no schema migrations.
 Unknown schema versions are preserved and rejected.
 
 The daemon atomically persists only flattened desired machine state at
@@ -123,6 +123,5 @@ The systemd unit uses `RuntimeDirectory=z13helper`,
 explicit writable hardware paths, and only `CAP_SYS_RAWIO`. The installed
 application ID is `com.ashtonantila.z13helper`.
 
-No compatibility aliases or automatic removal actions are shipped. A live
-z13ctl or legacy fan-service socket makes daemon startup fail with an actionable
-message, preventing simultaneous write ownership.
+No compatibility aliases, predecessor-path discovery, or automatic removal
+actions are shipped.

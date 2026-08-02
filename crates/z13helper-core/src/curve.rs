@@ -1,6 +1,6 @@
 //! Fan curve authoring math. Runtime safety floors are daemon-owned.
 //!
-//! Ports the lessons from z13gui's `EnforceCurve` and G-Helper's grid bands.
+//! Fan-curve validation, editing constraints, and grid bands.
 
 use thiserror::Error;
 
@@ -57,7 +57,7 @@ pub fn grid_band(index: usize) -> (i32, i32) {
 
 /// Enforce monotonicity and bounds after dragging point `idx`.
 ///
-/// Ports z13gui's `EnforceCurve`: clamp the edited point, push neighbours so
+/// Clamp the edited point and push neighbours so
 /// temps strictly increase and PWMs are non-decreasing, keep index-based
 /// bounds so points cannot collapse onto an edge.
 pub fn enforce_curve(curve: &mut Curve, idx: usize, clamp_to_grid: bool) {

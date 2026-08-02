@@ -24,7 +24,6 @@ mod logging;
 const EXPECTED_MODEL: &str = "GZ302EA";
 const DMI_PRODUCT_NAME: &str = "/sys/class/dmi/id/product_name";
 const SOCKET_PATH: &str = "/run/z13helper/z13helperd.sock";
-const LEGACY_FAN_SOCKET: &str = "/run/z13-helper/fan.sock";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 
 struct Subscriber {
@@ -42,31 +41,6 @@ fn verify_model() -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn refuse_conflicting_daemons() -> Result<()> {
-    if socket_is_live(Path::new(LEGACY_FAN_SOCKET)) {
-        bail!("legacy z13-helper fan service is running at {LEGACY_FAN_SOCKET}; disable it first");
-    }
-    if let Ok(users) = fs::read_dir("/run/user") {
-        for user in users.flatten() {
-            let socket = user.path().join("z13ctl/z13ctl.sock");
-            if socket.exists() && socket_is_live(&socket) {
-                bail!(
-                    "z13ctl is running at {}; disable z13ctl.socket and z13ctl.service first",
-                    socket.display()
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn socket_is_live(path: &Path) -> bool {
-    match UnixStream::connect(path) {
-        Ok(_) => true,
-        Err(error) => error.kind() == std::io::ErrorKind::PermissionDenied,
-    }
 }
 
 fn bind_socket(path: &Path) -> Result<UnixListener> {
@@ -173,7 +147,6 @@ fn main() -> Result<()> {
         return release_ec_only();
     }
     verify_model()?;
-    refuse_conflicting_daemons()?;
     let backend = Arc::new(Mutex::new(Backend::start().map_err(anyhow::Error::msg)?));
     let listener = bind_socket(Path::new(SOCKET_PATH))?;
     let subscribers = Arc::new(Mutex::new(Vec::new()));

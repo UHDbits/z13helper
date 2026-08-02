@@ -2,7 +2,7 @@
 //!
 //! Persists to `$XDG_CONFIG_HOME/z13helper/config.json` (default
 //! `~/.config/z13helper/config.json`). Writes are atomic (temp + rename),
-//! keep a `.bak`, and intentionally do not import or migrate predecessor data.
+//! keep a `.bak`, and intentionally implement no schema migrations.
 
 use std::fs;
 use std::io::Write;

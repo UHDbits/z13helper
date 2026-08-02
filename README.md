@@ -19,30 +19,17 @@ The two libraries compile into the binaries; they are not separate services.
 Keeping them separate prevents transport/I/O concerns from entering the pure,
 unit-tested profile and safety model.
 
-## Fresh application boundary
+## Configuration boundary
 
-This project does not migrate or manage data from the earlier `z13-helper`
-application. Its first and only configuration schema is version 1 at:
+The configuration starts at schema version 1 and lives at:
 
 ```text
 $XDG_CONFIG_HOME/z13helper/config.json
 ```
 
-Unsupported or corrupt files at that new path are preserved and reported. No
-installer searches for, imports, aliases, or deletes legacy data, binaries,
-services, sockets, groups, desktop files, or application IDs.
-
-Before enabling this daemon, manually stop and remove competing writers:
-
-```sh
-systemctl --user disable --now z13ctl.socket z13ctl.service z13gui.service
-sudo systemctl disable --now z13helper-fan-service.service
-```
-
-Exact old unit names vary by installation. Remove old application data yourself
-if desired; the build and installation targets deliberately do not do so.
-`z13helperd` also refuses to start while a live z13ctl socket or legacy fan
-service socket is present.
+Unsupported or corrupt files at that path are preserved and reported. The
+application does not discover, import, convert, alias, move, or delete data from
+other paths, and the installer manages only current `z13helper` identifiers.
 
 ## Build and install
 

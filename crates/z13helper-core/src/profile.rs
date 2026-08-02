@@ -192,7 +192,7 @@ impl Profile {
     }
 }
 
-/// Generic example curve (z13ctl docs). Prefer [`Base::stock_fan_curve`].
+/// Generic balanced example curve. Prefer [`Base::stock_fan_curve`].
 pub fn default_fan_curve() -> [[i32; 2]; 8] {
     Base::Balanced.stock_fan_curve()
 }
