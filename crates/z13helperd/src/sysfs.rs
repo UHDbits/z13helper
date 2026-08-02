@@ -255,10 +255,19 @@ impl Sysfs {
                 let voltage = read_measurement("voltage_now")?;
                 current.checked_mul(voltage).map(|value| value / 1_000_000)
             });
+            let health_percent = [
+                ("energy_full", "energy_full_design"),
+                ("charge_full", "charge_full_design"),
+            ]
+            .into_iter()
+            .find_map(|(full, design)| {
+                battery_health_percent(read_measurement(full)?, read_measurement(design)?)
+            });
             return Ok(BatteryTelemetry {
                 charge_percent: Some(charge_percent),
                 status: (!status.is_empty()).then_some(status),
                 power_microwatts,
+                health_percent,
             });
         }
         Err("battery telemetry not found".into())
@@ -321,6 +330,14 @@ impl Sysfs {
     }
 }
 
+fn battery_health_percent(full: u64, design: u64) -> Option<u8> {
+    if design == 0 {
+        return None;
+    }
+    let rounded = full.saturating_mul(100).saturating_add(design / 2) / design;
+    Some(rounded.min(100) as u8)
+}
+
 fn encode_smu_co(offset: i32) -> Result<[u8; 24], String> {
     if !(-40..=0).contains(&offset) {
         return Err("Curve Optimizer offset must be between -40 and 0".into());
@@ -380,6 +397,8 @@ mod tests {
         fs::write(battery.join("capacity"), "72\n").unwrap();
         fs::write(battery.join("status"), "Discharging\n").unwrap();
         fs::write(battery.join("power_now"), "14500000\n").unwrap();
+        fs::write(battery.join("energy_full"), "56000000\n").unwrap();
+        fs::write(battery.join("energy_full_design"), "70000000\n").unwrap();
 
         assert_eq!(
             Sysfs::new(&root).battery_telemetry().unwrap(),
@@ -387,9 +406,17 @@ mod tests {
                 charge_percent: Some(72),
                 status: Some("Discharging".into()),
                 power_microwatts: Some(14_500_000),
+                health_percent: Some(80),
             }
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn battery_health_handles_rounding_bounds_and_missing_design_capacity() {
+        assert_eq!(battery_health_percent(63, 70), Some(90));
+        assert_eq!(battery_health_percent(71, 70), Some(100));
+        assert_eq!(battery_health_percent(70, 0), None);
     }
 
     #[test]

@@ -127,6 +127,8 @@ pub struct BatteryTelemetry {
     pub status: Option<String>,
     #[serde(default)]
     pub power_microwatts: Option<u64>,
+    #[serde(default)]
+    pub health_percent: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

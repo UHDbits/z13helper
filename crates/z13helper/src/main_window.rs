@@ -46,7 +46,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     toolbar.add_top_bar(&persistent_banner);
     *state.persistent_banner.borrow_mut() = Some(persistent_banner);
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 16);
     content.set_margin_top(12);
     content.set_margin_bottom(12);
     content.set_margin_start(12);
@@ -127,6 +127,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
 
     // --- Display ---
     let display = adw::PreferencesGroup::builder().title("Display").build();
+    display.set_margin_top(-4);
     let overdrive = make_switch();
     let od_row = adw::ActionRow::builder().title("Panel Overdrive").build();
     od_row.add_suffix(&overdrive);
@@ -198,8 +199,9 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     let limit = gtk::Scale::with_range(gtk::Orientation::Horizontal, 40.0, 100.0, 5.0);
     limit.set_draw_value(false);
     limit.set_hexpand(true);
-    // Align the visible trough with the battery icon; Adwaita reserves a
-    // small inset for the horizontal scale thumb.
+    // Preserve the visual left alignment without reducing GtkScale's
+    // effective minimum width below the size required by its theme.
+    limit.set_size_request(42, -1);
     limit.set_margin_start(-8);
     limit.set_digits(0);
     limit.set_round_digits(0);
@@ -342,7 +344,6 @@ struct SettingsView {
 
 #[derive(Clone)]
 struct LightingView {
-    enabled: gtk::Switch,
     modes: gtk::DropDown,
     color: gtk::ColorDialogButton,
     speed: gtk::DropDown,
@@ -393,6 +394,11 @@ impl SettingsView {
                 .charge_percent
                 .map_or_else(|| "Charge: —%".into(), |value| format!("Charge: {value}%")),
         );
+        self.battery_charge
+            .set_tooltip_text(Some(&daemon.battery.health_percent.map_or_else(
+                || "Battery health: unavailable".into(),
+                |value| format!("Battery health: {value}%"),
+            )));
         self.battery_status.set_label(&battery_status_label(
             daemon.battery.status.as_deref(),
             daemon.battery.power_microwatts,
@@ -416,14 +422,16 @@ impl SettingsView {
 
 impl LightingView {
     fn sync_from(&self, lighting: &z13helper_client::LightingState) {
-        self.enabled.set_active(lighting.enabled);
-        self.enabled.set_state(lighting.enabled);
-        let index = match lighting.mode.as_str() {
-            "breathe" => 1,
-            "cycle" => 2,
-            "rainbow" => 3,
-            "strobe" => 4,
-            _ => 0,
+        let index = if !lighting.enabled {
+            0
+        } else {
+            match lighting.mode.as_str() {
+                "breathe" => 2,
+                "cycle" => 3,
+                "rainbow" => 4,
+                "strobe" => 5,
+                _ => 1,
+            }
         };
         self.modes.set_selected(index);
         if let Ok(color) = gtk::gdk::RGBA::parse(format!("#{}", lighting.color)) {
@@ -514,14 +522,13 @@ fn lighting_section(
     heading.add_css_class("heading");
     heading.set_xalign(0.0);
     heading.set_hexpand(true);
-    let enabled = make_switch();
     header.append(&icon);
     header.append(&heading);
-    header.append(&enabled);
     root.append(&header);
 
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let modes = gtk::DropDown::from_strings(&["static", "breathe", "cycle", "rainbow", "strobe"]);
+    let modes =
+        gtk::DropDown::from_strings(&["Off", "Static", "Breathe", "Cycle", "Rainbow", "Strobe"]);
     modes.set_valign(gtk::Align::Center);
     modes.set_hexpand(true);
     modes.set_tooltip_text(Some("Lighting mode"));
@@ -529,38 +536,23 @@ fn lighting_section(
 
     let color = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
     color.set_valign(gtk::Align::Center);
+    color.set_size_request(64, -1);
     color.set_tooltip_text(Some("Lighting color"));
     let color_control = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let color_label = gtk::Label::new(Some("Color"));
-    color_control.append(&color_label);
     color_control.append(&color);
     controls.append(&color_control);
 
-    let speed = gtk::DropDown::from_strings(&["slow", "normal", "fast"]);
+    let speed = gtk::DropDown::from_strings(&["Slow", "Normal", "Fast"]);
     speed.set_valign(gtk::Align::Center);
     speed.set_tooltip_text(Some("Animation speed"));
     controls.append(&speed);
     root.append(&controls);
 
     let view = LightingView {
-        enabled: enabled.clone(),
         modes: modes.clone(),
         color: color.clone(),
         speed: speed.clone(),
     };
-
-    let intent_view = view.clone();
-    let intent_state = state.clone();
-    let intent_sync = sync.clone();
-    enabled.connect_state_set(move |switch, on| {
-        if intent_sync.active() {
-            switch.set_state(on);
-            return glib::Propagation::Stop;
-        }
-        send_lighting_intent(&intent_state, &intent_view, device, Some(on));
-        switch.set_state(on);
-        glib::Propagation::Stop
-    });
 
     let color_control_c = color_control.clone();
     let speed_c = speed.clone();
@@ -569,11 +561,11 @@ fn lighting_section(
     let intent_sync = sync.clone();
     modes.connect_selected_notify(move |drop| {
         let mode = drop.selected();
-        // cycle(2)/rainbow(3) ignore color; static(0) ignores speed.
-        color_control_c.set_visible(mode != 2 && mode != 3);
-        speed_c.set_visible(mode != 0);
+        // Off/cycle/rainbow hide color; Off/static hide speed.
+        color_control_c.set_visible(mode != 0 && mode != 3 && mode != 4);
+        speed_c.set_visible(mode != 0 && mode != 1);
         if !intent_sync.active() {
-            send_lighting_intent(&intent_state, &intent_view, device, None);
+            send_lighting_intent(&intent_state, &intent_view, device);
         }
     });
     let intent_view = view.clone();
@@ -581,7 +573,7 @@ fn lighting_section(
     let intent_sync = sync.clone();
     color.connect_rgba_notify(move |_| {
         if !intent_sync.active() {
-            send_lighting_intent(&intent_state, &intent_view, device, None);
+            send_lighting_intent(&intent_state, &intent_view, device);
         }
     });
     let intent_view = view.clone();
@@ -589,34 +581,37 @@ fn lighting_section(
     let intent_sync = sync.clone();
     speed.connect_selected_notify(move |_| {
         if !intent_sync.active() {
-            send_lighting_intent(&intent_state, &intent_view, device, None);
+            send_lighting_intent(&intent_state, &intent_view, device);
         }
     });
-    // Initial visibility for static.
-    color_control.set_visible(true);
+    // Initial visibility for Off.
+    color_control.set_visible(false);
     speed.set_visible(false);
 
     LightingSection { root, view }
 }
 
-fn send_lighting_intent(
-    state: &Rc<AppState>,
-    view: &LightingView,
-    device: &'static str,
-    enabled: Option<bool>,
-) {
-    let enabled = enabled.unwrap_or_else(|| view.enabled.is_active());
-    let mode = view
+fn send_lighting_intent(state: &Rc<AppState>, view: &LightingView, device: &'static str) {
+    let mode_label = view
         .modes
         .selected_item()
         .and_downcast::<gtk::StringObject>()
         .map(|item| item.string().to_string())
-        .unwrap_or_else(|| "static".into());
+        .unwrap_or_else(|| "Off".into());
+    let (enabled, mode) = match mode_label.as_str() {
+        "Static" => (true, "static"),
+        "Breathe" => (true, "breathe"),
+        "Cycle" => (true, "cycle"),
+        "Rainbow" => (true, "rainbow"),
+        "Strobe" => (true, "strobe"),
+        _ => (false, "static"),
+    };
     let speed = view
         .speed
         .selected_item()
         .and_downcast::<gtk::StringObject>()
         .map(|item| item.string().to_string())
+        .map(|speed| speed.to_ascii_lowercase())
         .unwrap_or_else(|| "normal".into());
     let rgba = view.color.rgba();
     let color = format!(
@@ -630,7 +625,7 @@ fn send_lighting_intent(
     worker::blocking(
         move || {
             if enabled {
-                client.apply_lighting(&mode, &color, "000000", &speed, 3, device)
+                client.apply_lighting(mode, &color, "000000", &speed, 3, device)
             } else {
                 client.lighting_off(device)
             }
