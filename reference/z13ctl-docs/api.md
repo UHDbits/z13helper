@@ -7,7 +7,7 @@ or anything else that wants to control z13ctl programmatically.
 ## Import
 
 ```go
-import "github.com/dahui/z13ctl/api"
+import "github.com/UHDbits/z13ctl/api"
 ```
 
 The module is deliberately stdlib-only (no third-party dependencies) so that

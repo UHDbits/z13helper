@@ -1,100 +1,93 @@
-# Agent guide — z13-helper
+# Agent guide — z13helper
 
-G-Helper-style GTK4/libadwaita GUI for the ASUS ROG Flow Z13 (GZ302EA). Frontend
-only for the **z13ctl** daemon. Replaces **z13gui** for desktop use.
-
-Read [README.md](README.md) and [ARCHITECTURE.md](ARCHITECTURE.md) before
-changing apply logic, socket protocol, or threading.
+Self-contained GTK4/libadwaita control platform for the ASUS ROG Flow Z13
+(GZ302EA). Read `README.md` and `ARCHITECTURE.md` before changing apply logic,
+socket protocol, lifecycle restoration, or threading.
 
 ## Hard constraints
 
-- **Never** write sysfs, open hidraw, access raw I/O ports, or shell out to the
-  `z13ctl` CLI from the GTK app. Normal hardware I/O goes through z13ctl;
-  experimental direct fan control goes through the narrowly privileged
-  `z13-helper-fan-service`. Both are reached through socket clients in
-  `z13ctl-client`.
-- **Never** call `SMUProbeUndervolt` / probe the SMU from this app. Use
-  `get-state.undervolt_available` only.
-- **Never** call the daemon from the GTK/main thread (10 s command deadline).
-  Use `worker::blocking` → result on the GLib main context.
-- **Never** touch widgets from worker threads.
-- Do **not** run alongside `z13gui.service` (both claim Armoury Crate
-  `gui-toggle`).
-- No stretch goals unless the user asks: keep scope to the existing product.
+- `z13helperd` is the only hardware writer. The GUI and CLI never write sysfs,
+  open hidraw/input/SMU/raw I/O, or invoke another control CLI.
+- The GUI and CLI never probe the SMU. They consume cached
+  `DaemonState.undervolt_available` only.
+- Never perform socket calls on the GTK main thread or touch widgets from worker
+  threads. Use the UI worker service and return results to GLib.
+- Do not run with z13ctl, the legacy fan service, or `z13gui.service`.
+- Do not read, migrate, alias, move, or delete data from `z13-helper`. The new
+  config begins at schema 1 in `$XDG_CONFIG_HOME/z13helper/config.json`.
+- Do not add compatibility aliases or installers that remove legacy data/units.
+- Keep scope to the existing GZ302EA product; no stretch features.
 
 ## Workspace
 
 | Crate | Role |
 |---|---|
-| `crates/z13ctl-client` | Socket client + error model |
-| `crates/z13-helper-core` | Profiles, apply order, curve math, config, debounce (unit-tested) |
-| `crates/z13-helper` | Thin GTK UI |
-| `crates/z13-helper-fan-service` | Privileged direct-EC fan companion |
+| `crates/z13helper-core` | Pure domain logic, protocol/error types, config, apply planning |
+| `crates/z13helper-client` | Versioned NDJSON Unix-socket transport |
+| `crates/z13helper` | Thin GTK controllers, views, widgets, and services |
+| `crates/z13helperd` | Unified privileged hardware daemon |
+| `crates/z13helperctl` | Stateless diagnostics and scripting CLI |
 
-Binary / config / desktop name: **`z13-helper`**. Config:
-`$XDG_CONFIG_HOME/z13-helper/config.json`.
-
-Optional feature: `layer-shell` (gtk4-layer-shell may be missing on the host).
+Socket: `/run/z13helper/z13helperd.sock`. Daemon state:
+`/var/lib/z13helper/state.json`. Application ID:
+`com.ashtonantila.z13helper`.
 
 ## Commands
 
-Toolchain may live under workspace `.cargo` / `.rustup` (gitignored). Prefer:
-
 ```sh
-make build    # release
+make build
 make run
-make test     # client + core; GTK is manual
-make lint     # clippy -D warnings + rustfmt --check
+make test
+make lint
 make fmt
 ```
 
-If `cargo` is missing from `PATH`: `export PATH="$PWD/.cargo/bin:$PATH"`.
+The toolchain may live under workspace `.cargo`/`.rustup`. Socket tests can
+require execution outside a restricted sandbox.
 
-## Apply order (do not reorder)
+## Apply invariants
 
-1. `profile-set <base>` — **always**, even if unchanged (clears prior overrides + PPD).
-2. TDP / PPT (if enabled) — **before** fans.
-3. Fan curve (if enabled).
-4. Undervolt (if enabled and available).
+- Prevalidate a complete request before touching hardware and serialize applies.
+- Selecting a base writes every platform-profile device and restores its
+  measured five-value stock PPT table.
+- PPD is independent. Reject unknown selections; warn and continue if PPD is
+  absent.
+- Above 75 W PL1, confirm target fan protection before raising power; abandon
+  the increase if preparation fails.
+- When lowering power, write PPT before relaxing previous fan protection.
+- Undervolt is last. Retain safety fan protection on rollback/failure and report
+  degraded state if rollback is incomplete.
 
-PL1 above 75 W → daemon enforces an ~80% fan floor; send TDP first and clamp
-curves accordingly.
+## Fan policy
 
-## Profile model
-
-- Daemon stock bases: quiet / balanced / performance (+ one virtual `custom` slot).
-- GUI builtins: **Silent / Balanced / Turbo** (Quiet / Balanced / Performance).
-- Named customs are GUI-only in config.json; applying pushes into the daemon’s
-  single custom slot.
-- Base + PPD are **one** control (`Profile.base`). Do not expose independent PPD.
-- `profile-get` → stock base from sysfs; `get-state.profile` → `custom` when
-  overrides are live. Mode header needs both.
-- Builtins ship with override flags off. **Restore Factory Defaults** must reset
-  stock PPT/curve/UV (and builtin `base` by id) and refresh the Fans+Power UI.
+- Preserve two authored eight-point curves without safety mutation.
+- Firmware mode transforms only the copy written to hardware.
+- Direct mode alone uses engage/release hysteresis and dwell.
+- Bounds: engage 60–70°C, release 50–65°C and at least 5°C lower, floor
+  204–255 PWM, dwell 5–30 s. Defaults: 70/65°C, 204 PWM, 5 s.
+- There is no 96°C panic/full-speed override; CPU/firmware throttling is
+  authoritative.
+- Release direct EC control first at startup, before suspend, and on sensor/EC
+  failure, shutdown, or failed restoration.
 
 ## UI conventions
 
-- Main window: Silent / Balanced / Turbo / Fans+Power always fully visible;
-  only **custom** mode buttons scroll if needed. Do not wrap the builtin row in
-  a height-capped `ScrolledWindow` (clips `min-height: 72px` mode buttons).
-- Prefer full-width scales under rows — ActionRow suffixes crush sliders.
-- Charge limit writes: clamp to daemon range (min **40**).
-- Sync toggles/sliders from `get-state` on load; don’t assume local defaults.
-- Fans+Power: Close + Escape; reload curve/power/UV when the profile dropdown
-  changes; equal-width power sliders.
+- Use named section views with `sync_from` and intent callbacks, not positional
+  tuples or scattered reconciliation flags. All views share depth-based
+  `SyncGuard`.
+- Use 12 px outer margins and section gaps, 8 px row spacing, 6 px compact
+  spacing. Keep the three built-ins plus Fans + Power fully visible.
+- Use full-width PPT/undervolt scales and two balanced fan charts. Wide layouts
+  are side-by-side; narrow layouts stack inside a scroller. Keep one persistent
+  bottom action bar.
+- Preserve Escape/Close, profile reload, `ColorDialogButton`, and tracing.
+- Never use CSS `hexpand`, `Scale::add_mark`, or box shadows on animated
+  containers. Validate the gamescope socket before forcing X11.
 
-## GTK / Wayland pitfalls (from z13gui)
+## Testing
 
-- Set `GTK_A11Y=none` before GTK init.
-- No `hexpand` in CSS — use `set_hexpand` in code.
-- No `scale.add_mark()`; no `box-shadow` on animated containers.
-- Gamescope: force `GDK_BACKEND=x11` when the gamescope Wayland socket is real;
-  HUD overlay atom is `GAMESCOPE_EXTERNAL_OVERLAY` (display-only).
-- Cairo fan curve paints its own colours (CSS does not style the canvas).
-- Dial/`NotRunning` must show a banner — never treat unreachable daemon as success.
-
-## Testing expectations
-
-- Logic changes → unit tests in `z13-helper-core` / `z13ctl-client`.
-- Run `make test` and `make lint` before finishing a task.
-- Commit only when the user asks; GPG signing may prompt them.
+- Logic changes require unit tests in core/client/daemon.
+- Config tests cover only fresh v1 defaults, round trips, corruption
+  preservation, validation, and unsupported-version rejection.
+- Keep regression coverage proving temperature alone never overrides a curve.
+- Run `make test` and `make lint` before finishing. Commit only when requested.

@@ -1,0 +1,15 @@
+[package]
+name = "z13helper-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed NDJSON client for z13helperd"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+z13helper-core = { path = "../z13helper-core" }
+
+[[bin]]
+name = "z13helper-smoke"
+path = "src/bin/smoke.rs"

@@ -1,0 +1,26 @@
+[package]
+name = "z13helperd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Privileged hardware backend for the ASUS ROG Flow Z13 GZ302EA"
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+signal-hook.workspace = true
+thiserror.workspace = true
+z13helper-core = { path = "../z13helper-core" }
+tracing.workspace = true
+zbus.workspace = true
+
+[lib]
+name = "z13helperd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "z13helperd"
+path = "src/main.rs"

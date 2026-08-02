@@ -1,89 +1,98 @@
-# z13-helper
+# z13helper
 
-G-Helper-style GTK4/libadwaita desktop GUI for controlling an **ASUS ROG Flow Z13
-(2025, GZ302EA)** on Linux. It is a frontend for **[z13ctl](https://github.com/dahui/z13ctl)**.
-Normal hardware access goes through the z13ctl daemon socket. Optional direct
-fan control uses the separately installed, narrowly privileged
-`z13-helper-fan-service`; the GTK process never accesses sysfs, hidraw, or raw
-I/O ports and never shells out to `z13ctl`.
+`z13helper` is a self-contained Linux control platform for the ASUS ROG Flow
+Z13 (2025, GZ302EA). It ships a GTK4/libadwaita desktop application, one
+privileged hardware daemon, and a diagnostic CLI. The GTK process never opens
+sysfs, hidraw, input devices, the SMU, or raw I/O ports.
 
-This project **replaces z13gui** for desktop use. Disable `z13gui.service` so
-both apps do not fight over the Armoury Crate `gui-toggle` event:
+The shipped components are:
 
-```sh
-systemctl --user disable --now z13gui.service
+| Component | Purpose |
+|---|---|
+| `z13helper` | Desktop UI and named user profiles |
+| `z13helperd` | Root hardware daemon and sole hardware writer |
+| `z13helperctl` | JSON-friendly diagnostics and scripting CLI |
+| `z13helper-core` | Pure shared domain types, validation, and apply planning |
+| `z13helper-client` | Shared Unix-socket transport for the UI and CLI |
+
+The two libraries compile into the binaries; they are not separate services.
+Keeping them separate prevents transport/I/O concerns from entering the pure,
+unit-tested profile and safety model.
+
+## Fresh application boundary
+
+This project does not migrate or manage data from the earlier `z13-helper`
+application. Its first and only configuration schema is version 1 at:
+
+```text
+$XDG_CONFIG_HOME/z13helper/config.json
 ```
 
-## Prerequisites
+Unsupported or corrupt files at that new path are preserved and reported. No
+installer searches for, imports, aliases, or deletes legacy data, binaries,
+services, sockets, groups, desktop files, or application IDs.
 
-1. **z13ctl** installed and set up:
-   ```sh
-   sudo z13ctl setup          # group permissions on HID / sysfs
-   systemctl --user enable --now z13ctl.socket z13ctl.service
-   ```
-2. **GTK4** ≥ 4.14 and **libadwaita** ≥ 1.5 (dev packages for building).
-3. Optional: **`gtk4-layer-shell`** for a G-Helper-style Wayland HUD overlay
-   (`cargo build -p z13-helper --features layer-shell`).
-4. Optional: **`ryzen_smu`** (amkillam fork) for CPU undervolting. The app
-   reads `undervolt_available` from the daemon and never probes the SMU itself.
-5. Optional: **power-profiles-daemon**. z13ctl maps stock bases to PPD profiles;
-   if PPD is missing, the write is silently ignored.
-6. Optional experimental direct fan control: install and enable the system
-   companion with `sudo make install-fan-service`, then add your user to the
-   `z13-helper` group and re-login. Firmware fan curves continue to work when
-   it is not installed.
-
-## Build & install
-
-Rust 1.80+ required. This repo vendors a workspace-local rustup under `.cargo/`
-if you bootstrapped that way; otherwise use a system toolchain.
+Before enabling this daemon, manually stop and remove competing writers:
 
 ```sh
-make build          # release binary in target/release/z13-helper
-make test           # pure-logic unit tests
-make lint           # clippy -D warnings + rustfmt check
-make install        # ~/.local/bin + .desktop + icon
-make run
+systemctl --user disable --now z13ctl.socket z13ctl.service z13gui.service
+sudo systemctl disable --now z13helper-fan-service.service
 ```
 
-## Profile model
+Exact old unit names vary by installation. Remove old application data yourself
+if desired; the build and installation targets deliberately do not do so.
+`z13helperd` also refuses to start while a live z13ctl socket or legacy fan
+service socket is present.
 
-z13ctl has four profiles: `quiet`, `balanced`, `performance`, and a virtual
-`custom` slot. Named custom profiles ("Gaming", …) are a **GUI-side** concept
-stored in `~/.config/z13-helper/config.json`. Applying one pushes its values
-into z13ctl's single custom slot.
+## Build and install
 
-Built-ins **Silent / Balanced / Turbo** ship with every override flag off, so
-out of the box the app behaves like plain z13ctl.
+Rust 1.80+, GTK 4.14+, and libadwaita 1.5+ are required.
 
-### Apply order (not negotiable)
+```sh
+make build
+make test
+make lint
+make install
+sudo make install-service
+sudo usermod -aG z13helper "$USER"
+```
 
-1. `profile-set <base>` — always, even if unchanged (clears prior overrides and
-   sets the matching PPD profile).
-2. TDP / PPT (if enabled) — **before** the fan curve.
-3. Fan curve (if enabled).
-4. Undervolt (if enabled and available).
+Log out and back in after changing group membership. The system service creates
+`/run/z13helper/z13helperd.sock` and stores flattened machine state atomically
+at `/var/lib/z13helper/state.json`.
 
-Direct EC fan control is an explicit experimental alternative for step 3. It
-uses the same saved curve but interpolates and applies duty through a privileged
-companion instead of asking firmware to run the curve. Do not issue independent
-`z13ctl profile` commands while direct mode is active.
+Optional GTK layer-shell support can be built with:
 
-### Why base and PPD are one control
+```sh
+cargo build -p z13helper --features layer-shell
+```
 
-z13ctl's `SetProfile` calls `powerprofilesctl set` itself after writing
-`platform_profile`. TDP, fan, and undervolt handlers only set an in-memory
-`custom` marker — they never retouch PPD. So the Power Profile dropdown stores
-a single `base` and labels it with the PPD profile it implies
-(`Balanced — PPD: balanced`). Off-diagonal combinations are intentionally
-unreachable.
+## Profiles and safety
 
-## Power source auto-switch
+Silent, Balanced, and Turbo are fresh version-1 defaults. Named profiles live
+only in the user configuration. PPD is independently selectable when
+power-profiles-daemon is available.
 
-When AC/battery changes (UPower `OnBattery`, with sysfs fallback), the app
-debounces ~2 s, applies the remembered profile for that source, and shows a
-HUD toast (unless you clicked a main-window button — the highlight is enough).
+Each apply is validated and serialized by `z13helperd`. It restores the selected
+base's measured five-value stock PPT table, then applies independent PPD, PPT,
+two eight-point fan curves, and undervolt state in a fail-closed order. A PL1
+above 75 W is permitted only after fan protection has been prepared; lowering
+power happens before relaxing that protection.
+
+The high-power fan floor defaults to 204 PWM, engages at 70°C, releases at 65°C,
+and has a five-second dwell. Firmware mode transforms only the curve copy sent
+to firmware. Direct mode uses live engage/release hysteresis and dwell. Authored
+curves are never modified. There is intentionally no 96°C panic override: CPU
+and firmware throttling remain authoritative.
+
+## CLI
+
+`z13helperctl status` and `z13helperctl probe` print JSON. `watch` streams daemon
+events, while `apply -` accepts a complete version-1 apply request on stdin.
+Focused commands cover profile, PPD, PPT, fans, undervolt, lighting, battery,
+panel overdrive, boot sound, and direct-fan release. The CLI never owns named GUI
+profiles.
 
 ## License
 
-MIT — see sibling projects for trademark notes around ASUS / ROG naming.
+MIT. ASUS and ROG are trademarks of their respective owner.

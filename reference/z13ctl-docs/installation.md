@@ -1,7 +1,7 @@
 # Installation
 
 !!! tip "Most users should also install z13gui"
-    z13ctl is the engine; **[z13gui](https://github.com/dahui/z13gui)** is the
+    z13ctl is the engine; **[z13gui](https://github.com/UHDbits/z13gui)** is the
     recommended way to drive it for everyone except command-line veterans. It's
     a touch-friendly graphical overlay covering every feature — lighting, fan
     curves, TDP, undervolt, profiles, and battery limit. Install z13ctl first
@@ -55,7 +55,7 @@ sudo make install
 === "Release binary"
 
     Download the latest `linux_amd64` archive from the
-    [Releases](https://github.com/dahui/z13ctl/releases) page, then extract
+    [Releases](https://github.com/UHDbits/z13ctl/releases) page, then extract
     and install:
 
     ```sh
@@ -104,7 +104,7 @@ sudo make install
     Then log out and back in for the group membership to take effect.
 
     Alternatively, download the `.pkg.tar.zst` package directly from the
-    [Releases](https://github.com/dahui/z13ctl/releases) page and install with
+    [Releases](https://github.com/UHDbits/z13ctl/releases) page and install with
     pacman:
 
     ```sh
@@ -114,7 +114,7 @@ sudo make install
 === "Debian / Ubuntu"
 
     Download the `.deb` package from the
-    [Releases](https://github.com/dahui/z13ctl/releases) page, then install:
+    [Releases](https://github.com/UHDbits/z13ctl/releases) page, then install:
 
     ```sh
     sudo apt install ./z13ctl_*.deb
@@ -134,7 +134,7 @@ sudo make install
 === "Fedora / RHEL"
 
     Download the `.rpm` package from the
-    [Releases](https://github.com/dahui/z13ctl/releases) page, then install:
+    [Releases](https://github.com/UHDbits/z13ctl/releases) page, then install:
 
     ```sh
     sudo dnf install ./z13ctl_*.rpm
@@ -156,7 +156,7 @@ sudo make install
     Requires Go 1.23 or later.
 
     ```sh
-    git clone https://github.com/dahui/z13ctl
+    git clone https://github.com/UHDbits/z13ctl
     cd z13ctl
     make build
     sudo make install
@@ -187,13 +187,13 @@ If it prints nothing, see [Troubleshooting](#troubleshooting) below.
 ## GUI Frontend
 
 **Highly recommended for most users.** Install
-[z13gui](https://github.com/dahui/z13gui) alongside z13ctl — a touch-friendly
+[z13gui](https://github.com/UHDbits/z13gui) alongside z13ctl — a touch-friendly
 GTK4 overlay that communicates with z13ctl through its daemon and exposes every
 feature graphically. While the raw `z13ctl` CLI is ideal for scripting and
 advanced tuning, beginners and anyone who prefers a point-and-tap interface will
 find the more advanced features (custom fan curves, TDP, undervolting) far
 easier to use through z13gui. See the
-[z13gui README](https://github.com/dahui/z13gui#readme) for installation
+[z13gui README](https://github.com/UHDbits/z13gui#readme) for installation
 instructions.
 
 !!! note "Requires the daemon"

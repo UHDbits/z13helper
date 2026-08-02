@@ -1,103 +1,128 @@
 # Architecture
 
-z13-helper is a four-crate Cargo workspace:
+## Boundaries
 
-| Crate | Role |
+The Cargo workspace has five crates:
+
+| Crate | Boundary |
 |---|---|
-| `z13ctl-client` | NDJSON Unix-socket client for the z13ctl daemon |
-| `z13-helper-core` | Pure logic: profiles, apply sequencing, curve math, config, debounce |
-| `z13-helper` | Thin GTK4 / libadwaita UI |
-| `z13-helper-fan-service` | Root system companion for opt-in direct EC fan control |
+| `z13helper-core` | Pure profiles, v1 protocol, errors, config, curve math, safety policy, apply planning |
+| `z13helper-client` | Versioned NDJSON Unix-socket transport |
+| `z13helper` | GTK application, controllers, section views, and background UI services |
+| `z13helperd` | Privileged hardware ownership, persistence, lifecycle, and event dispatch |
+| `z13helperctl` | Stateless diagnostic and scripting client |
 
-`cargo test` covers the first two; the GTK layer is exercised manually.
+Core and client remain separate intentionally. Core contains no sockets, GTK,
+D-Bus, sysfs, or hardware I/O and is shared by all binaries. Client contains
+only transport and timeout/error mapping and is shared by the GUI and CLI.
 
-## Direct fan companion
+```mermaid
+flowchart LR
+  GUI["z13helper GTK"] --> CLIENT["z13helper-client"]
+  CLI["z13helperctl"] --> CLIENT
+  GUI --> CORE["z13helper-core"]
+  CLI --> CORE
+  CLIENT --> CORE
+  CLIENT -->|"v1 NDJSON / AF_UNIX"| DAEMON["z13helperd"]
+  DAEMON --> CORE
+  DAEMON --> HW["sysfs · D-Bus · hidraw · input · SMU · EC"]
+```
 
-The optional `z13-helper-fan-service` is the only component allowed to request
-`CAP_SYS_RAWIO`. It exposes a narrow NDJSON Unix socket and only accesses the
-ASUS EC fan mailbox registers. The GTK app reaches it through
-`z13ctl-client::ManualFanClient`; it never opens raw ports itself.
+Only `z13helperd` touches hardware. The socket is
+`/run/z13helper/z13helperd.sock`, owned by `root:z13helper`. Requests carry a
+protocol version, stable wire error codes, a bounded line size, and a command
+deadline. Complete applies are serialized so the last successful request wins.
 
-The service owns temperature interpolation and fail-safes. It returns the EC to
-automatic mode on sensor/transaction errors, shutdown, and suspend. It starts
-in automatic mode after every boot or crash. z13ctl remains authoritative for
-profiles, TDP, firmware fan curves, and every other hardware feature.
+## State ownership
 
-## Threading
+User-facing profile names and UI preferences live in the fresh schema-version-1
+file `$XDG_CONFIG_HOME/z13helper/config.json`. There are no legacy migrations.
+Unknown schema versions are preserved and rejected.
 
-Never call the daemon from the GTK thread (commands have a 10 s deadline).
-Pattern:
+The daemon atomically persists only flattened desired machine state at
+`/var/lib/z13helper/state.json`. On first boot without that file, it retains the
+detected base, restores the measured stock PPT table, and leaves direct EC mode
+released. Startup and resume restore fan protection before high power, followed
+by undervolt and lighting.
 
-1. Snapshot widget values on the UI thread.
-2. `worker::blocking` runs z13ctl and companion socket I/O on a std thread.
-3. The result is delivered back on the GLib main context via `async_channel`.
+## Apply transaction
 
-An `applying` in-flight guard serialises profile applies. Telemetry is a 1 Hz
-timer that stops doing work while the window is hidden and skips ticks while a
-previous `get-state` is still in flight.
+The daemon prevalidates the entire request before the first hardware mutation.
+For an ordinary or lower-power apply:
 
-## Error model (`handled` collapse)
+1. Select the base on every platform-profile device and restore its measured
+   five-value stock PPT table while retaining existing fan protection.
+2. Select PPD independently. Missing PPD produces a visible warning; an unknown
+   advertised selection is rejected.
+3. Lower/write PPT before relaxing prior high-power fan protection.
+4. Install firmware or direct fan control.
+5. Restore the requested undervolt offset.
 
-The Go API returns `(handled bool, err error)` where `(false, nil)` means the
-daemon was not reached. We collapse that into:
+When raising PL1 above 75 W, step 4 moves before the power write. A fan-setup
+failure abandons the power increase. If a later step fails, the daemon attempts
+rollback without dropping safety fan protection; incomplete rollback sets
+`degraded` and records warnings in `DaemonState`.
 
-- `DaemonError::NotRunning` — socket missing / refused
-- `DaemonError::PermissionDenied` — EACCES (run `sudo z13ctl setup`)
-- `DaemonError::Timeout` / `Rejected` / `Protocol`
+## Fan policy
 
-`NotRunning` reveals a persistent `AdwBanner` with the systemctl hint. Never
-treat dial failure as success (z13gui "dead button" bug).
+Profiles carry two authored eight-point curves and select firmware or direct
+mode. Authored values are immutable inputs to the runtime safety layer.
 
-## Apply ordering
+- Firmware mode applies the configured high-power floor to a temporary hardware
+  copy and verifies both ASUS `pwm_enable` interfaces. It reports
+  `firmware_armed`; release hysteresis and dwell do not apply.
+- Direct mode interpolates each authored curve in the EC loop. `FloorGate`
+  engages at the configured temperature, releases only below the release point
+  after dwell, and reports `direct_engaged` or `direct_released`.
+- At or below 75 W the state is `inactive`.
+- No temperature-only 96°C full-speed override exists. CPU and firmware thermal
+  throttling remain the final authority.
 
-See README. Critical consequences:
+EC automatic-mode release is the first startup action and occurs before suspend,
+on sensor failure, repeated EC errors, failed restore, normal shutdown, and the
+restricted systemd `ExecStopPost` recovery path.
 
-- Stock `profile-set` wipes custom fans / UV / PPT from hardware — it must run
-  first so the outgoing profile's overrides are cleared.
-- Above 75 W PL1, z13ctl writes a 204 PWM floor **before** the power limit and
-  rejects any later curve with a point below that floor. Always send TDP first;
-  the curve editor clamps to the floor when the profile's PL1 exceeds 75 W.
-- Steps 2–4 only flip the daemon's in-memory `Profile` marker to `custom`.
-  `platform_profile` and PPD stay at the base from step 1.
+## Hardware adapters
 
-## Profiles vs daemon `custom`
+The daemon owns adapters for:
 
-GUI named profiles live in `$XDG_CONFIG_HOME/z13-helper/config.json`. The
-daemon has exactly one saved custom slot. Applying a GUI profile means pushing
-into that slot. `profile-get` returns the stock base from sysfs (never
-`custom`); `get-state.profile` reports `custom` when overrides are live. Both
-are needed for the mode header (`Mode: Balanced+ 20W`).
+- all platform-profile devices, including quiet/low-power mapping;
+- effective five-value PPT state;
+- power-profiles-daemon profiles/current selection over D-Bus;
+- both firmware fan interfaces and direct EC mailbox control;
+- a single startup `ryzen_smu` MP1 `0x4C` availability probe and cached result;
+- persistent keyboard/lightbar hidraw handles with hotplug relight;
+- battery thresholds 40–100, panel overdrive, and boot sound;
+- non-exclusive `KEY_PROG3` monitoring with reconnect and `gui-toggle` events;
+- temperature and two calibrated fan RPM readings.
 
-## Power source + HUD
+Tests use injectable fake roots for sysfs/hwmon/SMU/hidraw/input behavior.
 
-- Primary: UPower `OnBattery` via zbus (polled on a background thread).
-- Fallback: `/sys/class/power_supply/*/online` (Mains) or Battery status.
-- Debounce: pure `PowerDebouncer` in core (~2 s, configurable).
-- HUD: gtk4-layer-shell overlay when built with `--features layer-shell`
-  (empty input region for click-through). Under gamescope (`GDK_BACKEND=x11`
-  after validating `GAMESCOPE_WAYLAND_DISPLAY`), set
-  `GAMESCOPE_EXTERNAL_OVERLAY` (display-only, no input — the right atom for a
-  toast; z13gui uses `STEAM_OVERLAY` because its drawer needs input). Fallback:
-  `org.freedesktop.Notifications`.
+## GTK threading and views
 
-## gui-toggle
+The GTK crate separates application orchestration, background services, and UI
+sections. Named views expose reconciliation behavior and share one depth-based
+`SyncGuard`, so daemon refreshes cannot trigger write callbacks. Socket and
+D-Bus calls run through `worker::blocking`; GTK widgets are touched only after
+the result returns to the GLib main context.
 
-Background subscribe with exponential-backoff reconnect. 50 ms leading-edge
-debounce (stay under ~120 ms — 250 ms swallowed real presses in z13gui).
-Toggle presents/hides the main window. This app replaces z13gui for that
-button; do not run both.
+The main window keeps Silent, Balanced, Turbo, and Fans + Power fully visible.
+Fans + Power uses a full-width profile toolbar, dual balanced charts, adaptive
+wide/stacked content, full-width equal-allocation scales, and one persistent
+bottom action bar. Outer/section/row/compact spacing is 12/12/8/6 px.
 
-## GTK4 / Wayland pitfalls (from z13gui — do not re-introduce)
+GTK rules retained from field testing: set `GTK_A11Y=none` before initialization,
+never use CSS `hexpand`, `Scale::add_mark`, or animated box shadows, force X11
+only for a real gamescope Wayland socket, use `GAMESCOPE_EXTERNAL_OVERLAY`, and
+paint fan-chart colors in Cairo.
 
-- Set `GTK_A11Y=none` before GTK init (AT-SPI D-Bus timeouts).
-- No `hexpand` in CSS — use `set_hexpand` in code.
-- No `scale.add_mark()` — GtkGizmo / pixman warnings.
-- No `box-shadow` on animated containers (Wayland Vulkan smearing).
-- Gamescope advertises layer-shell but does not implement anchoring/margins —
-  force `GDK_BACKEND=x11` when the gamescope Wayland socket exists; validate
-  the socket (stale env is common).
-- Never touch widgets from worker threads.
-- Cairo-painted widgets (fan curve) paint their own colours; CSS tokens do not
-  apply to the canvas.
-- Never call `SMUProbeUndervolt` from a short-lived client — it is destructive
-  (writes CO offset 0). Use `get-state.undervolt_available` only.
+## Lifecycle and packaging
+
+The systemd unit uses `RuntimeDirectory=z13helper`,
+`StateDirectory=z13helper`, AF_UNIX-only networking, `ProtectSystem=strict`,
+explicit writable hardware paths, and only `CAP_SYS_RAWIO`. The installed
+application ID is `com.ashtonantila.z13helper`.
+
+No compatibility aliases or automatic removal actions are shipped. A live
+z13ctl or legacy fan-service socket makes daemon startup fail with an actionable
+message, preventing simultaneous write ownership.

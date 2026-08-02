@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=z13helper
+Comment=G-Helper-style control panel for ASUS ROG Flow Z13
+Exec=z13helper
+Icon=z13helper
+Terminal=false
+Type=Application
+Categories=Settings;HardwareSettings;
+StartupNotify=true
+StartupWMClass=com.ashtonantila.z13helper
+X-GNOME-Application-ID=com.ashtonantila.z13helper

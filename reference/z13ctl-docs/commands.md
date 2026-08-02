@@ -4,7 +4,7 @@
     This page is the complete CLI reference. Driving the more advanced features
     (custom fan curves, TDP, undervolting) from the command line makes sense for
     Linux veterans and scripting, but if you're newer to Linux you'll likely
-    have an easier time with **[z13gui](https://github.com/dahui/z13gui)**, the
+    have an easier time with **[z13gui](https://github.com/UHDbits/z13gui)**, the
     touch-friendly graphical frontend that exposes all of these commands as
     point-and-tap controls.
 

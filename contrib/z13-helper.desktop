@@ -1,9 +1,0 @@
-[Desktop Entry]
-Name=z13-helper
-Comment=G-Helper-style control panel for ASUS ROG Flow Z13
-Exec=z13-helper
-Icon=z13-helper
-Terminal=false
-Type=Application
-Categories=Settings;HardwareSettings;
-StartupNotify=true

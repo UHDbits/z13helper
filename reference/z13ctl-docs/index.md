@@ -4,7 +4,7 @@ RGB lighting, performance profiles, battery limit, fan curves, TDP control,
 CPU undervolting, and display settings for the **2025 ASUS ROG Flow Z13**
 on Linux.
 
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/dahui/z13ctl/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/UHDbits/z13ctl/blob/main/LICENSE)
 
 ---
 
@@ -33,7 +33,7 @@ automatically when the detachable keyboard is removed and reattached.
 
 !!! tip "New to Linux? Use the GUI"
     Most users — especially those newer to Linux — should install
-    **[z13gui](https://github.com/dahui/z13gui)**, a touch-friendly GTK4 overlay
+    **[z13gui](https://github.com/UHDbits/z13gui)**, a touch-friendly GTK4 overlay
     that controls every z13ctl feature (lighting, fan curves, TDP, undervolt,
     profiles, battery limit) through the daemon — no command line required. The
     raw `z13ctl` CLI is great for scripting and advanced tuning, but if you're

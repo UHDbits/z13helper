@@ -1379,7 +1379,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
-name = "z13-helper"
+name = "z13helper"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1394,24 +1394,43 @@ dependencies = [
  "libadwaita",
  "serde",
  "serde_json",
+ "tracing",
  "x11rb",
- "z13-helper-core",
- "z13ctl-client",
+ "z13helper-client",
+ "z13helper-core",
  "zbus",
 ]
 
 [[package]]
-name = "z13-helper-core"
+name = "z13helper-client"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "z13helper-core",
+]
+
+[[package]]
+name = "z13helper-core"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "z13ctl-client",
 ]
 
 [[package]]
-name = "z13-helper-fan-service"
+name = "z13helperctl"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "z13helper-client",
+ "z13helper-core",
+]
+
+[[package]]
+name = "z13helperd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1420,15 +1439,9 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "thiserror",
-]
-
-[[package]]
-name = "z13ctl-client"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror",
+ "tracing",
+ "z13helper-core",
+ "zbus",
 ]
 
 [[package]]

@@ -1,0 +1,61 @@
+[Unit]
+Description=z13helper hardware control daemon
+Documentation=https://github.com/UHDbits/z13helper#readme
+ConditionPathExists=/sys/class/dmi/id/product_name
+After=systemd-sysusers.service
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=z13helper
+ExecStart=/usr/libexec/z13helperd
+RuntimeDirectory=z13helper
+RuntimeDirectoryMode=0750
+StateDirectory=z13helper
+StateDirectoryMode=0750
+UMask=0007
+Restart=on-failure
+RestartSec=1s
+TimeoutStopSec=5s
+KillSignal=SIGTERM
+ExecStopPost=/usr/libexec/z13helperd --release-ec
+
+# The EC mailbox requires raw x86 port I/O via ioperm(2). Do not set
+# PrivateDevices=yes — that drops CAP_SYS_RAWIO effectiveness for port I/O.
+CapabilityBoundingSet=CAP_SYS_RAWIO
+AmbientCapabilities=CAP_SYS_RAWIO
+NoNewPrivileges=yes
+DevicePolicy=closed
+DeviceAllow=char-hidraw rw
+DeviceAllow=char-input r
+
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/run/z13helper /var/lib/z13helper
+ReadWritePaths=-/sys/devices/platform/asus-nb-wmi
+ReadWritePaths=-/sys/class/platform-profile
+ReadWritePaths=-/sys/firmware/acpi/platform_profile
+ReadWritePaths=-/sys/class/hwmon
+ReadWritePaths=-/sys/class/power_supply
+ReadWritePaths=-/sys/class/firmware-attributes/asus-armoury
+ReadWritePaths=-/sys/kernel/ryzen_smu_drv
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

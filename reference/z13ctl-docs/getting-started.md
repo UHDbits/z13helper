@@ -8,7 +8,7 @@ you probably want the daemon running anyway.
 !!! tip "Prefer not to use the command line? Use z13gui"
     Everything below can be done from a graphical interface instead. If you're
     new to Linux or simply prefer not to type commands, install
-    **[z13gui](https://github.com/dahui/z13gui)** — a touch-friendly overlay
+    **[z13gui](https://github.com/UHDbits/z13gui)** — a touch-friendly overlay
     that drives all of these features (lighting, fan curves, TDP, undervolt,
     profiles) through the daemon. The CLI examples here remain useful for
     scripting and advanced tuning.
@@ -223,5 +223,5 @@ This prints a live swatch table in your terminal. Any 6-digit hex value
 - [Commands](commands.md) — every flag and option for every command
 - [Daemon](daemon.md) — set up the daemon for state persistence, boot
   restore, and sleep/resume recovery
-- [z13gui](https://github.com/dahui/z13gui) — graphical interface for all
+- [z13gui](https://github.com/UHDbits/z13gui) — graphical interface for all
   z13ctl features (touch-friendly GTK4 overlay)

@@ -1,18 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/z13ctl-client",
-    "crates/z13-helper-core",
-    "crates/z13-helper",
-    "crates/z13-helper-fan-service",
+    "crates/z13helper-client",
+    "crates/z13helper-core",
+    "crates/z13helper",
+    "crates/z13helperd",
+    "crates/z13helperctl",
 ]
-default-members = ["crates/z13-helper"]
+default-members = ["crates/z13helper"]
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
 version = "0.1.0"
-repository = "https://github.com/dahui/z13gg"
+repository = "https://github.com/UHDbits/z13helper"
 
 [workspace.dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
@@ -21,3 +22,5 @@ thiserror = "2.0.12"
 anyhow = "1.0.98"
 libc = "0.2.174"
 signal-hook = "0.3.18"
+tracing = "0.1.44"
+zbus = "5.18.0"
