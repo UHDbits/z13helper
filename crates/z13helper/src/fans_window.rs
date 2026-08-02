@@ -168,11 +168,18 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
 
     let fan_toggle = gtk::CheckButton::with_label("Apply custom fan curve");
     fan_toggle.set_active(profile.apply_fan_curve);
+    let unified_toggle = gtk::CheckButton::with_label("Unified fan control");
+    unified_toggle.set_active(profile.unified_fan_control);
+    unified_toggle.set_tooltip_text(Some(
+        "Use the Fan 1 graph to control both fans with the same curve.",
+    ));
     editor.set_muted(!fan_toggle.is_active());
     editor2.set_muted(!fan_toggle.is_active());
     editor.set_editable(fan_toggle.is_active());
-    editor2.set_editable(fan_toggle.is_active());
+    editor2.set_editable(fan_toggle.is_active() && !profile.unified_fan_control);
+    editor2.widget().set_visible(!profile.unified_fan_control);
     right.append(&fan_toggle);
+    right.append(&unified_toggle);
 
     let direct_toggle = gtk::CheckButton::with_label("Direct EC control");
     direct_toggle.set_active(profile.fan_control_mode == FanControlMode::Direct);
@@ -289,16 +296,21 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let chart_label = gtk::Label::new(Some("Fan 1 Curve — % vs °C"));
     chart_label.add_css_class("dim-label");
     chart_label.set_xalign(0.0);
+    if profile.unified_fan_control {
+        chart_label.set_label("Unified Fan Curve — % vs °C");
+    }
     right.append(&chart_label);
     right.append(editor.widget());
     let chart2_label = gtk::Label::new(Some("Fan 2 Curve — % vs °C"));
     chart2_label.add_css_class("dim-label");
     chart2_label.set_xalign(0.0);
+    chart2_label.set_visible(!profile.unified_fan_control);
     right.append(&chart2_label);
     right.append(editor2.widget());
 
     let editor_muted = editor.clone();
     let editor2_muted = editor2.clone();
+    let unified_fan_toggle = unified_toggle.clone();
     let state_fan = state.clone();
     let editing_fan = editing_id.clone();
     let loading_fan = loading.clone();
@@ -311,12 +323,53 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         editor_muted.set_muted(!enabled);
         editor2_muted.set_muted(!enabled);
         editor_muted.set_editable(enabled);
-        editor2_muted.set_editable(enabled);
+        editor2_muted.set_editable(enabled && !unified_fan_toggle.is_active());
         let id = editing_fan.borrow().clone();
         if let Some(p) = state_fan.config.borrow_mut().find_mut(&id) {
             p.apply_fan_curve = t.is_active();
         }
         schedule_apply(&state_fan, &apply_schedule_fan);
+    });
+
+    let state_unified = state.clone();
+    let editing_unified = editing_id.clone();
+    let loading_unified = loading.clone();
+    let apply_schedule_unified = apply_schedule.clone();
+    let editor2_unified = editor2.clone();
+    let chart_label_unified = chart_label.clone();
+    let chart2_label_unified = chart2_label.clone();
+    let fan_toggle_unified = fan_toggle.clone();
+    unified_toggle.connect_toggled(move |toggle| {
+        if loading_unified.active() {
+            return;
+        }
+        let unified = toggle.is_active();
+        let id = editing_unified.borrow().clone();
+        let curve = state_unified
+            .config
+            .borrow_mut()
+            .find_mut(&id)
+            .map(|profile| {
+                profile.unified_fan_control = unified;
+                if unified {
+                    profile.fan_curves[1] = profile.fan_curves[0];
+                }
+                profile.fan_curves[0]
+            });
+        if let Some(curve) = curve {
+            if unified {
+                editor2_unified.set_curve(curve);
+            }
+        }
+        editor2_unified.widget().set_visible(!unified);
+        editor2_unified.set_editable(fan_toggle_unified.is_active() && !unified);
+        chart_label_unified.set_label(if unified {
+            "Unified Fan Curve — % vs °C"
+        } else {
+            "Fan 1 Curve — % vs °C"
+        });
+        chart2_label_unified.set_visible(!unified);
+        schedule_apply(&state_unified, &apply_schedule_unified);
     });
 
     let state_direct = state.clone();
@@ -370,6 +423,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let editing_curve = editing_id.clone();
     let loading_curve = loading.clone();
     let apply_schedule_curve = apply_schedule.clone();
+    let editor2_curve = editor2.clone();
     editor.set_changed(move |curve| {
         if loading_curve.active() {
             return;
@@ -377,6 +431,10 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         let id = editing_curve.borrow().clone();
         if let Some(p) = state_curve.config.borrow_mut().find_mut(&id) {
             p.fan_curves[0] = curve;
+            if p.unified_fan_control {
+                p.fan_curves[1] = curve;
+                editor2_curve.set_curve(curve);
+            }
         }
         schedule_apply(&state_curve, &apply_schedule_curve);
     });
@@ -390,6 +448,9 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         }
         let id = editing_curve.borrow().clone();
         if let Some(profile) = state_curve.config.borrow_mut().find_mut(&id) {
+            if profile.unified_fan_control {
+                profile.fan_curves[0] = curve;
+            }
             profile.fan_curves[1] = curve;
         }
         schedule_apply(&state_curve, &apply_schedule_curve);
@@ -407,10 +468,13 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             first: editor.clone(),
             second: editor2.clone(),
             enabled: fan_toggle.clone(),
+            unified: unified_toggle.clone(),
             direct: direct_toggle.clone(),
             direct_explanation: direct_warning.clone(),
             hysteresis_up: hysteresis_up.1.clone(),
             hysteresis_down: hysteresis_down.1.clone(),
+            chart_label: chart_label.clone(),
+            chart2_label: chart2_label.clone(),
         },
         power: PowerEditorView {
             spl: spl.clone(),
@@ -433,6 +497,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let editor2_sel = editor2.clone();
     let editing_sel = editing_id.clone();
     let fan_toggle_sel = fan_toggle.clone();
+    let unified_toggle_sel = unified_toggle.clone();
     let editors_sel = editors.clone();
     let loading_sel = loading.clone();
     let rename_sel = rename.clone();
@@ -450,11 +515,13 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         {
             let prev = editing_sel.borrow().clone();
             let curve = editor_sel.curve();
-            let curve2 = editor2_sel.curve();
+            let unified = unified_toggle_sel.is_active();
+            let curve2 = if unified { curve } else { editor2_sel.curve() };
             if let Some(p) = state_sel.config.borrow_mut().find_mut(&prev) {
                 p.fan_curves[0] = curve;
                 p.fan_curves[1] = curve2;
                 p.apply_fan_curve = fan_toggle_sel.is_active();
+                p.unified_fan_control = unified;
             }
         }
         *editing_sel.borrow_mut() = next.id.clone();
@@ -1197,10 +1264,13 @@ struct FanEditorView {
     first: CurveEditor,
     second: CurveEditor,
     enabled: gtk::CheckButton,
+    unified: gtk::CheckButton,
     direct: gtk::CheckButton,
     direct_explanation: gtk::Label,
     hysteresis_up: gtk::Scale,
     hysteresis_down: gtk::Scale,
+    chart_label: gtk::Label,
+    chart2_label: gtk::Label,
 }
 
 struct PowerEditorView {
@@ -1221,7 +1291,11 @@ impl ProfileEditorView {
     fn load(&self, profile: &Profile, disable_high_power_fan_protection: bool) {
         self.loading.run(|| {
             self.fans.first.set_curve(profile.fan_curves[0]);
-            self.fans.second.set_curve(profile.fan_curves[1]);
+            self.fans.second.set_curve(if profile.unified_fan_control {
+                profile.fan_curves[0]
+            } else {
+                profile.fan_curves[1]
+            });
             let high_power = profile.apply_power_limits
                 && profile.pl1_spl >= HIGH_POWER_THRESHOLD_W
                 && !disable_high_power_fan_protection;
@@ -1230,8 +1304,25 @@ impl ProfileEditorView {
             self.fans.first.set_muted(!profile.apply_fan_curve);
             self.fans.second.set_muted(!profile.apply_fan_curve);
             self.fans.first.set_editable(profile.apply_fan_curve);
-            self.fans.second.set_editable(profile.apply_fan_curve);
+            self.fans
+                .second
+                .set_editable(profile.apply_fan_curve && !profile.unified_fan_control);
+            self.fans
+                .second
+                .widget()
+                .set_visible(!profile.unified_fan_control);
             self.fans.enabled.set_active(profile.apply_fan_curve);
+            self.fans.unified.set_active(profile.unified_fan_control);
+            self.fans
+                .chart_label
+                .set_label(if profile.unified_fan_control {
+                    "Unified Fan Curve — % vs °C"
+                } else {
+                    "Fan 1 Curve — % vs °C"
+                });
+            self.fans
+                .chart2_label
+                .set_visible(!profile.unified_fan_control);
             self.fans
                 .direct
                 .set_active(profile.fan_control_mode == FanControlMode::Direct);

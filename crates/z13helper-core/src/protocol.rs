@@ -243,12 +243,16 @@ impl ApplyRequest {
             .unwrap_or(0);
         let needs_protected_curve = effective_pl1 >= crate::curve::HIGH_POWER_THRESHOLD_W
             && !disable_high_power_fan_protection;
+        let fan_curves = if profile.unified_fan_control {
+            [profile.fan_curves[0], profile.fan_curves[0]]
+        } else {
+            profile.fan_curves
+        };
         Self {
             ppd_profile: profile.ppd_profile.clone(),
             power_limits,
             fan_mode: profile.fan_control_mode,
-            fan_curves: (profile.apply_fan_curve || needs_protected_curve)
-                .then_some(profile.fan_curves),
+            fan_curves: (profile.apply_fan_curve || needs_protected_curve).then_some(fan_curves),
             undervolt: profile.apply_undervolt.then_some(profile.cpu_co),
             cpu_temp_limit: profile.cpu_temp_limit,
             fan_hysteresis: FanHysteresis {
@@ -517,5 +521,20 @@ mod tests {
 
         let overridden = ApplyRequest::from_profile(&profile, true);
         assert!(overridden.fan_curves.is_none());
+    }
+
+    #[test]
+    fn unified_fan_control_applies_the_first_curve_to_both_fans() {
+        let mut profile = Profile::builtin("turbo", "Turbo");
+        profile.apply_fan_curve = true;
+        profile.unified_fan_control = true;
+        profile.fan_curves[0][0] = [42, 43];
+        profile.fan_curves[1][0] = [1, 2];
+
+        let curves = ApplyRequest::from_profile(&profile, false)
+            .fan_curves
+            .unwrap();
+        assert_eq!(curves[0], curves[1]);
+        assert_eq!(curves[0][0], [42, 43]);
     }
 }

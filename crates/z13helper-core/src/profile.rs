@@ -27,6 +27,8 @@ pub struct Profile {
     pub fan_hysteresis_up: u8,
     #[serde(default = "default_fan_hysteresis")]
     pub fan_hysteresis_down: u8,
+    #[serde(default = "default_unified_fan_control")]
+    pub unified_fan_control: bool,
     pub fan_curves: [FanCurve; 2],
     #[serde(default)]
     pub factory_fan_curves_loaded: bool,
@@ -38,6 +40,10 @@ pub struct Profile {
 
 pub const fn default_fan_hysteresis() -> u8 {
     3
+}
+
+pub const fn default_unified_fan_control() -> bool {
+    true
 }
 
 pub const fn default_cpu_temp_limit() -> u8 {
@@ -158,6 +164,7 @@ impl Profile {
             fan_control_mode: FanControlMode::Firmware,
             fan_hysteresis_up: default_fan_hysteresis(),
             fan_hysteresis_down: default_fan_hysteresis(),
+            unified_fan_control: default_unified_fan_control(),
             fan_curves: stock_fan_curves(Some(ppd_profile)),
             factory_fan_curves_loaded: false,
             apply_undervolt: false,
@@ -182,6 +189,7 @@ impl Profile {
         self.fan_control_mode = FanControlMode::Firmware;
         self.fan_hysteresis_up = default_fan_hysteresis();
         self.fan_hysteresis_down = default_fan_hysteresis();
+        self.unified_fan_control = default_unified_fan_control();
         self.fan_curves = stock_fan_curves(ppd_profile);
         self.factory_fan_curves_loaded = false;
         self.apply_undervolt = false;
