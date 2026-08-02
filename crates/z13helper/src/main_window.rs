@@ -172,38 +172,59 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     }
 
     // --- Lighting ---
-    let lightbar = lighting_group("Lightbar", "lightbar", state, &sync);
-    let keyboard = lighting_group("Laptop Keyboard", "keyboard", state, &sync);
-    content.append(&lightbar.group);
-    content.append(&keyboard.group);
+    let lightbar = lighting_section(
+        "Lightbar",
+        "display-brightness-symbolic",
+        "lightbar",
+        state,
+        &sync,
+    );
+    let keyboard = lighting_section(
+        "Laptop Keyboard",
+        "input-keyboard-symbolic",
+        "keyboard",
+        state,
+        &sync,
+    );
+    content.append(&lightbar.root);
+    content.append(&keyboard.root);
 
     // --- Battery ---
-    let battery = adw::PreferencesGroup::builder()
-        .title("Battery Charge Limit")
-        .build();
-    let batt_header = adw::ActionRow::builder()
-        .title("Limit")
-        .subtitle("40–100%, steps of 5")
-        .build();
+    let battery = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let batt_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let batt_icon = gtk::Image::from_icon_name("battery-symbolic");
+    let batt_titles = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    batt_titles.set_hexpand(true);
+    let batt_title = gtk::Label::new(Some("Battery Charge Limit"));
+    batt_title.add_css_class("heading");
+    batt_title.set_xalign(0.0);
+    let batt_hint = gtk::Label::new(Some("40–100% · 5% steps"));
+    batt_hint.add_css_class("dim-label");
+    batt_hint.add_css_class("caption");
+    batt_hint.set_xalign(0.0);
+    batt_titles.append(&batt_title);
+    batt_titles.append(&batt_hint);
     let full = gtk::Button::with_label("100%");
     full.add_css_class("flat");
-    batt_header.add_suffix(&full);
-    battery.add(&batt_header);
+    full.set_tooltip_text(Some("Set charge limit to 100%"));
+    batt_header.append(&batt_icon);
+    batt_header.append(&batt_titles);
+    batt_header.append(&full);
+    battery.append(&batt_header);
 
     let limit = gtk::Scale::with_range(gtk::Orientation::Horizontal, 40.0, 100.0, 5.0);
-    limit.set_draw_value(true);
-    limit.set_value_pos(gtk::PositionType::Right);
+    limit.set_draw_value(false);
     limit.set_hexpand(true);
     limit.set_digits(0);
-    limit.set_margin_start(12);
-    limit.set_margin_end(12);
-    limit.set_margin_bottom(8);
-    // Prefer round-digits so the thumb lands on 5% steps.
     limit.set_round_digits(0);
-    battery.add(&limit);
+    battery.append(&limit);
     content.append(&battery);
 
     install_battery_debounce(state, &limit, &sync);
+    let full_label = full.clone();
+    limit.connect_value_changed(move |scale| {
+        full_label.set_label(&format!("{:.0}%", scale.value()));
+    });
     let limit_full = limit.clone();
     full.connect_clicked(move |_| limit_full.set_value(100.0));
 
@@ -283,7 +304,7 @@ struct LightingView {
 }
 
 struct LightingSection {
-    group: adw::PreferencesGroup,
+    root: gtk::Box,
     view: LightingView,
 }
 
@@ -380,39 +401,47 @@ fn make_switch() -> gtk::Switch {
     sw
 }
 
-fn lighting_group(
+fn lighting_section(
     title: &str,
+    icon_name: &str,
     device: &'static str,
     state: &Rc<AppState>,
     sync: &SyncGuard,
 ) -> LightingSection {
-    let group = adw::PreferencesGroup::builder().title(title).build();
-
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let icon = gtk::Image::from_icon_name(icon_name);
+    let heading = gtk::Label::new(Some(title));
+    heading.add_css_class("heading");
+    heading.set_xalign(0.0);
+    heading.set_hexpand(true);
     let enabled = make_switch();
-    let on_row = adw::ActionRow::builder().title("Power").build();
-    on_row.add_suffix(&enabled);
-    on_row.set_activatable_widget(Some(&enabled));
-    group.add(&on_row);
+    header.append(&icon);
+    header.append(&heading);
+    header.append(&enabled);
+    root.append(&header);
 
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let modes = gtk::DropDown::from_strings(&["static", "breathe", "cycle", "rainbow", "strobe"]);
     modes.set_valign(gtk::Align::Center);
-    modes.set_size_request(120, -1);
-    let mode_row = adw::ActionRow::builder().title("Mode").build();
-    mode_row.add_suffix(&modes);
-    group.add(&mode_row);
+    modes.set_hexpand(true);
+    modes.set_tooltip_text(Some("Lighting mode"));
+    controls.append(&modes);
 
     let color = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
     color.set_valign(gtk::Align::Center);
-    let color_row = adw::ActionRow::builder().title("Color").build();
-    color_row.add_suffix(&color);
-    group.add(&color_row);
+    color.set_tooltip_text(Some("Lighting color"));
+    let color_control = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let color_label = gtk::Label::new(Some("Color"));
+    color_control.append(&color_label);
+    color_control.append(&color);
+    controls.append(&color_control);
 
     let speed = gtk::DropDown::from_strings(&["slow", "normal", "fast"]);
     speed.set_valign(gtk::Align::Center);
-    speed.set_size_request(120, -1);
-    let speed_row = adw::ActionRow::builder().title("Speed").build();
-    speed_row.add_suffix(&speed);
-    group.add(&speed_row);
+    speed.set_tooltip_text(Some("Animation speed"));
+    controls.append(&speed);
+    root.append(&controls);
 
     let view = LightingView {
         enabled: enabled.clone(),
@@ -434,16 +463,16 @@ fn lighting_group(
         glib::Propagation::Stop
     });
 
-    let color_row_c = color_row.clone();
-    let speed_row_c = speed_row.clone();
+    let color_control_c = color_control.clone();
+    let speed_c = speed.clone();
     let intent_view = view.clone();
     let intent_client = state.client.clone();
     let intent_sync = sync.clone();
     modes.connect_selected_notify(move |drop| {
         let mode = drop.selected();
         // cycle(2)/rainbow(3) ignore color; static(0) ignores speed.
-        color_row_c.set_visible(mode != 2 && mode != 3);
-        speed_row_c.set_visible(mode != 0);
+        color_control_c.set_visible(mode != 2 && mode != 3);
+        speed_c.set_visible(mode != 0);
         if !intent_sync.active() {
             send_lighting_intent(&intent_client, &intent_view, device, None);
         }
@@ -465,10 +494,10 @@ fn lighting_group(
         }
     });
     // Initial visibility for static.
-    color_row.set_visible(true);
-    speed_row.set_visible(false);
+    color_control.set_visible(true);
+    speed.set_visible(false);
 
-    LightingSection { group, view }
+    LightingSection { root, view }
 }
 
 fn send_lighting_intent(
