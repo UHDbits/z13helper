@@ -128,7 +128,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     // --- Display ---
     let display = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let display_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let display_icon = gtk::Image::from_icon_name("video-display-symbolic");
+    let display_icon = gtk::Image::from_icon_name("computer-symbolic");
     let display_heading = gtk::Label::new(Some("Display"));
     display_heading.add_css_class("heading");
     display_heading.set_xalign(0.0);
