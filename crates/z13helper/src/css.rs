@@ -16,6 +16,7 @@ switch {
   min-height: 24px;
 }
 .warning { color: #FF8000; }
+.fans-split-view > .sidebar-pane { background-color: transparent; }
 .hud {
   background-color: rgba(0, 0, 0, 0.72);
   border-radius: 12px;

@@ -59,6 +59,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let toast_overlay = adw::ToastOverlay::new();
     state.register_toast_overlay(&toast_overlay);
     let left = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    left.add_css_class("card");
     left.set_margin_top(12);
     left.set_margin_bottom(12);
     left.set_margin_start(12);
@@ -73,6 +74,9 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let stack = gtk::Stack::new();
     let switcher = gtk::StackSwitcher::new();
     switcher.set_stack(Some(&stack));
+    switcher.set_margin_top(12);
+    switcher.set_margin_start(12);
+    switcher.set_margin_end(12);
 
     let profile = state
         .config
@@ -591,6 +595,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         .max_sidebar_width(380.0)
         .sidebar_width_fraction(0.36)
         .build();
+    split_view.add_css_class("fans-split-view");
     split_view.set_vexpand(true);
     root.append(&split_view);
     root.append(&actions);
