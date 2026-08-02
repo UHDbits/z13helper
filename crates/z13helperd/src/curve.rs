@@ -113,6 +113,14 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_firmware_temperature_breakpoint_interpolates_safely() {
+        let mut curve = curve();
+        curve[4][0] = curve[3][0];
+        assert_eq!(duty_at(&curve, 60), curve[3][1] as u8);
+        assert!(duty_at(&curve, 61) >= curve[4][1] as u8);
+    }
+
+    #[test]
     fn temperature_alone_never_overrides_curve() {
         let (duty, gate) = controlled_duty(
             &curve(),

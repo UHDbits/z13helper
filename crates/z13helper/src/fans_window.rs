@@ -6,7 +6,7 @@ use std::rc::Rc;
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use z13helper_core::{FanControlMode, Profile};
+use z13helper_core::{stock_fan_curves, ApplyRequest, FanControlMode, Profile};
 
 use crate::app::AppState;
 use crate::services::worker;
@@ -385,21 +385,58 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let restored_toast = toast_overlay.clone();
     let restore_factory = Rc::new(move || {
         let id = editing_def.borrow().clone();
-        let restored = {
-            let mut cfg = state_def.config.borrow_mut();
-            if let Some(p) = cfg.find_mut(&id) {
-                p.factory_defaults();
-                Some(p.clone())
-            } else {
-                None
-            }
+        let Some(mut restored) = state_def.config.borrow().find(&id).cloned() else {
+            return;
         };
-        if let Some(p) = restored {
-            editors_def.load(&p);
-            state_def.save_config();
-            state_def.apply_active(false);
-            restored_toast.add_toast(adw::Toast::new("Factory defaults restored"));
-        }
+        restored.factory_defaults();
+        let ppd_profile = restored.ppd_profile.clone();
+        let request = ApplyRequest::from_profile(&restored, state_def.config.borrow().fan_floor);
+        let client = state_def.client.clone();
+        let state_done = state_def.clone();
+        let editors_done = editors_def.clone();
+        let toast_done = restored_toast.clone();
+        worker::blocking(
+            move || {
+                let apply = client.apply(request)?;
+                let factory = ppd_profile.map(|ppd| client.factory_fan_curves(vec![ppd]));
+                Ok::<_, z13helper_core::DaemonError>((restored, apply.warnings, factory))
+            },
+            move |result| match result {
+                Ok((mut restored, mut warnings, factory)) => {
+                    if let Some(factory) = factory {
+                        match factory {
+                            Ok(curves) => {
+                                if let Some(ppd) = restored.ppd_profile.as_ref() {
+                                    if let Some(curve) = curves.get(ppd) {
+                                        restored.fan_curves = *curve;
+                                        restored.factory_fan_curves_loaded = true;
+                                    } else {
+                                        warnings.push(format!(
+                                            "firmware returned no factory fan curves for {ppd}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(error) => warnings.push(format!(
+                                "firmware factory fan curves were unavailable; using bundled defaults: {error}"
+                            )),
+                        }
+                    }
+                    if let Some(profile) = state_done.config.borrow_mut().find_mut(&id) {
+                        *profile = restored.clone();
+                    }
+                    editors_done.load(&restored);
+                    state_done.save_config();
+                    toast_done.add_toast(adw::Toast::new("Factory defaults restored"));
+                    if !warnings.is_empty() {
+                        state_done.report_error(&warnings.join(" · "));
+                    }
+                }
+                Err(error) => {
+                    state_done.report_error(&format!("Could not restore factory defaults: {error}"))
+                }
+            },
+        );
     });
     let restore_click = restore_factory.clone();
     let restore_parent = window.clone();
@@ -707,11 +744,18 @@ fn build_cpu_page(
             }
             let id = editing.borrow().clone();
             if let Some(profile) = state.config.borrow_mut().find_mut(&id) {
-                profile.ppd_profile = ppd
+                let ppd_profile = ppd
                     .selected_item()
                     .and_downcast::<gtk::StringObject>()
                     .map(|item| item.string().to_string())
                     .filter(|selection| selection != "disabled");
+                if profile.ppd_profile != ppd_profile {
+                    profile.ppd_profile = ppd_profile;
+                    profile.factory_fan_curves_loaded = false;
+                    if !profile.apply_fan_curve {
+                        profile.fan_curves = stock_fan_curves(profile.ppd_profile.as_deref());
+                    }
+                }
                 profile.apply_power_limits = power.is_active();
                 profile.pl1_spl = pl1.value() as u32;
                 profile.pl2_sppt = pl2.value() as u32;

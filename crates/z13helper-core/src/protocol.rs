@@ -306,6 +306,9 @@ pub struct ProbeReply {
 pub enum Command {
     GetState,
     Probe,
+    GetFactoryFanCurves {
+        ppd_profiles: Vec<String>,
+    },
     Apply {
         request: ApplyRequest,
     },
@@ -376,6 +379,8 @@ pub struct WireResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<ProbeReply>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory_fan_curves: Option<HashMap<String, [Curve; 2]>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<DaemonEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<WireError>,
@@ -388,6 +393,7 @@ impl WireResponse {
             state: None,
             apply: None,
             probe: None,
+            factory_fan_curves: None,
             event: None,
             error: None,
         }
@@ -436,6 +442,23 @@ mod tests {
         assert!(matches!(
             decoded.command,
             Command::SetBatteryOneTimeCharge { enabled: true }
+        ));
+    }
+
+    #[test]
+    fn factory_fan_curve_command_roundtrips() {
+        let request = WireRequest {
+            version: PROTOCOL_VERSION,
+            command: Command::GetFactoryFanCurves {
+                ppd_profiles: vec!["power-saver".into(), "balanced".into()],
+            },
+        };
+        let text = serde_json::to_string(&request).unwrap();
+        assert!(text.contains("\"cmd\":\"get-factory-fan-curves\""));
+        let decoded: WireRequest = serde_json::from_str(&text).unwrap();
+        assert!(matches!(
+            decoded.command,
+            Command::GetFactoryFanCurves { ppd_profiles } if ppd_profiles.len() == 2
         ));
     }
 

@@ -112,6 +112,7 @@ fn broadcast(subscribers: &Arc<Mutex<Vec<Subscriber>>>, kind: DaemonEventKind) {
         state: None,
         apply: None,
         probe: None,
+        factory_fan_curves: None,
         event: Some(DaemonEvent {
             kind,
             generation: None,

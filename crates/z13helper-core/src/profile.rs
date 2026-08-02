@@ -24,6 +24,8 @@ pub struct Profile {
     #[serde(default)]
     pub fan_control_mode: FanControlMode,
     pub fan_curves: [FanCurve; 2],
+    #[serde(default)]
+    pub factory_fan_curves_loaded: bool,
     pub apply_undervolt: bool,
     pub cpu_co: i32,
 }
@@ -141,6 +143,7 @@ impl Profile {
             apply_fan_curve: false,
             fan_control_mode: FanControlMode::Firmware,
             fan_curves: stock_fan_curves(Some(ppd_profile)),
+            factory_fan_curves_loaded: false,
             apply_undervolt: false,
             cpu_co: 0,
         }
@@ -161,6 +164,7 @@ impl Profile {
         self.apply_fan_curve = false;
         self.fan_control_mode = FanControlMode::Firmware;
         self.fan_curves = stock_fan_curves(ppd_profile);
+        self.factory_fan_curves_loaded = false;
         self.apply_undervolt = false;
         self.cpu_co = 0;
     }

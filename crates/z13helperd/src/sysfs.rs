@@ -127,6 +127,31 @@ impl Sysfs {
         Ok(())
     }
 
+    /// Ask the ASUS WMI driver to reload both factory curve tables for the
+    /// currently selected firmware profile, then read its cached points.
+    /// Writing mode 3 intentionally leaves each curve in firmware-auto mode.
+    pub fn factory_fan_curves(&self) -> Result<[Curve; 2], String> {
+        let curve_dir = self.find_hwmon("asus_custom_fan_curve")?;
+        let mut curves = [[[0; 2]; 8]; 2];
+        for (fan, curve) in curves.iter_mut().enumerate() {
+            let index = fan + 1;
+            self.write_text(curve_dir.join(format!("pwm{index}_enable")), 3)?;
+            for (point, values) in curve.iter_mut().enumerate() {
+                let point = point + 1;
+                values[0] = self
+                    .read_text(curve_dir.join(format!("pwm{index}_auto_point{point}_temp")))?
+                    .parse()
+                    .map_err(|error| format!("parse fan {index} point {point} temp: {error}"))?;
+                values[1] = self
+                    .read_text(curve_dir.join(format!("pwm{index}_auto_point{point}_pwm")))?
+                    .parse()
+                    .map_err(|error| format!("parse fan {index} point {point} PWM: {error}"))?;
+            }
+            validate(curve).map_err(|error| format!("factory fan {index} curve: {error}"))?;
+        }
+        Ok(curves)
+    }
+
     pub fn battery_limit(&self) -> Result<i32, String> {
         let directory = self.path("/sys/class/power_supply");
         for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
@@ -361,6 +386,64 @@ mod tests {
         assert_eq!(
             fs::read_to_string(readings.join("pwm2_enable")).unwrap(),
             "2\n"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn factory_curves_request_firmware_reload_and_read_distinct_fans() {
+        let root = root();
+        let curve_dir = root.join("class/hwmon/hwmon0");
+        fs::create_dir_all(&curve_dir).unwrap();
+        fs::write(curve_dir.join("name"), "asus_custom_fan_curve\n").unwrap();
+        let expected = [
+            [
+                [50, 2],
+                [54, 2],
+                [58, 22],
+                [62, 30],
+                [64, 43],
+                [67, 56],
+                [71, 68],
+                [71, 68],
+            ],
+            [
+                [48, 2],
+                [53, 22],
+                [57, 33],
+                [60, 45],
+                [63, 58],
+                [65, 71],
+                [70, 94],
+                [76, 107],
+            ],
+        ];
+        for (fan, curve) in expected.iter().enumerate() {
+            let index = fan + 1;
+            fs::write(curve_dir.join(format!("pwm{index}_enable")), "2\n").unwrap();
+            for (point, [temp, pwm]) in curve.iter().enumerate() {
+                let point = point + 1;
+                fs::write(
+                    curve_dir.join(format!("pwm{index}_auto_point{point}_temp")),
+                    format!("{temp}\n"),
+                )
+                .unwrap();
+                fs::write(
+                    curve_dir.join(format!("pwm{index}_auto_point{point}_pwm")),
+                    format!("{pwm}\n"),
+                )
+                .unwrap();
+            }
+        }
+
+        assert_eq!(Sysfs::new(&root).factory_fan_curves().unwrap(), expected);
+        assert_eq!(
+            fs::read_to_string(curve_dir.join("pwm1_enable")).unwrap(),
+            "3\n"
+        );
+        assert_eq!(
+            fs::read_to_string(curve_dir.join("pwm2_enable")).unwrap(),
+            "3\n"
         );
         let _ = fs::remove_dir_all(root);
     }

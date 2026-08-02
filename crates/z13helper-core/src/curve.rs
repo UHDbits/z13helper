@@ -21,7 +21,7 @@ pub enum CurveError {
     TempRange { temp: i32, index: usize },
     #[error("pwm {pwm} in point {index} out of range 0–255")]
     PwmRange { pwm: i32, index: usize },
-    #[error("temps must be monotonically increasing")]
+    #[error("temps must be non-decreasing")]
     TempNotIncreasing,
     #[error("pwm values must be non-decreasing")]
     PwmDecreasing,
@@ -29,6 +29,9 @@ pub enum CurveError {
 
 /// Validate a curve against the daemon's rules (without the high-TDP floor).
 pub fn validate(curve: &Curve) -> Result<(), CurveError> {
+    // ASUS factory tables may repeat a temperature breakpoint (Silent does at
+    // 71°C), so only a backwards step is invalid here. Editor normalization
+    // still keeps newly authored curves strictly increasing.
     for (i, pt) in curve.iter().enumerate() {
         let (temp, pwm) = (pt[0], pt[1]);
         if !(0..=120).contains(&temp) {
@@ -38,7 +41,7 @@ pub fn validate(curve: &Curve) -> Result<(), CurveError> {
             return Err(CurveError::PwmRange { pwm, index: i + 1 });
         }
         if i > 0 {
-            if temp <= curve[i - 1][0] {
+            if temp < curve[i - 1][0] {
                 return Err(CurveError::TempNotIncreasing);
             }
             if pwm < curve[i - 1][1] {
@@ -175,6 +178,13 @@ mod tests {
     fn default_curve_valid() {
         let c = default_fan_curve();
         validate(&c).unwrap();
+    }
+
+    #[test]
+    fn firmware_table_may_repeat_a_temperature_breakpoint() {
+        let mut curve = default_fan_curve();
+        curve[7] = curve[6];
+        validate(&curve).unwrap();
     }
 
     #[test]

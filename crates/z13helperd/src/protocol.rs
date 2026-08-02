@@ -38,6 +38,9 @@ fn dispatch(backend: &mut Backend, command: Command) -> Result<WireResponse, Dae
     match command {
         Command::GetState => response.state = Some(backend.state()),
         Command::Probe => response.probe = Some(backend.probe()),
+        Command::GetFactoryFanCurves { ppd_profiles } => {
+            response.factory_fan_curves = Some(backend.factory_fan_curves(ppd_profiles)?)
+        }
         Command::Apply { request } => response.apply = Some(backend.apply(request)?),
         Command::SetBatteryLimit { limit } => backend.set_battery_limit(limit)?,
         Command::SetBatteryOneTimeCharge { enabled } => {
@@ -67,6 +70,7 @@ pub fn failure(code: ErrorCode, message: impl Into<String>) -> WireResponse {
         state: None,
         apply: None,
         probe: None,
+        factory_fan_curves: None,
         event: None,
         error: Some(WireError {
             code,

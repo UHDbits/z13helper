@@ -58,7 +58,9 @@ cargo build -p z13helper --features layer-shell
 
 Silent, Balanced, and Turbo are fresh version-1 defaults. Named profiles live
 only in the user configuration. PPD is independently selectable when
-power-profiles-daemon is available.
+power-profiles-daemon is available. On first use, the GUI asks the daemon to
+load each built-in profile's factory CPU and GPU curve tables from firmware;
+the bundled G-Helper-derived curves remain the fallback when that query fails.
 
 Each apply is validated and serialized by `z13helperd`. PPD selects the firmware
 power policy, after which the daemon applies optional PPT, two eight-point fan

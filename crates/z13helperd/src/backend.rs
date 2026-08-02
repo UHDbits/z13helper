@@ -317,6 +317,83 @@ impl Backend {
         })
     }
 
+    pub fn factory_fan_curves(
+        &mut self,
+        ppd_profiles: Vec<String>,
+    ) -> Result<HashMap<String, [Curve; 2]>, DaemonError> {
+        if ppd_profiles.is_empty() {
+            return Err(DaemonError::Rejected(
+                "at least one PPD profile is required".into(),
+            ));
+        }
+        self.hardware.refresh_ppd();
+        for profile in &ppd_profiles {
+            if !self
+                .hardware
+                .ppd_profiles
+                .iter()
+                .any(|known| known == profile)
+            {
+                return Err(DaemonError::Rejected(format!(
+                    "unknown power-profiles-daemon profile {profile:?}"
+                )));
+            }
+        }
+        self.observe();
+        validate_factory_curve_query_power(self.persisted.state.tdp)?;
+
+        let previous = self.persisted.desired.clone();
+        let original_ppd = self.hardware.ppd_profile.clone();
+        if previous.is_none() && original_ppd.is_none() {
+            return Err(DaemonError::Rejected(
+                "current PPD profile is unknown; refusing a query that cannot be restored".into(),
+            ));
+        }
+
+        let query = (|| {
+            let mut curves = HashMap::new();
+            for profile in ppd_profiles {
+                PlatformHardware::ppd_set_blocking(&profile).map_err(DaemonError::Rejected)?;
+                self.hardware.ppd_profile = Some(profile.clone());
+                let factory = self
+                    .hardware
+                    .sysfs
+                    .factory_fan_curves()
+                    .map_err(DaemonError::Rejected)?;
+                curves.insert(profile, factory);
+            }
+            Ok(curves)
+        })();
+
+        let restore = if let Some(previous) = previous {
+            self.hardware.set_floor(previous.floor);
+            apply_request(&mut self.hardware, &previous).map(|_| ())
+        } else if let Some(original_ppd) = original_ppd {
+            PlatformHardware::ppd_set_blocking(&original_ppd)
+                .map_err(DaemonError::Rejected)
+                .map(|_| {
+                    self.hardware.ppd_profile = Some(original_ppd);
+                })
+        } else {
+            unreachable!()
+        };
+
+        self.observe();
+        if let Err(restore_error) = restore {
+            let query_error = query
+                .err()
+                .map(|error| format!("query failed ({error}); "))
+                .unwrap_or_default();
+            let message =
+                format!("{query_error}factory fan-curve restoration failed ({restore_error})");
+            self.persisted.state.degraded = true;
+            self.persisted.state.warnings.push(message.clone());
+            let _ = self.save();
+            return Err(DaemonError::Rejected(message));
+        }
+        query
+    }
+
     pub fn set_battery_limit(&mut self, limit: i32) -> Result<(), DaemonError> {
         if !(40..=100).contains(&limit) {
             return Err(DaemonError::Rejected(
@@ -595,13 +672,26 @@ fn effective_battery_limit(one_time_charge: bool, normal_limit: Option<i32>) -> 
     one_time_charge.then_some(100).or(normal_limit)
 }
 
+fn validate_factory_curve_query_power(tdp: Option<TdpState>) -> Result<(), DaemonError> {
+    let pl1 = tdp.map(|tdp| tdp.pl1_spl.max(0) as u32).unwrap_or(0);
+    if pl1 > TDP_MAX_SAFE {
+        return Err(DaemonError::Rejected(format!(
+            "factory fan curves cannot be read while PL1 is {pl1} W; lower power first"
+        )));
+    }
+    Ok(())
+}
+
 fn one_time_charge_is_complete(one_time_charge: bool, charge_percent: Option<u8>) -> bool {
     one_time_charge && charge_percent.is_some_and(|charge| charge >= 100)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_battery_limit, one_time_charge_is_complete};
+    use super::{
+        effective_battery_limit, one_time_charge_is_complete, validate_factory_curve_query_power,
+    };
+    use z13helper_core::protocol::TdpState;
 
     #[test]
     fn one_time_charge_overrides_and_then_restores_the_normal_limit() {
@@ -610,5 +700,15 @@ mod tests {
         assert!(!one_time_charge_is_complete(true, Some(99)));
         assert!(one_time_charge_is_complete(true, Some(100)));
         assert!(!one_time_charge_is_complete(false, Some(100)));
+    }
+
+    #[test]
+    fn factory_curve_query_never_drops_high_power_protection() {
+        let tdp = |pl1| TdpState {
+            pl1_spl: pl1,
+            ..TdpState::default()
+        };
+        assert!(validate_factory_curve_query_power(Some(tdp(75))).is_ok());
+        assert!(validate_factory_curve_query_power(Some(tdp(76))).is_err());
     }
 }

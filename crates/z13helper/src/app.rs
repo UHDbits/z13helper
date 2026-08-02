@@ -92,6 +92,57 @@ impl AppState {
         );
     }
 
+    fn seed_factory_fan_curves(self: &Rc<Self>) {
+        if self
+            .config
+            .borrow()
+            .profiles
+            .iter()
+            .filter(|profile| profile.builtin)
+            .all(|profile| profile.factory_fan_curves_loaded || profile.apply_fan_curve)
+        {
+            return;
+        }
+        let mut ppd_profiles: Vec<String> = self
+            .config
+            .borrow()
+            .profiles
+            .iter()
+            .filter(|profile| {
+                profile.builtin && !profile.factory_fan_curves_loaded && !profile.apply_fan_curve
+            })
+            .filter_map(|profile| profile.ppd_profile.clone())
+            .collect();
+        ppd_profiles.sort();
+        ppd_profiles.dedup();
+        let client = self.client.clone();
+        let done = self.clone();
+        worker::blocking(
+            move || client.factory_fan_curves(ppd_profiles),
+            move |result| match result {
+                Ok(curves) => {
+                    let mut config = done.config.borrow_mut();
+                    for profile in &mut config.profiles {
+                        if !profile.builtin || profile.apply_fan_curve {
+                            continue;
+                        }
+                        if let Some(curve) =
+                            profile.ppd_profile.as_ref().and_then(|ppd| curves.get(ppd))
+                        {
+                            profile.fan_curves = *curve;
+                            profile.factory_fan_curves_loaded = true;
+                        }
+                    }
+                    drop(config);
+                    done.save_config();
+                }
+                Err(error) => done.report_error(&format!(
+                    "Could not read firmware factory fan curves; using bundled defaults: {error}"
+                )),
+            },
+        );
+    }
+
     /// Apply the active profile. `notify` is reserved for HUD callers; button
     /// clicks pass `false` (G-Helper convention — the highlight is enough).
     pub fn apply_active(self: &Rc<Self>, _notify: bool) {
@@ -172,6 +223,7 @@ impl AppState {
         *self.main_window.borrow_mut() = Some(window.clone());
         subscribe::start(self);
         window.present();
+        self.seed_factory_fan_curves();
     }
 
     pub fn toggle_window(&self) {

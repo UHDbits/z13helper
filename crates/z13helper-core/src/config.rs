@@ -150,7 +150,7 @@ impl Config {
             }
         }
         for p in &mut self.profiles {
-            if p.builtin && !p.apply_fan_curve {
+            if p.builtin && !p.apply_fan_curve && !p.factory_fan_curves_loaded {
                 p.fan_curves = stock_fan_curves(p.ppd_profile.as_deref());
             }
         }

@@ -90,6 +90,8 @@ The daemon owns adapters for:
 - effective five-value PPT state;
 - power-profiles-daemon profiles/current selection over D-Bus;
 - both firmware fan interfaces and direct EC mailbox control;
+- serialized factory fan-curve retrieval through ASUS WMI mode 3, with PPD and
+  the previous desired machine state restored after each query;
 - a single startup `ryzen_smu` MP1 `0x4C` availability probe and cached result;
 - persistent keyboard/lightbar hidraw handles with hotplug relight;
 - battery thresholds 40–100, a persistent one-time 100% override that restores

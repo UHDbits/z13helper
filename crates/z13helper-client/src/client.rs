@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use z13helper_core::curve::Curve;
 use z13helper_core::error::{DaemonError, ErrorCode};
 use z13helper_core::protocol::{
     ApplyRequest, ApplyResponse, Command, DaemonEvent, DaemonState, LightingState, ProbeReply,
@@ -88,6 +90,15 @@ impl Client {
         self.exchange(Command::Apply { request })?
             .apply
             .ok_or_else(|| DaemonError::Protocol("missing apply response".into()))
+    }
+
+    pub fn factory_fan_curves(
+        &self,
+        ppd_profiles: Vec<String>,
+    ) -> Result<HashMap<String, [Curve; 2]>, DaemonError> {
+        self.exchange(Command::GetFactoryFanCurves { ppd_profiles })?
+            .factory_fan_curves
+            .ok_or_else(|| DaemonError::Protocol("missing factory fan curves".into()))
     }
 
     pub fn battery_limit_set(&self, limit: i32) -> Result<(), DaemonError> {
@@ -298,6 +309,7 @@ mod tests {
                 state: Some(DaemonState::default()),
                 apply: None,
                 probe: None,
+                factory_fan_curves: None,
                 event: None,
                 error: None,
             };
@@ -343,5 +355,43 @@ mod tests {
         Client::with_path(path)
             .battery_one_time_charge_set(true)
             .unwrap();
+    }
+
+    #[test]
+    fn factory_fan_curves_are_returned_by_ppd_profile() {
+        let dir = std::env::temp_dir().join(format!(
+            "z13helper-client-factory-fans-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("daemon.sock");
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("bind {}: {error}", path.display()),
+        };
+        let expected = z13helper_core::stock_fan_curves(Some("balanced"));
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            assert!(request.contains("\"cmd\":\"get-factory-fan-curves\""));
+            assert!(request.contains("\"balanced\""));
+            let mut curves = HashMap::new();
+            curves.insert("balanced".into(), expected);
+            let mut response = WireResponse::success();
+            response.factory_fan_curves = Some(curves);
+            let mut stream = stream;
+            writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+        });
+        let curves = Client::with_path(path)
+            .factory_fan_curves(vec!["balanced".into()])
+            .unwrap();
+        assert_eq!(curves["balanced"], expected);
     }
 }
