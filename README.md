@@ -84,6 +84,11 @@ The battery slider stores the normal 40–100% charge limit. A separate one-time
 automatically restores the normal limit when battery telemetry reaches 100%.
 `battery-charge-once on|off` exposes the same toggle to scripts.
 
+The Display section stores panel overdrive as a user policy: either always on,
+or on while plugged in and off on battery. Confirmed power-source transitions
+apply the effective value through `z13helperd`; the GUI never writes the
+firmware attribute directly.
+
 ## License
 
 MIT. ASUS and ROG are trademarks of their respective owner.

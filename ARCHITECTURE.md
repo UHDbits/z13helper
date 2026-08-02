@@ -101,6 +101,11 @@ The daemon owns adapters for:
 - non-exclusive `KEY_PROG3` monitoring with reconnect and `gui-toggle` events;
 - temperature and two calibrated fan RPM readings.
 
+The user config owns the panel-overdrive policy (`always on` or `plugged in
+only`). The GTK power-source watcher resolves that policy after each confirmed
+transition and asks the daemon to persist and write the flattened effective
+hardware value. This policy is independent of profile auto-switching.
+
 Tests use injectable fake roots for sysfs/hwmon/SMU/hidraw/input behavior.
 
 ## GTK threading and views

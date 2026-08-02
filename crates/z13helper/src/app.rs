@@ -73,6 +73,23 @@ impl AppState {
         }
     }
 
+    pub fn apply_panel_overdrive_policy(self: &Rc<Self>) {
+        let enabled = self
+            .config
+            .borrow()
+            .panel_overdrive_enabled(self.on_battery.get());
+        let client = self.client.clone();
+        let feedback = self.clone();
+        worker::blocking(
+            move || client.panel_overdrive_set(i32::from(enabled)),
+            move |result| {
+                if let Err(error) = result {
+                    feedback.report_error(&format!("Panel overdrive failed: {error}"));
+                }
+            },
+        );
+    }
+
     /// Apply the active profile. `notify` is reserved for HUD callers; button
     /// clicks pass `false` (G-Helper convention — the highlight is enough).
     pub fn apply_active(self: &Rc<Self>, _notify: bool) {

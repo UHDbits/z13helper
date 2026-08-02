@@ -34,6 +34,8 @@ pub struct Config {
     pub last_profile_on_battery: String,
     pub power_source_debounce_ms: u64,
     pub show_hud: bool,
+    #[serde(default)]
+    pub panel_overdrive_always_on: bool,
     pub fan_clamp_to_grid: bool,
     pub fan_floor: crate::protocol::FanFloorConfig,
     pub profiles: Vec<Profile>,
@@ -49,6 +51,7 @@ impl Default for Config {
             last_profile_on_battery: "silent".into(),
             power_source_debounce_ms: 2000,
             show_hud: true,
+            panel_overdrive_always_on: false,
             fan_clamp_to_grid: false,
             fan_floor: crate::protocol::FanFloorConfig::default(),
             profiles: builtin_profiles(),
@@ -221,6 +224,10 @@ impl Config {
             self.last_profile_on_ac = id.into();
         }
     }
+
+    pub fn panel_overdrive_enabled(&self, on_battery: bool) -> bool {
+        self.panel_overdrive_always_on || !on_battery
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +252,19 @@ mod tests {
         assert_eq!(cfg.find("silent").unwrap().pl1_spl, 40);
         assert_eq!(cfg.find("balanced").unwrap().pl1_spl, 52);
         assert_eq!(cfg.find("turbo").unwrap().pl1_spl, 70);
+        assert!(!cfg.panel_overdrive_always_on);
+        assert!(cfg.panel_overdrive_enabled(false));
+        assert!(!cfg.panel_overdrive_enabled(true));
+    }
+
+    #[test]
+    fn always_on_panel_overdrive_ignores_power_source() {
+        let cfg = Config {
+            panel_overdrive_always_on: true,
+            ..Config::default()
+        };
+        assert!(cfg.panel_overdrive_enabled(false));
+        assert!(cfg.panel_overdrive_enabled(true));
     }
 
     #[test]

@@ -55,6 +55,7 @@ pub fn start(state: &Rc<AppState>) {
 
 fn on_confirmed_transition(state: &Rc<AppState>, on_battery: bool) {
     state.on_battery.set(on_battery);
+    state.apply_panel_overdrive_policy();
     if !state.config.borrow().auto_switch_on_power_source {
         return;
     }

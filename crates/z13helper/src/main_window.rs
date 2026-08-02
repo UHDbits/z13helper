@@ -126,33 +126,44 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     sync.run(|| refresh_active_buttons(&mode_buttons, &state.config.borrow().active_profile));
 
     // --- Display ---
-    let display = adw::PreferencesGroup::builder().title("Display").build();
+    let display = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let display_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let display_icon = gtk::Image::from_icon_name("video-display-symbolic");
+    let display_heading = gtk::Label::new(Some("Display"));
+    display_heading.add_css_class("heading");
+    display_heading.set_xalign(0.0);
+    display_heading.set_hexpand(true);
+    display_header.append(&display_icon);
+    display_header.append(&display_heading);
+    display.append(&display_header);
+
+    let display_group = adw::PreferencesGroup::new();
     let overdrive = make_switch();
-    let od_row = adw::ActionRow::builder().title("Panel Overdrive").build();
+    let od_row = adw::ActionRow::builder()
+        .title("Panel overdrive")
+        .subtitle(overdrive_policy_label(
+            state.config.borrow().panel_overdrive_always_on,
+        ))
+        .build();
     od_row.add_suffix(&overdrive);
     od_row.set_activatable_widget(Some(&overdrive));
-    display.add(&od_row);
+    display_group.add(&od_row);
+    display.append(&display_group);
     content.append(&display);
 
     {
-        let client = state.client.clone();
         let sync = sync.clone();
-        let feedback = state.clone();
+        let state = state.clone();
+        let policy_row = od_row.clone();
         overdrive.connect_state_set(move |switch, enabled| {
             if sync.active() {
                 switch.set_state(enabled);
                 return glib::Propagation::Stop;
             }
-            let c = client.clone();
-            let feedback = feedback.clone();
-            worker::blocking(
-                move || c.panel_overdrive_set(i32::from(enabled)),
-                move |result| {
-                    if let Err(error) = result {
-                        feedback.report_error(&format!("Panel overdrive failed: {error}"));
-                    }
-                },
-            );
+            state.config.borrow_mut().panel_overdrive_always_on = enabled;
+            state.save_config();
+            policy_row.set_subtitle(overdrive_policy_label(enabled));
+            state.apply_panel_overdrive_policy();
             switch.set_state(enabled);
             glib::Propagation::Stop
         });
@@ -299,6 +310,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     let view = MainView {
         settings: SettingsView {
             overdrive,
+            overdrive_row: od_row,
             battery_limit: limit,
             battery_title: batt_title,
             battery_one_time_charge: full,
@@ -332,6 +344,7 @@ struct MainView {
 #[derive(Clone)]
 struct SettingsView {
     overdrive: gtk::Switch,
+    overdrive_row: adw::ActionRow,
     battery_limit: gtk::Scale,
     battery_title: gtk::Label,
     battery_one_time_charge: gtk::ToggleButton,
@@ -366,18 +379,19 @@ impl MainView {
             .undervolt_available
             .set(Some(daemon.undervolt_available));
         self.sync.run(|| {
-            self.settings.sync_from(daemon);
+            self.settings.sync_from(state, daemon);
             self.mode.sync_from(state, daemon);
         });
     }
 }
 
 impl SettingsView {
-    fn sync_from(&self, daemon: &State) {
-        if let Some(value) = daemon.panel_overdrive {
-            self.overdrive.set_active(value != 0);
-            self.overdrive.set_state(value != 0);
-        }
+    fn sync_from(&self, state: &AppState, daemon: &State) {
+        let always_on = state.config.borrow().panel_overdrive_always_on;
+        self.overdrive.set_active(always_on);
+        self.overdrive.set_state(always_on);
+        self.overdrive_row
+            .set_subtitle(overdrive_policy_label(always_on));
         if let Some(value) = daemon.battery_limit {
             self.battery_limit.set_value(value.clamp(40, 100) as f64);
         }
@@ -468,6 +482,14 @@ fn battery_status_label(status: Option<&str>, power_microwatts: Option<u64>) -> 
         || status.into(),
         |power| format!("{status}: {:.1} W", power as f64 / 1_000_000.0),
     )
+}
+
+fn overdrive_policy_label(always_on: bool) -> &'static str {
+    if always_on {
+        "Always on"
+    } else {
+        "Only when plugged in"
+    }
 }
 
 fn sync_one_time_charge_button(
