@@ -77,8 +77,7 @@ and firmware throttling remain authoritative.
 `z13helperctl status` and `z13helperctl probe` print JSON. `watch` streams daemon
 events, while `apply -` accepts a complete version-1 apply request on stdin.
 Focused commands cover profile, PPD, PPT, fans, undervolt, lighting, battery,
-panel overdrive, boot sound, and direct-fan release. The CLI never owns named GUI
-profiles.
+panel overdrive, and direct-fan release. The CLI never owns named GUI profiles.
 
 The battery slider stores the normal 40–100% charge limit. A separate one-time
 100% override is persisted by `z13helperd`, remains active without the GUI, and

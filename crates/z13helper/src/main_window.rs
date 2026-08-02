@@ -182,15 +182,10 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     let batt_icon = gtk::Image::from_icon_name("z13helper-battery-limit-symbolic");
     let batt_titles = gtk::Box::new(gtk::Orientation::Vertical, 0);
     batt_titles.set_hexpand(true);
-    let batt_title = gtk::Label::new(Some("Battery Charge Limit"));
+    let batt_title = gtk::Label::new(Some("Battery Charge Limit: —%"));
     batt_title.add_css_class("heading");
     batt_title.set_xalign(0.0);
-    let batt_hint = gtk::Label::new(Some("—%"));
-    batt_hint.add_css_class("dim-label");
-    batt_hint.add_css_class("caption");
-    batt_hint.set_xalign(0.0);
     batt_titles.append(&batt_title);
-    batt_titles.append(&batt_hint);
     let battery_status = gtk::Label::new(Some("—"));
     battery_status.add_css_class("dim-label");
     battery_status.set_xalign(1.0);
@@ -203,6 +198,9 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     let limit = gtk::Scale::with_range(gtk::Orientation::Horizontal, 40.0, 100.0, 5.0);
     limit.set_draw_value(false);
     limit.set_hexpand(true);
+    // Align the visible trough with the battery icon; Adwaita reserves a
+    // small inset for the horizontal scale thumb.
+    limit.set_margin_start(-8);
     limit.set_digits(0);
     limit.set_round_digits(0);
     let full = gtk::ToggleButton::with_label("100%");
@@ -215,23 +213,25 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
 
     let battery_charge = gtk::Label::new(Some("Charge: —%"));
     battery_charge.add_css_class("dim-label");
-    battery_charge.add_css_class("caption");
     battery_charge.set_halign(gtk::Align::End);
     battery.append(&battery_charge);
     content.append(&battery);
 
     install_battery_debounce(state, &limit, &sync);
-    let hint_for_limit = batt_hint.clone();
+    let title_for_limit = batt_title.clone();
     let full_for_limit = full.clone();
     limit.connect_value_changed(move |scale| {
         if !full_for_limit.is_active() {
-            hint_for_limit.set_label(&format!("{:.0}%", scale.value()));
+            title_for_limit.set_label(&battery_limit_title(
+                false,
+                Some(scale.value().round() as i32),
+            ));
         }
     });
     let client = state.client.clone();
     let feedback = state.clone();
     let one_time_sync = sync.clone();
-    let hint_for_toggle = batt_hint.clone();
+    let title_for_toggle = batt_title.clone();
     let limit_for_toggle = limit.clone();
     full.connect_toggled(move |button| {
         if one_time_sync.active() {
@@ -239,11 +239,11 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         }
         let enabled = button.is_active();
         let normal_limit = Some(limit_for_toggle.value().round() as i32);
-        sync_one_time_charge_button(button, &hint_for_toggle, enabled, normal_limit);
+        sync_one_time_charge_button(button, &title_for_toggle, enabled, normal_limit);
         let client = client.clone();
         let feedback = feedback.clone();
         let button_done = button.clone();
-        let hint_done = hint_for_toggle.clone();
+        let title_done = title_for_toggle.clone();
         let sync_done = one_time_sync.clone();
         worker::blocking(
             move || client.battery_one_time_charge_set(enabled),
@@ -252,7 +252,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
                     sync_done.run(|| {
                         sync_one_time_charge_button(
                             &button_done,
-                            &hint_done,
+                            &title_done,
                             !enabled,
                             normal_limit,
                         )
@@ -268,35 +268,13 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     let version = gtk::Label::new(Some(&format!("v{}", env!("CARGO_PKG_VERSION"))));
     version.add_css_class("dim-label");
     version.set_hexpand(true);
+    version.set_valign(gtk::Align::End);
     version.set_xalign(0.0);
-    let boot = gtk::CheckButton::with_label("Boot sound");
-    {
-        let client = state.client.clone();
-        let sync = sync.clone();
-        let feedback = state.clone();
-        boot.connect_toggled(move |b| {
-            if sync.active() {
-                return;
-            }
-            let c = client.clone();
-            let feedback = feedback.clone();
-            let enabled = b.is_active();
-            worker::blocking(
-                move || c.boot_sound_set(i32::from(enabled)),
-                move |result| {
-                    if let Err(error) = result {
-                        feedback.report_error(&format!("Boot sound failed: {error}"));
-                    }
-                },
-            );
-        });
-    }
     let hide = gtk::Button::with_label("Hide");
     hide.set_tooltip_text(Some("Hide z13helper"));
     let window_hide = window.clone();
     hide.connect_clicked(move |_| window_hide.set_visible(false));
     footer.append(&version);
-    footer.append(&boot);
     footer.append(&hide);
     content.append(&footer);
 
@@ -321,11 +299,10 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         settings: SettingsView {
             overdrive,
             battery_limit: limit,
-            battery_hint: batt_hint,
+            battery_title: batt_title,
             battery_one_time_charge: full,
             battery_charge,
             battery_status,
-            boot,
             lightbar: lightbar.view,
             keyboard: keyboard.view,
         },
@@ -355,11 +332,10 @@ struct MainView {
 struct SettingsView {
     overdrive: gtk::Switch,
     battery_limit: gtk::Scale,
-    battery_hint: gtk::Label,
+    battery_title: gtk::Label,
     battery_one_time_charge: gtk::ToggleButton,
     battery_charge: gtk::Label,
     battery_status: gtk::Label,
-    boot: gtk::CheckButton,
     lightbar: LightingView,
     keyboard: LightingView,
 }
@@ -407,7 +383,7 @@ impl SettingsView {
         }
         sync_one_time_charge_button(
             &self.battery_one_time_charge,
-            &self.battery_hint,
+            &self.battery_title,
             daemon.battery_one_time_charge,
             daemon.battery_limit,
         );
@@ -421,9 +397,6 @@ impl SettingsView {
             daemon.battery.status.as_deref(),
             daemon.battery.power_microwatts,
         ));
-        if let Some(value) = daemon.boot_sound {
-            self.boot.set_active(value != 0);
-        }
         self.lightbar.sync_from(
             daemon
                 .devices
@@ -481,6 +454,9 @@ impl ModeView {
 
 fn battery_status_label(status: Option<&str>, power_microwatts: Option<u64>) -> String {
     let status = status.filter(|status| !status.is_empty()).unwrap_or("—");
+    if status == "Full" {
+        return status.into();
+    }
     power_microwatts.map_or_else(
         || status.into(),
         |power| format!("{status}: {:.1} W", power as f64 / 1_000_000.0),
@@ -489,7 +465,7 @@ fn battery_status_label(status: Option<&str>, power_microwatts: Option<u64>) -> 
 
 fn sync_one_time_charge_button(
     button: &gtk::ToggleButton,
-    hint: &gtk::Label,
+    title: &gtk::Label,
     active: bool,
     normal_limit: Option<i32>,
 ) {
@@ -501,14 +477,17 @@ fn sync_one_time_charge_button(
         button.remove_css_class("suggested-action");
         button.set_tooltip_text(Some("Charge once to 100%"));
     }
-    hint.set_label(&battery_limit_hint(active, normal_limit));
+    title.set_label(&battery_limit_title(active, normal_limit));
 }
 
-fn battery_limit_hint(one_time_charge: bool, normal_limit: Option<i32>) -> String {
+fn battery_limit_title(one_time_charge: bool, normal_limit: Option<i32>) -> String {
     if one_time_charge {
-        "One time charge to 100%".into()
+        "Battery Charge Limit: One time to 100%".into()
     } else {
-        normal_limit.map_or_else(|| "—%".into(), |limit| format!("{limit}%"))
+        normal_limit.map_or_else(
+            || "Battery Charge Limit: —%".into(),
+            |limit| format!("Battery Charge Limit: {limit}%"),
+        )
     }
 }
 
@@ -771,7 +750,7 @@ fn select_profile(state: &Rc<AppState>, id: &str) {
 
 #[cfg(test)]
 mod battery_tests {
-    use super::{battery_limit_hint, battery_status_label};
+    use super::{battery_limit_title, battery_status_label};
 
     #[test]
     fn formats_status_with_live_power() {
@@ -779,16 +758,20 @@ mod battery_tests {
             battery_status_label(Some("Charging"), Some(14_500_000)),
             "Charging: 14.5 W"
         );
-        assert_eq!(battery_status_label(Some("Full"), Some(0)), "Full: 0.0 W");
+        assert_eq!(battery_status_label(Some("Full"), Some(0)), "Full");
+        assert_eq!(battery_status_label(Some("Full"), Some(12_300_000)), "Full");
         assert_eq!(battery_status_label(None, None), "—");
     }
 
     #[test]
     fn formats_normal_and_one_time_charge_limits() {
-        assert_eq!(battery_limit_hint(false, Some(80)), "80%");
         assert_eq!(
-            battery_limit_hint(true, Some(80)),
-            "One time charge to 100%"
+            battery_limit_title(false, Some(80)),
+            "Battery Charge Limit: 80%"
+        );
+        assert_eq!(
+            battery_limit_title(true, Some(80)),
+            "Battery Charge Limit: One time to 100%"
         );
     }
 }
