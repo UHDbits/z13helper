@@ -8,14 +8,10 @@ use z13helper_core::FanFloorConfig;
 
 type ChangedCallback = Box<dyn Fn(Curve)>;
 
-const PAD_LEFT: f64 = 48.0;
-const PAD_RIGHT: f64 = 16.0;
-const PAD_TOP: f64 = 20.0;
-const PAD_BOTTOM: f64 = 36.0;
-
 #[derive(Clone)]
 pub struct CurveEditor {
     area: gtk::DrawingArea,
+    accessible_label: Rc<String>,
     curve: Rc<RefCell<Curve>>,
     selected: Rc<Cell<usize>>,
     muted: Rc<Cell<bool>>,
@@ -25,16 +21,19 @@ pub struct CurveEditor {
 }
 
 impl CurveEditor {
-    pub fn new(curve: Curve, clamp_grid: bool) -> Self {
+    pub fn new(curve: Curve, clamp_grid: bool, accessible_label: &str) -> Self {
         let area = gtk::DrawingArea::builder()
             .content_width(440)
             .content_height(320)
             .hexpand(true)
             .vexpand(true)
             .focusable(true)
+            .accessible_role(gtk::AccessibleRole::Slider)
             .build();
+        area.add_css_class("card");
         let this = Self {
             area,
+            accessible_label: Rc::new(accessible_label.into()),
             curve: Rc::new(RefCell::new(curve)),
             selected: Rc::new(Cell::new(0)),
             muted: Rc::new(Cell::new(false)),
@@ -42,6 +41,7 @@ impl CurveEditor {
             floor: Rc::new(Cell::new(FanFloorConfig::default())),
             changed: Rc::new(RefCell::new(None)),
         };
+        this.update_accessibility();
         this.install_draw();
         this.install_input();
         this
@@ -57,6 +57,7 @@ impl CurveEditor {
 
     pub fn set_curve(&self, curve: Curve) {
         *self.curve.borrow_mut() = curve;
+        self.update_accessibility();
         self.area.queue_draw();
     }
 
@@ -82,16 +83,47 @@ impl CurveEditor {
         if let Some(callback) = self.changed.borrow().as_ref() {
             callback(*self.curve.borrow());
         }
+        self.update_accessibility();
         self.area.queue_draw();
     }
 
-    fn chart_geom(w: f64, h: f64) -> (f64, f64, f64, f64) {
+    fn font_size(area: &gtk::DrawingArea) -> f64 {
+        area.pango_context()
+            .font_description()
+            .map(|description| f64::from(description.size()) / f64::from(gtk::pango::SCALE))
+            .filter(|size| *size > 0.0)
+            .unwrap_or(11.0)
+    }
+
+    fn chart_geom(w: f64, h: f64, font_size: f64) -> (f64, f64, f64, f64) {
+        let pad_left = (font_size * 4.4).max(48.0);
+        let pad_right = 16.0;
+        let pad_top = (font_size * 1.8).max(20.0);
+        let pad_bottom = (font_size * 3.2).max(36.0);
         (
-            PAD_LEFT,
-            PAD_TOP,
-            (w - PAD_LEFT - PAD_RIGHT).max(1.0),
-            (h - PAD_TOP - PAD_BOTTOM).max(1.0),
+            pad_left,
+            pad_top,
+            (w - pad_left - pad_right).max(1.0),
+            (h - pad_top - pad_bottom).max(1.0),
         )
+    }
+
+    fn update_accessibility(&self) {
+        let index = self.selected.get();
+        let point = self.curve.borrow()[index];
+        let value = format!(
+            "Point {} of {POINT_COUNT}: {} degrees Celsius, {} percent fan speed",
+            index + 1,
+            point[0],
+            curve::pwm_to_percent(point[1])
+        );
+        self.area.update_property(&[
+            gtk::accessible::Property::Label(&self.accessible_label),
+            gtk::accessible::Property::Description(
+                "Press Tab to select a point. Use arrow keys to adjust it; hold Shift for larger steps.",
+            ),
+            gtk::accessible::Property::ValueText(&value),
+        ]);
     }
 
     fn install_draw(&self) {
@@ -99,19 +131,26 @@ impl CurveEditor {
         let selected = self.selected.clone();
         let muted = self.muted.clone();
         let floor = self.floor.clone();
-        self.area.set_draw_func(move |_, cr, width, height| {
+        self.area.set_draw_func(move |area, cr, width, height| {
             let w = width as f64;
             let h = height as f64;
-            let (left, top, cw, ch) = Self::chart_geom(w, h);
+            let font_size = Self::font_size(area);
+            let (left, top, cw, ch) = Self::chart_geom(w, h, font_size);
             let x = |temp: i32| left + (temp - 20) as f64 / 90.0 * cw;
             let y = |pwm: i32| top + (1.0 - pwm as f64 / 255.0) * ch;
-
-            cr.set_source_rgb(0.14, 0.15, 0.17);
-            let _ = cr.paint();
+            let foreground = area.color();
+            let set_color = |color: &gtk::gdk::RGBA, opacity: f64| {
+                cr.set_source_rgba(
+                    f64::from(color.red()),
+                    f64::from(color.green()),
+                    f64::from(color.blue()),
+                    f64::from(color.alpha()) * opacity,
+                );
+            };
 
             // Grid.
             cr.set_line_width(1.0);
-            cr.set_source_rgba(1.0, 1.0, 1.0, 0.12);
+            set_color(&foreground, 0.18);
             for t in (20..=110).step_by(10) {
                 cr.move_to(x(t), top);
                 cr.line_to(x(t), top + ch);
@@ -123,9 +162,14 @@ impl CurveEditor {
             let _ = cr.stroke();
 
             // Axis labels.
-            cr.set_source_rgba(0.85, 0.88, 0.92, 0.9);
-            cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
-            cr.set_font_size(11.0);
+            set_color(&foreground, 0.88);
+            let font = area.pango_context().font_description();
+            let family = font
+                .as_ref()
+                .and_then(gtk::pango::FontDescription::family)
+                .unwrap_or_else(|| "Sans".into());
+            cr.select_font_face(&family, cairo::FontSlant::Normal, cairo::FontWeight::Normal);
+            cr.set_font_size(font_size);
             for t in (20..=110).step_by(10) {
                 let label = format!("{t}");
                 if let Ok(ext) = cr.text_extents(&label) {
@@ -145,21 +189,21 @@ impl CurveEditor {
                 }
             }
             // Axis titles.
-            cr.set_font_size(10.0);
-            cr.set_source_rgba(0.7, 0.74, 0.8, 0.85);
+            cr.set_font_size(font_size * 0.9);
+            set_color(&foreground, 0.72);
             cr.move_to(left + cw / 2.0 - 12.0, h - 4.0);
             let _ = cr.show_text("°C");
 
             // High-TDP floor.
             let floor = floor.get();
             {
-                cr.set_source_rgba(1.0, 0.5, 0.0, 0.55);
+                set_color(&foreground, 0.72);
                 cr.set_dash(&[4.0, 4.0], 0.0);
                 cr.move_to(x(floor.engage_temp_c), y(i32::from(floor.duty)));
                 cr.line_to(left + cw, y(i32::from(floor.duty)));
                 let _ = cr.stroke();
                 cr.set_dash(&[], 0.0);
-                cr.set_font_size(10.0);
+                cr.set_font_size(font_size * 0.9);
                 cr.move_to(x(floor.engage_temp_c) + 4.0, y(i32::from(floor.duty)) - 4.0);
                 let _ = cr.show_text(&format!(
                     "{}% floor above {}°C at >75W",
@@ -170,9 +214,9 @@ impl CurveEditor {
 
             let points = *curve.borrow();
             if muted.get() {
-                cr.set_source_rgba(0.55, 0.55, 0.55, 0.5);
+                set_color(&foreground, 0.45);
             } else {
-                cr.set_source_rgb(0.23, 0.68, 0.94);
+                set_color(&foreground, 1.0);
             }
             cr.set_line_width(2.5);
             for (i, pt) in points.iter().enumerate() {
@@ -186,15 +230,15 @@ impl CurveEditor {
 
             for (i, pt) in points.iter().enumerate() {
                 if i == selected.get() {
-                    cr.set_source_rgb(1.0, 0.5, 0.0);
+                    set_color(&foreground, 1.0);
                     // Hover-style tooltip near the point.
-                    cr.set_font_size(11.0);
+                    cr.set_font_size(font_size);
                     let tip = format!("{}°C, {}%", pt[0], curve::pwm_to_percent(pt[1]));
                     cr.move_to(x(pt[0]) + 8.0, y(pt[1]) - 8.0);
                     let _ = cr.show_text(&tip);
-                    cr.set_source_rgb(1.0, 0.5, 0.0);
+                    set_color(&foreground, 1.0);
                 } else {
-                    cr.set_source_rgb(0.92, 0.95, 0.98);
+                    set_color(&foreground, 0.92);
                 }
                 cr.arc(x(pt[0]), y(pt[1]), 5.5, 0.0, std::f64::consts::TAU);
                 let _ = cr.fill();
@@ -214,6 +258,7 @@ impl CurveEditor {
             let idx = editor.closest_point(px, py);
             editor.selected.set(idx);
             origin.set((px, py));
+            editor.update_accessibility();
             editor.area.queue_draw();
         });
         let editor = self.clone();
@@ -236,6 +281,7 @@ impl CurveEditor {
             if key == gtk::gdk::Key::Tab {
                 idx = (idx + 1) % POINT_COUNT;
                 editor.selected.set(idx);
+                editor.update_accessibility();
                 editor.area.queue_draw();
                 return glib::Propagation::Stop;
             }
@@ -265,7 +311,7 @@ impl CurveEditor {
     fn closest_point(&self, px: f64, py: f64) -> usize {
         let w = self.area.width() as f64;
         let h = self.area.height() as f64;
-        let (left, top, cw, ch) = Self::chart_geom(w, h);
+        let (left, top, cw, ch) = Self::chart_geom(w, h, Self::font_size(&self.area));
         let x = |t: i32| left + (t - 20) as f64 / 90.0 * cw;
         let y = |p: i32| top + (1.0 - p as f64 / 255.0) * ch;
         self.curve
@@ -284,7 +330,7 @@ impl CurveEditor {
     fn move_point(&self, idx: usize, px: f64, py: f64, vertical_only: bool) {
         let w = self.area.width() as f64;
         let h = self.area.height() as f64;
-        let (left, top, cw, ch) = Self::chart_geom(w, h);
+        let (left, top, cw, ch) = Self::chart_geom(w, h, Self::font_size(&self.area));
         let temp = (20.0 + (px - left) / cw * 90.0).round() as i32;
         let pwm = ((1.0 - (py - top) / ch) * 255.0).round() as i32;
         let mut curve = self.curve.borrow_mut();

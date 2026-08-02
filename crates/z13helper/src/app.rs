@@ -22,8 +22,10 @@ pub struct AppState {
     pub on_battery: Cell<bool>,
     pub undervolt_available: Cell<Option<bool>>,
     pub main_window: RefCell<Option<adw::ApplicationWindow>>,
-    pub error_banner: RefCell<Option<adw::Banner>>,
-    pending_error: RefCell<Option<String>>,
+    pub persistent_banner: RefCell<Option<adw::Banner>>,
+    toast_overlays: RefCell<Vec<glib::WeakRef<adw::ToastOverlay>>>,
+    pending_persistent_error: RefCell<Option<String>>,
+    pending_toast: RefCell<Option<String>>,
 }
 
 impl AppState {
@@ -52,14 +54,16 @@ impl AppState {
             on_battery: Cell::new(false),
             undervolt_available: Cell::new(None),
             main_window: RefCell::new(None),
-            error_banner: RefCell::new(None),
-            pending_error: RefCell::new(pending_error),
+            persistent_banner: RefCell::new(None),
+            toast_overlays: RefCell::new(Vec::new()),
+            pending_persistent_error: RefCell::new(pending_error),
+            pending_toast: RefCell::new(None),
         })
     }
 
     pub fn save_config(&self) {
         if !self.config_writable.get() {
-            self.report_error(
+            self.report_persistent_error(
                 "Configuration changes cannot be saved until the unsupported file is moved away",
             );
             return;
@@ -93,9 +97,7 @@ impl AppState {
                             .borrow_mut()
                             .set_active_for_power_source(&id, on_battery);
                         done.save_config();
-                        if response.warnings.is_empty() {
-                            done.clear_error();
-                        } else {
+                        if !response.warnings.is_empty() {
                             done.report_error(&response.warnings.join(" · "));
                         }
                     }
@@ -107,18 +109,31 @@ impl AppState {
     }
 
     pub fn report_error(&self, message: &str) {
-        if let Some(banner) = self.error_banner.borrow().as_ref() {
-            banner.set_title(message);
-            banner.set_revealed(true);
+        tracing::error!(%message, "z13helper error");
+        let mut overlays = self.toast_overlays.borrow_mut();
+        overlays.retain(|overlay| overlay.upgrade().is_some());
+        let target = overlays.iter().rev().find_map(glib::WeakRef::upgrade);
+        drop(overlays);
+        if let Some(overlay) = target {
+            overlay.add_toast(adw::Toast::new(message));
         } else {
-            tracing::error!(%message, "z13helper error");
-            *self.pending_error.borrow_mut() = Some(message.into());
+            *self.pending_toast.borrow_mut() = Some(message.into());
         }
     }
 
-    pub fn clear_error(&self) {
-        if let Some(banner) = self.error_banner.borrow().as_ref() {
-            banner.set_revealed(false);
+    pub fn report_persistent_error(&self, message: &str) {
+        if let Some(banner) = self.persistent_banner.borrow().as_ref() {
+            banner.set_title(message);
+            banner.set_revealed(true);
+        } else {
+            *self.pending_persistent_error.borrow_mut() = Some(message.into());
+        }
+    }
+
+    pub fn register_toast_overlay(&self, overlay: &adw::ToastOverlay) {
+        self.toast_overlays.borrow_mut().push(overlay.downgrade());
+        if let Some(message) = self.pending_toast.borrow_mut().take() {
+            overlay.add_toast(adw::Toast::new(&message));
         }
     }
 
@@ -128,8 +143,8 @@ impl AppState {
             return;
         }
         let window = main_window::build(self);
-        if let Some(message) = self.pending_error.borrow_mut().take() {
-            self.report_error(&message);
+        if let Some(message) = self.pending_persistent_error.borrow_mut().take() {
+            self.report_persistent_error(&message);
         }
         *self.main_window.borrow_mut() = Some(window.clone());
         subscribe::start(self);

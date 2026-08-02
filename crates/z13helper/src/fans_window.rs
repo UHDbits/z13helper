@@ -49,6 +49,8 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     root.set_margin_bottom(12);
     root.set_margin_start(12);
     root.set_margin_end(12);
+    let toast_overlay = adw::ToastOverlay::new();
+    state.register_toast_overlay(&toast_overlay);
     let body = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     body.set_vexpand(true);
     let left = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -69,10 +71,12 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let editor = CurveEditor::new(
         profile.fan_curves[0],
         state.config.borrow().fan_clamp_to_grid,
+        "Fan 1 curve",
     );
     let editor2 = CurveEditor::new(
         profile.fan_curves[1],
         state.config.borrow().fan_clamp_to_grid,
+        "Fan 2 curve",
     );
     editor.set_floor_config(state.config.borrow().fan_floor);
     editor2.set_floor_config(state.config.borrow().fan_floor);
@@ -110,9 +114,13 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         .unwrap_or(0);
     selector.set_selected(selected as u32);
     selector.set_hexpand(true);
-    let plus = gtk::Button::with_label("+");
-    let minus = gtk::Button::with_label("−");
+    let plus = gtk::Button::with_label("Add");
+    plus.set_tooltip_text(Some("Add Profile"));
+    let minus = gtk::Button::with_label("Remove");
+    minus.set_tooltip_text(Some("Remove Profile"));
     let rename = gtk::Button::with_label("Rename");
+    rename.set_tooltip_text(Some("Rename Profile"));
+    set_profile_action_sensitivity(state, &profile.id, &rename, &minus);
     sel_row.append(&selector);
     sel_row.append(&plus);
     sel_row.append(&rename);
@@ -316,6 +324,8 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let fan_toggle_sel = fan_toggle.clone();
     let editors_sel = editors.clone();
     let loading_sel = loading.clone();
+    let rename_sel = rename.clone();
+    let remove_sel = minus.clone();
     selector.connect_selected_notify(move |drop| {
         if loading_sel.active() {
             return;
@@ -339,12 +349,14 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         *editing_sel.borrow_mut() = next.id.clone();
         state_sel.config.borrow_mut().active_profile = next.id.clone();
         editors_sel.load(next);
+        set_profile_action_sensitivity(&state_sel, &next.id, &rename_sel, &remove_sel);
         state_sel.apply_active(false);
     });
 
     let state_def = state.clone();
     let editing_def = editing_id.clone();
     let editors_def = editors.clone();
+    let restored_toast = toast_overlay.clone();
     let restore_factory = Rc::new(move || {
         let id = editing_def.borrow().clone();
         let restored = {
@@ -360,10 +372,29 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             editors_def.load(&p);
             state_def.save_config();
             state_def.apply_active(false);
+            restored_toast.add_toast(adw::Toast::new("Factory defaults restored"));
         }
     });
     let restore_click = restore_factory.clone();
-    restore.connect_clicked(move |_| restore_click());
+    let restore_parent = window.clone();
+    let restore_state = state.clone();
+    restore.connect_clicked(move |_| {
+        let name = restore_state
+            .config
+            .borrow()
+            .active()
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| "selected profile".into());
+        let body = format!("Reset “{name}” power, fan, and undervolt settings?");
+        let dialog = adw::AlertDialog::new(Some("Restore Factory Defaults?"), Some(&body));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("restore", "Restore");
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("restore", adw::ResponseAppearance::Destructive);
+        let restore = restore_click.clone();
+        dialog.connect_response(Some("restore"), move |_, _| restore());
+        dialog.present(Some(&restore_parent));
+    });
 
     let state_add = state.clone();
     let selector_add = selector.clone();
@@ -392,7 +423,10 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let editors_rm = editors.clone();
     let editing_rm = editing_id.clone();
     let loading_rm = loading.clone();
-    minus.connect_clicked(move |_| {
+    let rename_rm = rename.clone();
+    let remove_rm = minus.clone();
+    let removed_toast = toast_overlay.clone();
+    let remove_profile = Rc::new(move || {
         let id = state_rm.config.borrow().active_profile.clone();
         if state_rm.config.borrow_mut().remove(&id) {
             let profiles = state_rm.config.borrow().profiles.clone();
@@ -415,9 +449,30 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                     editors_rm.load(profile);
                 }
             });
+            set_profile_action_sensitivity(&state_rm, &active, &rename_rm, &remove_rm);
             state_rm.save_config();
             state_rm.apply_active(false);
+            removed_toast.add_toast(adw::Toast::new("Profile removed"));
         }
+    });
+    let remove_parent = window.clone();
+    let remove_state = state.clone();
+    minus.connect_clicked(move |_| {
+        let name = remove_state
+            .config
+            .borrow()
+            .active()
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| "selected profile".into());
+        let body = format!("Permanently remove “{name}”?");
+        let dialog = adw::AlertDialog::new(Some("Remove Profile?"), Some(&body));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("remove", "Remove");
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+        let remove = remove_profile.clone();
+        dialog.connect_response(Some("remove"), move |_, _| remove());
+        dialog.present(Some(&remove_parent));
     });
 
     let state_ren = state.clone();
@@ -516,7 +571,8 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     });
     root.append(&scroller);
     root.append(&actions);
-    toolbar.set_content(Some(&root));
+    toast_overlay.set_child(Some(&root));
+    toolbar.set_content(Some(&toast_overlay));
     window.set_content(Some(&toolbar));
     window.present();
 }
@@ -957,5 +1013,35 @@ fn select_dropdown_string(dropdown: &gtk::DropDown, target: &str) {
             dropdown.set_selected(index);
             return;
         }
+    }
+}
+
+fn set_profile_action_sensitivity(
+    state: &AppState,
+    profile_id: &str,
+    rename: &gtk::Button,
+    remove: &gtk::Button,
+) {
+    let editable = profile_actions_are_editable(&state.config.borrow(), profile_id);
+    rename.set_sensitive(editable);
+    remove.set_sensitive(editable);
+}
+
+fn profile_actions_are_editable(config: &z13helper_core::Config, profile_id: &str) -> bool {
+    config
+        .find(profile_id)
+        .is_some_and(|profile| !profile.builtin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::profile_actions_are_editable;
+
+    #[test]
+    fn builtins_cannot_be_renamed_or_removed() {
+        let mut config = z13helper_core::Config::default();
+        assert!(!profile_actions_are_editable(&config, "silent"));
+        let custom = config.add_custom().id.clone();
+        assert!(profile_actions_are_editable(&config, &custom));
     }
 }

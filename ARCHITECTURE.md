@@ -109,12 +109,17 @@ the result returns to the GLib main context.
 The main window keeps Silent, Balanced, Turbo, and Fans + Power fully visible.
 Fans + Power uses a full-width profile toolbar, dual balanced charts, adaptive
 wide/stacked content, full-width equal-allocation scales, and one persistent
-bottom action bar. Outer/section/row/compact spacing is 12/12/8/6 px.
+bottom action bar. Main content is clamped and vertically scrollable at short
+display heights. Profile choices expose grouped toggle semantics, persistent
+states use banners, and operation results use toasts. Fan charts inherit theme
+colors and font scaling and expose their selected points to assistive
+technology. Outer/section/row/compact spacing is 12/12/8/6 px.
 
-GTK rules retained from field testing: set `GTK_A11Y=none` before initialization,
-never use CSS `hexpand`, `Scale::add_mark`, or animated box shadows, force X11
-only for a real gamescope Wayland socket, use `GAMESCOPE_EXTERNAL_OVERLAY`, and
-paint fan-chart colors in Cairo.
+GTK rules retained from field testing: never use CSS `hexpand`,
+`Scale::add_mark`, or animated box shadows; force X11 only for a real gamescope
+Wayland socket; use `GAMESCOPE_EXTERNAL_OVERLAY`; and keep custom chart drawing
+theme-aware. GTK accessibility remains enabled for screen readers and other
+assistive technology.
 
 ## Lifecycle and packaging
 

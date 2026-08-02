@@ -13,10 +13,6 @@ use std::rc::Rc;
 const APPLICATION_ID: &str = "com.ashtonantila.z13helper";
 
 fn main() {
-    // GTK_A11Y=none avoids AT-SPI D-Bus timeouts that block GTK init.
-    if std::env::var_os("GTK_A11Y").is_none() {
-        unsafe { std::env::set_var("GTK_A11Y", "none") };
-    }
     // Gamescope's Wayland bridge cannot host this GTK surface reliably; its
     // Xwayland server can, but only when the advertised socket exists.
     if let Some(display) = std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY") {

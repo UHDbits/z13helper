@@ -6,7 +6,7 @@ use std::rc::Rc;
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use z13helper_client::{Client, State};
+use z13helper_client::State;
 use z13helper_core::label::mode_label;
 
 use crate::app::AppState;
@@ -27,21 +27,21 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     header.set_title_widget(Some(&gtk::Label::new(Some("z13helper"))));
     toolbar.add_top_bar(&header);
 
-    let banner =
+    let daemon_banner =
         adw::Banner::new("z13helperd is not running — sudo systemctl start z13helperd.service");
-    banner.set_revealed(false);
-    toolbar.add_top_bar(&banner);
-    *state.error_banner.borrow_mut() = Some(banner.clone());
+    daemon_banner.set_revealed(false);
+    toolbar.add_top_bar(&daemon_banner);
+    let persistent_banner = adw::Banner::new("");
+    persistent_banner.set_revealed(false);
+    toolbar.add_top_bar(&persistent_banner);
+    *state.persistent_banner.borrow_mut() = Some(persistent_banner);
 
-    // Outer content is NOT a scrolled window — only the mode grid scrolls when
-    // custom profiles overflow.
     let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     content.set_margin_top(12);
     content.set_margin_bottom(12);
     content.set_margin_start(12);
     content.set_margin_end(12);
-    toolbar.set_content(Some(&content));
-    window.set_content(Some(&toolbar));
+    let sync = SyncGuard::default();
 
     // --- Performance Mode ---
     let mode_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -64,7 +64,9 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         .build();
     content.append(&mode_grid);
 
-    let mode_buttons: Rc<RefCell<Vec<(String, gtk::Button)>>> = Rc::new(RefCell::new(Vec::new()));
+    let mode_buttons: Rc<RefCell<Vec<(String, gtk::ToggleButton)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    let mut mode_group: Option<gtk::ToggleButton> = None;
 
     for (index, (name, id, class)) in [
         ("Silent", "silent", "silent"),
@@ -74,26 +76,36 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     .into_iter()
     .enumerate()
     {
-        let button = gtk::Button::with_label(name);
+        let button = gtk::ToggleButton::with_label(name);
         button.add_css_class("mode-button");
         button.add_css_class(class);
         button.set_hexpand(true);
+        if let Some(group) = mode_group.as_ref() {
+            button.set_group(Some(group));
+        } else {
+            mode_group = Some(button.clone());
+        }
         let state_click = state.clone();
         let label = mode_label_w.clone();
         let buttons = mode_buttons.clone();
+        let mode_sync = sync.clone();
         let id_owned = id.to_string();
-        button.connect_clicked(move |_| {
+        button.connect_toggled(move |button| {
+            if mode_sync.active() || !button.is_active() {
+                return;
+            }
             select_profile(&state_click, &id_owned);
             label.set_label(&current_label(&state_click));
-            refresh_active_buttons(&buttons, &state_click.config.borrow().active_profile);
+            mode_sync.run(|| {
+                refresh_active_buttons(&buttons, &state_click.config.borrow().active_profile)
+            });
         });
         mode_grid.attach(&button, index as i32, 0, 1, 1);
         mode_buttons.borrow_mut().push((id.to_string(), button));
     }
 
     let fans = gtk::Button::with_label("Fans + Power");
-    fans.add_css_class("mode-button");
-    fans.add_css_class("custom");
+    fans.add_css_class("editor-button");
     fans.set_hexpand(true);
     let parent = window.clone();
     let state_fans = state.clone();
@@ -124,17 +136,28 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
             .row_spacing(8)
             .build();
         for profile in custom_profiles {
-            let button = gtk::Button::with_label(&profile.name);
+            let button = gtk::ToggleButton::with_label(&profile.name);
             button.add_css_class("mode-button");
             button.add_css_class("custom");
+            if let Some(group) = mode_group.as_ref() {
+                button.set_group(Some(group));
+            } else {
+                mode_group = Some(button.clone());
+            }
             let id = profile.id.clone();
             let state_click = state.clone();
             let label = mode_label_w.clone();
             let buttons = mode_buttons.clone();
-            button.connect_clicked(move |_| {
+            let mode_sync = sync.clone();
+            button.connect_toggled(move |button| {
+                if mode_sync.active() || !button.is_active() {
+                    return;
+                }
                 select_profile(&state_click, &id);
                 label.set_label(&current_label(&state_click));
-                refresh_active_buttons(&buttons, &state_click.config.borrow().active_profile);
+                mode_sync.run(|| {
+                    refresh_active_buttons(&buttons, &state_click.config.borrow().active_profile)
+                });
             });
             mode_buttons
                 .borrow_mut()
@@ -144,7 +167,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         custom_scroll.set_child(Some(&custom_box));
         content.append(&custom_scroll);
     }
-    refresh_active_buttons(&mode_buttons, &state.config.borrow().active_profile);
+    sync.run(|| refresh_active_buttons(&mode_buttons, &state.config.borrow().active_profile));
 
     // --- Display ---
     let display = adw::PreferencesGroup::builder().title("Display").build();
@@ -155,17 +178,25 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     display.add(&od_row);
     content.append(&display);
 
-    let sync = SyncGuard::default();
     {
         let client = state.client.clone();
         let sync = sync.clone();
+        let feedback = state.clone();
         overdrive.connect_state_set(move |switch, enabled| {
             if sync.active() {
                 switch.set_state(enabled);
                 return glib::Propagation::Stop;
             }
             let c = client.clone();
-            worker::blocking(move || c.panel_overdrive_set(i32::from(enabled)), |_| {});
+            let feedback = feedback.clone();
+            worker::blocking(
+                move || c.panel_overdrive_set(i32::from(enabled)),
+                move |result| {
+                    if let Err(error) = result {
+                        feedback.report_error(&format!("Panel overdrive failed: {error}"));
+                    }
+                },
+            );
             switch.set_state(enabled);
             glib::Propagation::Stop
         });
@@ -252,13 +283,22 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     {
         let client = state.client.clone();
         let sync = sync.clone();
+        let feedback = state.clone();
         boot.connect_toggled(move |b| {
             if sync.active() {
                 return;
             }
             let c = client.clone();
+            let feedback = feedback.clone();
             let enabled = b.is_active();
-            worker::blocking(move || c.boot_sound_set(i32::from(enabled)), |_| {});
+            worker::blocking(
+                move || c.boot_sound_set(i32::from(enabled)),
+                move |result| {
+                    if let Err(error) = result {
+                        feedback.report_error(&format!("Boot sound failed: {error}"));
+                    }
+                },
+            );
         });
     }
     let quit = gtk::Button::with_label("Quit");
@@ -268,6 +308,21 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     footer.append(&boot);
     footer.append(&quit);
     content.append(&footer);
+
+    let clamp = adw::Clamp::new();
+    clamp.set_maximum_size(600);
+    clamp.set_tightening_threshold(500);
+    clamp.set_child(Some(&content));
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .child(&clamp)
+        .build();
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&scroller));
+    state.register_toast_overlay(&toast_overlay);
+    toolbar.set_content(Some(&toast_overlay));
+    window.set_content(Some(&toolbar));
 
     // Initial + periodic sync from daemon.
     let view = MainView {
@@ -285,7 +340,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
             telemetry,
             buttons: mode_buttons,
         },
-        banner,
+        banner: daemon_banner,
         sync,
     };
     sync_once(state, &view);
@@ -330,7 +385,7 @@ struct LightingSection {
 struct ModeView {
     label: gtk::Label,
     telemetry: gtk::Label,
-    buttons: Rc<RefCell<Vec<(String, gtk::Button)>>>,
+    buttons: Rc<RefCell<Vec<(String, gtk::ToggleButton)>>>,
 }
 
 impl MainView {
@@ -338,8 +393,10 @@ impl MainView {
         state
             .undervolt_available
             .set(Some(daemon.undervolt_available));
-        self.sync.run(|| self.settings.sync_from(daemon));
-        self.mode.sync_from(state, daemon);
+        self.sync.run(|| {
+            self.settings.sync_from(daemon);
+            self.mode.sync_from(state, daemon);
+        });
     }
 }
 
@@ -487,14 +544,14 @@ fn lighting_section(
     };
 
     let intent_view = view.clone();
-    let intent_client = state.client.clone();
+    let intent_state = state.clone();
     let intent_sync = sync.clone();
     enabled.connect_state_set(move |switch, on| {
         if intent_sync.active() {
             switch.set_state(on);
             return glib::Propagation::Stop;
         }
-        send_lighting_intent(&intent_client, &intent_view, device, Some(on));
+        send_lighting_intent(&intent_state, &intent_view, device, Some(on));
         switch.set_state(on);
         glib::Propagation::Stop
     });
@@ -502,7 +559,7 @@ fn lighting_section(
     let color_control_c = color_control.clone();
     let speed_c = speed.clone();
     let intent_view = view.clone();
-    let intent_client = state.client.clone();
+    let intent_state = state.clone();
     let intent_sync = sync.clone();
     modes.connect_selected_notify(move |drop| {
         let mode = drop.selected();
@@ -510,23 +567,23 @@ fn lighting_section(
         color_control_c.set_visible(mode != 2 && mode != 3);
         speed_c.set_visible(mode != 0);
         if !intent_sync.active() {
-            send_lighting_intent(&intent_client, &intent_view, device, None);
+            send_lighting_intent(&intent_state, &intent_view, device, None);
         }
     });
     let intent_view = view.clone();
-    let intent_client = state.client.clone();
+    let intent_state = state.clone();
     let intent_sync = sync.clone();
     color.connect_rgba_notify(move |_| {
         if !intent_sync.active() {
-            send_lighting_intent(&intent_client, &intent_view, device, None);
+            send_lighting_intent(&intent_state, &intent_view, device, None);
         }
     });
     let intent_view = view.clone();
-    let intent_client = state.client.clone();
+    let intent_state = state.clone();
     let intent_sync = sync.clone();
     speed.connect_selected_notify(move |_| {
         if !intent_sync.active() {
-            send_lighting_intent(&intent_client, &intent_view, device, None);
+            send_lighting_intent(&intent_state, &intent_view, device, None);
         }
     });
     // Initial visibility for static.
@@ -537,7 +594,7 @@ fn lighting_section(
 }
 
 fn send_lighting_intent(
-    client: &Client,
+    state: &Rc<AppState>,
     view: &LightingView,
     device: &'static str,
     enabled: Option<bool>,
@@ -562,7 +619,8 @@ fn send_lighting_intent(
         (rgba.green() * 255.0).round() as u8,
         (rgba.blue() * 255.0).round() as u8
     );
-    let client = client.clone();
+    let client = state.client.clone();
+    let feedback = state.clone();
     worker::blocking(
         move || {
             if enabled {
@@ -574,6 +632,7 @@ fn send_lighting_intent(
         move |result| {
             if let Err(error) = result {
                 tracing::error!(%error, %device, "lighting write failed");
+                feedback.report_error(&format!("{device} lighting failed: {error}"));
             }
         },
     );
@@ -582,6 +641,7 @@ fn send_lighting_intent(
 fn install_battery_debounce(state: &Rc<AppState>, scale: &gtk::Scale, sync: &SyncGuard) {
     let source = Rc::new(Cell::new(None::<glib::SourceId>));
     let client = state.client.clone();
+    let feedback = state.clone();
     let sync = sync.clone();
     scale.connect_value_changed(move |scale| {
         if sync.active() {
@@ -597,15 +657,17 @@ fn install_battery_debounce(state: &Rc<AppState>, scale: &gtk::Scale, sync: &Syn
             sync.run(|| scale.set_value(value as f64));
         }
         let client = client.clone();
+        let feedback = feedback.clone();
         let source_done = source.clone();
         source.set(Some(glib::timeout_add_local_once(
             std::time::Duration::from_millis(200),
             move || {
                 worker::blocking(
                     move || client.battery_limit_set(value),
-                    |result| {
+                    move |result| {
                         if let Err(e) = result {
                             tracing::error!(%e, "battery limit write failed");
+                            feedback.report_error(&format!("Battery limit failed: {e}"));
                         }
                     },
                 );
@@ -660,13 +722,9 @@ fn install_telemetry(state: &Rc<AppState>, window: &adw::ApplicationWindow, view
     });
 }
 
-fn refresh_active_buttons(buttons: &RefCell<Vec<(String, gtk::Button)>>, active_id: &str) {
+fn refresh_active_buttons(buttons: &RefCell<Vec<(String, gtk::ToggleButton)>>, active_id: &str) {
     for (id, button) in buttons.borrow().iter() {
-        if id == active_id {
-            button.add_css_class("active");
-        } else {
-            button.remove_css_class("active");
-        }
+        button.set_active(id == active_id);
     }
 }
 

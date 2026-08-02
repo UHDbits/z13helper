@@ -2,11 +2,12 @@ use gtk4 as gtk;
 
 const STYLE: &str = r#"
 .mode-button { min-width: 92px; min-height: 72px; border: 3px solid transparent; border-radius: 6px; }
+.editor-button { min-width: 92px; min-height: 72px; }
 .mode-button.silent { color: #06B48A; }
 .mode-button.balanced { color: #3AAEEF; }
 .mode-button.turbo { color: #FF2020; }
 .mode-button.custom { color: #FF8000; }
-.mode-button.active {
+.mode-button:checked {
   border-color: currentColor;
   background-image: linear-gradient(to bottom, alpha(currentColor, 0.22), transparent 45%);
   background-color: alpha(currentColor, 0.10);
