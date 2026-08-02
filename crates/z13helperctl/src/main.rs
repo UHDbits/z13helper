@@ -11,7 +11,7 @@ fn usage() -> ! {
          tdp <pl1> <pl2> <fppt> [apu-sppt platform-sppt]\n  undervolt <-40..0|off>\n\
          fans <firmware|direct|off> [curves-json-file]\n\
          lighting <keyboard|lightbar> <off|mode> [color] [brightness]\n\
-         battery-limit <40..100>\n  panel-overdrive <on|off>\n\
+         battery-limit <40..100>\n  battery-charge-once <on|off>\n  panel-overdrive <on|off>\n\
          boot-sound <on|off>\n  release-fans"
     );
     std::process::exit(2)
@@ -201,6 +201,12 @@ fn run() -> Result<(), String> {
                         .parse()
                         .map_err(|error: std::num::ParseIntError| error.to_string())?,
                 )
+                .map_err(|e| e.to_string())?;
+            print_ok()?;
+        }
+        "battery-charge-once" => {
+            client
+                .battery_one_time_charge_set(parse_bool(&args.next().unwrap_or_else(|| usage()))?)
                 .map_err(|e| e.to_string())?;
             print_ok()?;
         }

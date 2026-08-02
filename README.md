@@ -80,6 +80,11 @@ Focused commands cover profile, PPD, PPT, fans, undervolt, lighting, battery,
 panel overdrive, boot sound, and direct-fan release. The CLI never owns named GUI
 profiles.
 
+The battery slider stores the normal 40–100% charge limit. A separate one-time
+100% override is persisted by `z13helperd`, remains active without the GUI, and
+automatically restores the normal limit when battery telemetry reaches 100%.
+`battery-charge-once on|off` exposes the same toggle to scripts.
+
 ## License
 
 MIT. ASUS and ROG are trademarks of their respective owner.

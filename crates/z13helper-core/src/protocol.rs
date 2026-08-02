@@ -154,6 +154,8 @@ pub struct DaemonState {
     #[serde(default)]
     pub battery_limit: Option<i32>,
     #[serde(default)]
+    pub battery_one_time_charge: bool,
+    #[serde(default)]
     pub battery: BatteryTelemetry,
     #[serde(default)]
     pub boot_sound: Option<i32>,
@@ -207,6 +209,7 @@ impl Default for DaemonState {
             },
             devices: None,
             battery_limit: None,
+            battery_one_time_charge: false,
             battery: BatteryTelemetry::default(),
             boot_sound: None,
             panel_overdrive: None,
@@ -315,6 +318,9 @@ pub enum Command {
     },
     SetBatteryLimit {
         limit: i32,
+    },
+    SetBatteryOneTimeCharge {
+        enabled: bool,
     },
     SetPanelOverdrive {
         enabled: bool,
@@ -425,6 +431,22 @@ mod tests {
         let text = serde_json::to_string(&request).unwrap();
         assert!(text.contains("\"version\":1"));
         assert!(text.contains("\"cmd\":\"get-state\""));
+    }
+
+    #[test]
+    fn one_time_charge_command_roundtrips() {
+        let request = WireRequest {
+            version: PROTOCOL_VERSION,
+            command: Command::SetBatteryOneTimeCharge { enabled: true },
+        };
+        let text = serde_json::to_string(&request).unwrap();
+        assert!(text.contains("\"cmd\":\"set-battery-one-time-charge\""));
+        assert!(text.contains("\"enabled\":true"));
+        let decoded: WireRequest = serde_json::from_str(&text).unwrap();
+        assert!(matches!(
+            decoded.command,
+            Command::SetBatteryOneTimeCharge { enabled: true }
+        ));
     }
 
     #[test]

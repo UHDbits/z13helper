@@ -95,6 +95,11 @@ impl Client {
         Ok(())
     }
 
+    pub fn battery_one_time_charge_set(&self, enabled: bool) -> Result<(), DaemonError> {
+        self.exchange(Command::SetBatteryOneTimeCharge { enabled })?;
+        Ok(())
+    }
+
     pub fn panel_overdrive_set(&self, value: i32) -> Result<(), DaemonError> {
         self.exchange(Command::SetPanelOverdrive {
             enabled: value != 0,
@@ -308,5 +313,42 @@ mod tests {
         });
         let state = Client::with_path(path).get_state().unwrap();
         assert_eq!(state.base, z13helper_core::Base::Balanced);
+    }
+
+    #[test]
+    fn one_time_charge_uses_persistent_daemon_command() {
+        let dir = std::env::temp_dir().join(format!(
+            "z13helper-client-charge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("daemon.sock");
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("bind {}: {error}", path.display()),
+        };
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            assert!(request.contains("\"cmd\":\"set-battery-one-time-charge\""));
+            assert!(request.contains("\"enabled\":true"));
+            let mut stream = stream;
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&WireResponse::success()).unwrap()
+            )
+            .unwrap();
+        });
+        Client::with_path(path)
+            .battery_one_time_charge_set(true)
+            .unwrap();
     }
 }

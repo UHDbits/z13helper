@@ -40,6 +40,9 @@ fn dispatch(backend: &mut Backend, command: Command) -> Result<WireResponse, Dae
         Command::Probe => response.probe = Some(backend.probe()),
         Command::Apply { request } => response.apply = Some(backend.apply(request)?),
         Command::SetBatteryLimit { limit } => backend.set_battery_limit(limit)?,
+        Command::SetBatteryOneTimeCharge { enabled } => {
+            backend.set_battery_one_time_charge(enabled)?
+        }
         Command::SetPanelOverdrive { enabled } => backend.set_panel_overdrive(enabled)?,
         Command::SetBootSound { enabled } => backend.set_boot_sound(enabled)?,
         Command::SetLighting { device, state } => backend.set_lighting(device, state)?,

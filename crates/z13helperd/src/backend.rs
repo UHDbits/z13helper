@@ -235,6 +235,7 @@ impl Backend {
             backend.persisted.state.fan_curves = Some([stock, stock]);
             let _ = backend.save();
         }
+        backend.restore_battery_policy();
         backend.restore_lighting();
         Ok(backend)
     }
@@ -330,11 +331,40 @@ impl Backend {
     }
 
     pub fn set_battery_limit(&mut self, limit: i32) -> Result<(), DaemonError> {
+        if !(40..=100).contains(&limit) {
+            return Err(DaemonError::Rejected(
+                "battery limit must be between 40 and 100".into(),
+            ));
+        }
+        if !self.persisted.state.battery_one_time_charge {
+            self.hardware
+                .sysfs
+                .set_battery_limit(limit)
+                .map_err(DaemonError::Rejected)?;
+        }
+        self.persisted.state.battery_limit = Some(limit);
+        self.bump_and_save()
+    }
+
+    pub fn set_battery_one_time_charge(&mut self, enabled: bool) -> Result<(), DaemonError> {
+        if enabled == self.persisted.state.battery_one_time_charge {
+            return Ok(());
+        }
+        if self.persisted.state.battery_limit.is_none() {
+            self.persisted.state.battery_limit = Some(
+                self.hardware
+                    .sysfs
+                    .battery_limit()
+                    .map_err(DaemonError::Rejected)?,
+            );
+        }
+        let target = effective_battery_limit(enabled, self.persisted.state.battery_limit)
+            .expect("normal battery limit was initialized above");
         self.hardware
             .sysfs
-            .set_battery_limit(limit)
+            .set_battery_limit(target)
             .map_err(DaemonError::Rejected)?;
-        self.persisted.state.battery_limit = Some(limit);
+        self.persisted.state.battery_one_time_charge = enabled;
         self.bump_and_save()
     }
 
@@ -408,6 +438,7 @@ impl Backend {
                 return;
             }
         }
+        self.restore_battery_policy();
         self.restore_lighting();
     }
 
@@ -436,12 +467,15 @@ impl Backend {
         if let Ok(tdp) = self.hardware.sysfs.read_tdp(self.persisted.state.base) {
             self.persisted.state.tdp = Some(tdp);
         }
-        if let Ok(limit) = self.hardware.sysfs.battery_limit() {
-            self.persisted.state.battery_limit = Some(limit);
+        if !self.persisted.state.battery_one_time_charge {
+            if let Ok(limit) = self.hardware.sysfs.battery_limit() {
+                self.persisted.state.battery_limit = Some(limit);
+            }
         }
         if let Ok(battery) = self.hardware.sysfs.battery_telemetry() {
             self.persisted.state.battery = battery;
         }
+        self.complete_one_time_charge_if_full();
         if let Ok(value) = self.hardware.sysfs.read_armoury_bool("panel_overdrive") {
             self.persisted.state.panel_overdrive = Some(value);
         }
@@ -519,6 +553,44 @@ impl Backend {
         self.store.save(&self.persisted)
     }
 
+    fn restore_battery_policy(&mut self) {
+        let target = effective_battery_limit(
+            self.persisted.state.battery_one_time_charge,
+            self.persisted.state.battery_limit,
+        );
+        if let Some(target) = target {
+            if let Err(error) = self.hardware.sysfs.set_battery_limit(target) {
+                tracing::warn!(%error, target, "failed to restore battery charge policy");
+            }
+        }
+    }
+
+    fn complete_one_time_charge_if_full(&mut self) {
+        if !one_time_charge_is_complete(
+            self.persisted.state.battery_one_time_charge,
+            self.persisted.state.battery.charge_percent,
+        ) {
+            return;
+        }
+        let Some(limit) = self.persisted.state.battery_limit else {
+            return;
+        };
+        match self.hardware.sysfs.set_battery_limit(limit) {
+            Ok(()) => {
+                let previous_generation = self.persisted.state.generation;
+                self.persisted.state.battery_one_time_charge = false;
+                if let Err(error) = self.bump_and_save() {
+                    self.persisted.state.battery_one_time_charge = true;
+                    self.persisted.state.generation = previous_generation;
+                    tracing::error!(%error, "failed to persist completed one-time charge");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, limit, "failed to restore battery limit after full charge");
+            }
+        }
+    }
+
     fn restore_lighting(&mut self) {
         let lighting = self.persisted.state.devices.clone().unwrap_or_default();
         for (device, state) in lighting {
@@ -544,5 +616,27 @@ impl Backend {
             }
         }
         Ok(())
+    }
+}
+
+fn effective_battery_limit(one_time_charge: bool, normal_limit: Option<i32>) -> Option<i32> {
+    one_time_charge.then_some(100).or(normal_limit)
+}
+
+fn one_time_charge_is_complete(one_time_charge: bool, charge_percent: Option<u8>) -> bool {
+    one_time_charge && charge_percent.is_some_and(|charge| charge >= 100)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{effective_battery_limit, one_time_charge_is_complete};
+
+    #[test]
+    fn one_time_charge_overrides_and_then_restores_the_normal_limit() {
+        assert_eq!(effective_battery_limit(false, Some(80)), Some(80));
+        assert_eq!(effective_battery_limit(true, Some(80)), Some(100));
+        assert!(!one_time_charge_is_complete(true, Some(99)));
+        assert!(one_time_charge_is_complete(true, Some(100)));
+        assert!(!one_time_charge_is_complete(false, Some(100)));
     }
 }

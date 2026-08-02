@@ -43,7 +43,10 @@ The daemon atomically persists only flattened desired machine state at
 `/var/lib/z13helper/state.json`. On first boot without that file, it retains the
 detected base, restores the measured stock PPT table, and leaves direct EC mode
 released. Startup and resume restore fan protection before high power, followed
-by undervolt and lighting.
+by undervolt, the persistent battery policy, and lighting. The stored battery
+limit remains the normal slider value; a separate one-time flag temporarily
+writes 100% and is cleared only after the normal limit is restored at full
+charge.
 
 ## Apply transaction
 
@@ -92,7 +95,8 @@ The daemon owns adapters for:
 - both firmware fan interfaces and direct EC mailbox control;
 - a single startup `ryzen_smu` MP1 `0x4C` availability probe and cached result;
 - persistent keyboard/lightbar hidraw handles with hotplug relight;
-- battery thresholds 40–100, panel overdrive, and boot sound;
+- battery thresholds 40–100, a persistent one-time 100% override that restores
+  the normal threshold at full charge, panel overdrive, and boot sound;
 - non-exclusive `KEY_PROG3` monitoring with reconnect and `gui-toggle` events;
 - temperature and two calibrated fan RPM readings.
 

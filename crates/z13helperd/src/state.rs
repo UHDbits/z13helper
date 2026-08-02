@@ -113,8 +113,13 @@ mod tests {
         let store = StateStore::new(&path);
         let mut state = PersistedState::default();
         state.state.generation = 9;
+        state.state.battery_limit = Some(80);
+        state.state.battery_one_time_charge = true;
         store.save(&state).unwrap();
-        assert_eq!(store.load().unwrap().state.generation, 9);
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.state.generation, 9);
+        assert_eq!(loaded.state.battery_limit, Some(80));
+        assert!(loaded.state.battery_one_time_charge);
         let _ = fs::remove_file(path);
     }
 
