@@ -72,6 +72,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     right.set_margin_end(12);
 
     let stack = gtk::Stack::new();
+    stack.set_vhomogeneous(false);
     let switcher = gtk::StackSwitcher::new();
     switcher.set_stack(Some(&stack));
     switcher.set_margin_top(12);
@@ -148,6 +149,8 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     fan_toggle.set_active(profile.apply_fan_curve);
     editor.set_muted(!fan_toggle.is_active());
     editor2.set_muted(!fan_toggle.is_active());
+    editor.set_editable(fan_toggle.is_active());
+    editor2.set_editable(fan_toggle.is_active());
     right.append(&fan_toggle);
 
     let direct_toggle = gtk::CheckButton::with_label("Direct EC control");
@@ -178,6 +181,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let state_probe = state.clone();
     let uv_probe = advanced.1.clone();
     let apply_uv_probe = advanced.2.clone();
+    let manual_uv_probe = advanced.3.clone();
     worker::blocking(
         move || manual_probe.get_state(),
         move |result| match result {
@@ -187,6 +191,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                     .set(Some(status.undervolt_available));
                 uv_probe.set_sensitive(status.undervolt_available);
                 apply_uv_probe.set_sensitive(status.undervolt_available);
+                manual_uv_probe.set_sensitive(status.undervolt_available);
                 sync_ppd_choices(&ppd_probe, &status.capabilities.ppd_profiles, &state_probe);
                 direct_probe.set_sensitive(status.capabilities.direct_fans);
                 if !status.capabilities.direct_fans {
@@ -206,6 +211,9 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             Err(error) => {
                 ppd_probe.set_sensitive(false);
                 direct_probe.set_sensitive(false);
+                uv_probe.set_sensitive(false);
+                apply_uv_probe.set_sensitive(false);
+                manual_uv_probe.set_sensitive(false);
                 status_probe.set_label(&format!("z13helperd unavailable: {error}"));
             }
         },
@@ -232,8 +240,11 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         if loading_fan.active() {
             return;
         }
-        editor_muted.set_muted(!t.is_active());
-        editor2_muted.set_muted(!t.is_active());
+        let enabled = t.is_active();
+        editor_muted.set_muted(!enabled);
+        editor2_muted.set_muted(!enabled);
+        editor_muted.set_editable(enabled);
+        editor2_muted.set_editable(enabled);
         let id = editing_fan.borrow().clone();
         if let Some(p) = state_fan.config.borrow_mut().find_mut(&id) {
             p.apply_fan_curve = t.is_active();
@@ -682,14 +693,17 @@ fn build_cpu_page(
             .map(|p| p.apply_power_limits)
             .unwrap_or(false),
     );
-    power_group.add(&apply_power);
 
     let spl = slider_row("SPL (CPU sustained)", pl1, 5, 93);
     let sppt = slider_row("sPPT (CPU long boost)", pl2, 5, 93);
-    let fppt = slider_row("fPPT (CPU short boost)", pl3, 5, 93);
+    let fppt = slider_row("fPPT (CPU short boost)", pl3, 5, 120);
     power_group.add(&spl.0);
     power_group.add(&sppt.0);
     power_group.add(&fppt.0);
+    power_group.add(&apply_power);
+    spl.1.set_sensitive(apply_power.is_active());
+    sppt.1.set_sensitive(apply_power.is_active());
+    fppt.1.set_sensitive(apply_power.is_active());
     page.append(&power_group);
 
     let warning = gtk::Label::new(Some(
@@ -745,7 +759,16 @@ fn build_cpu_page(
     let update_ppd = update.clone();
     ppd.connect_selected_notify(move |_| update_ppd());
     let update_toggle = update.clone();
-    apply_power.connect_toggled(move |_| update_toggle());
+    let spl_toggle = spl.1.clone();
+    let sppt_toggle = sppt.1.clone();
+    let fppt_toggle = fppt.1.clone();
+    apply_power.connect_toggled(move |toggle| {
+        let enabled = toggle.is_active();
+        spl_toggle.set_sensitive(enabled);
+        sppt_toggle.set_sensitive(enabled);
+        fppt_toggle.set_sensitive(enabled);
+        update_toggle();
+    });
     for scale in [&spl.1, &sppt.1, &fppt.1] {
         let update = update.clone();
         scale.connect_value_changed(move |_| update());
@@ -759,7 +782,7 @@ fn build_advanced_page(
     editing_id: &Rc<RefCell<String>>,
     loading: &SyncGuard,
     apply_schedule: &ApplySchedule,
-) -> (gtk::Box, gtk::Scale, gtk::CheckButton) {
+) -> (gtk::Box, gtk::Scale, gtk::CheckButton, gtk::Button) {
     let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     page.set_margin_top(12);
     page.set_margin_bottom(12);
@@ -769,12 +792,12 @@ fn build_advanced_page(
     let group = adw::PreferencesGroup::builder()
         .title("CPU Undervolt (Curve Optimizer)")
         .description(
-            "Offset only takes effect while custom overrides are active. \
-             The daemon reapplies it after sleep. Range 0 to −40.",
+            "Auto Apply persists this offset with the profile. Apply tests it once without \
+             restoring it after a daemon restart. Range 0 to −40.",
         )
         .build();
 
-    let apply_uv = gtk::CheckButton::with_label("Apply Undervolt");
+    let apply_uv = gtk::CheckButton::with_label("Auto Apply");
     apply_uv.set_active(
         state
             .config
@@ -783,7 +806,6 @@ fn build_advanced_page(
             .map(|p| p.apply_undervolt)
             .unwrap_or(false),
     );
-    group.add(&apply_uv);
 
     // Full-width slider below the title — ActionRow suffixes crush scales.
     let uv = gtk::Scale::with_range(gtk::Orientation::Horizontal, -40.0, 0.0, 1.0);
@@ -809,6 +831,18 @@ fn build_advanced_page(
     group.add(&uv_row);
     page.append(&group);
     page.append(&uv);
+
+    let uv_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    uv_actions.set_margin_start(12);
+    uv_actions.set_margin_end(12);
+    let manual_apply = gtk::Button::with_label("Apply");
+    manual_apply.set_tooltip_text(Some(
+        "Test this Curve Optimizer offset once without enabling Auto Apply.",
+    ));
+    manual_apply.update_property(&[gtk::accessible::Property::Label("Apply undervolt once")]);
+    uv_actions.append(&apply_uv);
+    uv_actions.append(&manual_apply);
+    page.append(&uv_actions);
 
     let note = gtk::Label::new(Some(
         "If undervolt controls stay disabled, ryzen_smu (amkillam fork) is not loaded.",
@@ -879,6 +913,7 @@ fn build_advanced_page(
     if let Some(available) = state.undervolt_available.get() {
         uv.set_sensitive(available);
         apply_uv.set_sensitive(available);
+        manual_apply.set_sensitive(available);
     }
 
     let state_uv = state.clone();
@@ -895,7 +930,11 @@ fn build_advanced_page(
             p.cpu_co = scale.value() as i32;
             p.apply_undervolt = apply_uv_c.is_active();
         }
-        schedule_apply(&state_uv, &apply_schedule_uv);
+        if apply_uv_c.is_active() {
+            schedule_apply(&state_uv, &apply_schedule_uv);
+        } else {
+            state_uv.save_config();
+        }
     });
     let state_chk = state.clone();
     let editing = editing_id.clone();
@@ -912,7 +951,38 @@ fn build_advanced_page(
         schedule_apply(&state_chk, &apply_schedule_uv);
     });
 
-    (page, uv, apply_uv)
+    let state_manual = state.clone();
+    let editing_manual = editing_id.clone();
+    let loading_manual = loading.clone();
+    manual_apply.connect_clicked(move |button| {
+        if loading_manual.active() {
+            return;
+        }
+        let id = editing_manual.borrow().clone();
+        let Some(offset) = state_manual
+            .config
+            .borrow()
+            .find(&id)
+            .map(|profile| profile.cpu_co)
+        else {
+            return;
+        };
+        button.set_sensitive(false);
+        let button_done = button.clone();
+        let client = state_manual.client.clone();
+        let feedback = state_manual.clone();
+        worker::blocking(
+            move || client.apply_undervolt_once(offset),
+            move |result| {
+                button_done.set_sensitive(feedback.undervolt_available.get().unwrap_or(true));
+                if let Err(error) = result {
+                    feedback.report_error(&format!("Manual undervolt apply failed: {error}"));
+                }
+            },
+        );
+    });
+
+    (page, uv, apply_uv, manual_apply)
 }
 
 fn schedule_apply(state: &Rc<AppState>, schedule: &ApplySchedule) {
@@ -966,6 +1036,8 @@ impl ProfileEditorView {
             self.fans.second.set_curve(profile.fan_curves[1]);
             self.fans.first.set_muted(!profile.apply_fan_curve);
             self.fans.second.set_muted(!profile.apply_fan_curve);
+            self.fans.first.set_editable(profile.apply_fan_curve);
+            self.fans.second.set_editable(profile.apply_fan_curve);
             self.fans.enabled.set_active(profile.apply_fan_curve);
             self.fans
                 .direct
@@ -977,6 +1049,9 @@ impl ProfileEditorView {
             self.power.sppt.set_value(profile.pl2_sppt as f64);
             self.power.fppt.set_value(profile.fppt as f64);
             self.power.enabled.set_active(profile.apply_power_limits);
+            self.power.spl.set_sensitive(profile.apply_power_limits);
+            self.power.sppt.set_sensitive(profile.apply_power_limits);
+            self.power.fppt.set_sensitive(profile.apply_power_limits);
             select_dropdown_string(
                 &self.power.ppd,
                 profile.ppd_profile.as_deref().unwrap_or("disabled"),

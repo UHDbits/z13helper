@@ -92,6 +92,11 @@ impl Client {
             .ok_or_else(|| DaemonError::Protocol("missing apply response".into()))
     }
 
+    pub fn apply_undervolt_once(&self, offset: i32) -> Result<(), DaemonError> {
+        self.exchange(Command::ApplyUndervoltOnce { offset })?;
+        Ok(())
+    }
+
     pub fn factory_fan_curves(
         &self,
         ppd_profiles: Vec<String>,
@@ -355,6 +360,41 @@ mod tests {
         Client::with_path(path)
             .battery_one_time_charge_set(true)
             .unwrap();
+    }
+
+    #[test]
+    fn one_shot_undervolt_uses_non_persistent_daemon_command() {
+        let dir = std::env::temp_dir().join(format!(
+            "z13helper-client-uv-once-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("daemon.sock");
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("bind {}: {error}", path.display()),
+        };
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            assert!(request.contains("\"cmd\":\"apply-undervolt-once\""));
+            assert!(request.contains("\"offset\":-20"));
+            let mut stream = stream;
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&WireResponse::success()).unwrap()
+            )
+            .unwrap();
+        });
+        Client::with_path(path).apply_undervolt_once(-20).unwrap();
     }
 
     #[test]

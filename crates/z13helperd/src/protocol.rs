@@ -42,6 +42,7 @@ fn dispatch(backend: &mut Backend, command: Command) -> Result<WireResponse, Dae
             response.factory_fan_curves = Some(backend.factory_fan_curves(ppd_profiles)?)
         }
         Command::Apply { request } => response.apply = Some(backend.apply(request)?),
+        Command::ApplyUndervoltOnce { offset } => backend.apply_undervolt_once(offset)?,
         Command::SetBatteryLimit { limit } => backend.set_battery_limit(limit)?,
         Command::SetBatteryOneTimeCharge { enabled } => {
             backend.set_battery_one_time_charge(enabled)?

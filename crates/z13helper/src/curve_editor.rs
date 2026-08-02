@@ -8,6 +8,10 @@ use z13helper_core::FanFloorConfig;
 
 type ChangedCallback = Box<dyn Fn(Curve)>;
 
+const CHART_TEMP_MIN: i32 = 20;
+const CHART_TEMP_MAX: i32 = 100;
+const CHART_TEMP_RANGE: f64 = (CHART_TEMP_MAX - CHART_TEMP_MIN) as f64;
+
 #[derive(Clone)]
 pub struct CurveEditor {
     area: gtk::DrawingArea,
@@ -62,6 +66,10 @@ impl CurveEditor {
     pub fn set_muted(&self, muted: bool) {
         self.muted.set(muted);
         self.area.queue_draw();
+    }
+
+    pub fn set_editable(&self, editable: bool) {
+        self.area.set_sensitive(editable);
     }
 
     pub fn set_floor_config(&self, floor: FanFloorConfig) {
@@ -130,7 +138,7 @@ impl CurveEditor {
             let h = height as f64;
             let font_size = Self::font_size(area);
             let (left, top, cw, ch) = Self::chart_geom(w, h, font_size);
-            let x = |temp: i32| left + (temp - 20) as f64 / 90.0 * cw;
+            let x = |temp: i32| left + (temp - CHART_TEMP_MIN) as f64 / CHART_TEMP_RANGE * cw;
             let y = |pwm: i32| top + (1.0 - pwm as f64 / 255.0) * ch;
             let foreground = area.color();
             let set_color = |color: &gtk::gdk::RGBA, opacity: f64| {
@@ -145,7 +153,7 @@ impl CurveEditor {
             // Grid.
             cr.set_line_width(1.0);
             set_color(&foreground, 0.18);
-            for t in (20..=110).step_by(10) {
+            for t in (CHART_TEMP_MIN..=CHART_TEMP_MAX).step_by(10) {
                 cr.move_to(x(t), top);
                 cr.line_to(x(t), top + ch);
             }
@@ -164,7 +172,7 @@ impl CurveEditor {
                 .unwrap_or_else(|| "Sans".into());
             cr.select_font_face(&family, cairo::FontSlant::Normal, cairo::FontWeight::Normal);
             cr.set_font_size(font_size);
-            for t in (20..=110).step_by(10) {
+            for t in (CHART_TEMP_MIN..=CHART_TEMP_MAX).step_by(10) {
                 let label = format!("{t}");
                 if let Ok(ext) = cr.text_extents(&label) {
                     cr.move_to(x(t) - ext.width() / 2.0, top + ch + 16.0);
@@ -301,7 +309,7 @@ impl CurveEditor {
         let w = self.area.width() as f64;
         let h = self.area.height() as f64;
         let (left, top, cw, ch) = Self::chart_geom(w, h, Self::font_size(&self.area));
-        let x = |t: i32| left + (t - 20) as f64 / 90.0 * cw;
+        let x = |t: i32| left + (t - CHART_TEMP_MIN) as f64 / CHART_TEMP_RANGE * cw;
         let y = |p: i32| top + (1.0 - p as f64 / 255.0) * ch;
         self.curve
             .borrow()
@@ -320,7 +328,9 @@ impl CurveEditor {
         let w = self.area.width() as f64;
         let h = self.area.height() as f64;
         let (left, top, cw, ch) = Self::chart_geom(w, h, Self::font_size(&self.area));
-        let temp = (20.0 + (px - left) / cw * 90.0).round() as i32;
+        let temp = (CHART_TEMP_MIN as f64 + (px - left) / cw * CHART_TEMP_RANGE)
+            .round()
+            .clamp(CHART_TEMP_MIN as f64, CHART_TEMP_MAX as f64) as i32;
         let pwm = ((1.0 - (py - top) / ch) * 255.0).round() as i32;
         let mut curve = self.curve.borrow_mut();
         if vertical_only {

@@ -317,6 +317,16 @@ impl Backend {
         })
     }
 
+    /// Apply a one-shot Curve Optimizer offset without changing the desired
+    /// state that will be restored after suspend or daemon restart.
+    pub fn apply_undervolt_once(&mut self, offset: i32) -> Result<(), DaemonError> {
+        validate_manual_undervolt(offset, self.hardware.undervolt_available)?;
+        self.hardware
+            .sysfs
+            .set_undervolt(offset)
+            .map_err(DaemonError::Rejected)
+    }
+
     pub fn factory_fan_curves(
         &mut self,
         ppd_profiles: Vec<String>,
@@ -686,10 +696,25 @@ fn one_time_charge_is_complete(one_time_charge: bool, charge_percent: Option<u8>
     one_time_charge && charge_percent.is_some_and(|charge| charge >= 100)
 }
 
+fn validate_manual_undervolt(offset: i32, available: bool) -> Result<(), DaemonError> {
+    if !(-40..=0).contains(&offset) {
+        return Err(DaemonError::Rejected(
+            "Curve Optimizer offset must be between -40 and 0".into(),
+        ));
+    }
+    if !available {
+        return Err(DaemonError::Rejected(
+            "ryzen_smu is unavailable; undervolt cannot be applied".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         effective_battery_limit, one_time_charge_is_complete, validate_factory_curve_query_power,
+        validate_manual_undervolt,
     };
     use z13helper_core::protocol::TdpState;
 
@@ -710,5 +735,12 @@ mod tests {
         };
         assert!(validate_factory_curve_query_power(Some(tdp(75))).is_ok());
         assert!(validate_factory_curve_query_power(Some(tdp(76))).is_err());
+    }
+
+    #[test]
+    fn one_shot_undervolt_requires_a_safe_available_offset() {
+        assert!(validate_manual_undervolt(-20, true).is_ok());
+        assert!(validate_manual_undervolt(-41, true).is_err());
+        assert!(validate_manual_undervolt(-20, false).is_err());
     }
 }

@@ -269,15 +269,15 @@ impl ApplyRequest {
             }
         }
         if let Some(tdp) = self.power_limits {
-            for (name, value) in [
-                ("PL1", tdp.pl1_spl),
-                ("PL2", tdp.pl2_sppt),
-                ("FPPT", tdp.fppt),
-                ("APU SPPT", tdp.apu_sppt),
-                ("platform SPPT", tdp.platform_sppt),
+            for (name, value, maximum) in [
+                ("PL1", tdp.pl1_spl, 93),
+                ("PL2", tdp.pl2_sppt, 93),
+                ("FPPT", tdp.fppt, 120),
+                ("APU SPPT", tdp.apu_sppt, 93),
+                ("platform SPPT", tdp.platform_sppt, 93),
             ] {
-                if !(5..=93).contains(&value) {
-                    return Err(format!("{name} must be between 5 and 93 watts"));
+                if !(5..=maximum).contains(&value) {
+                    return Err(format!("{name} must be between 5 and {maximum} watts"));
                 }
             }
             if tdp.pl2_sppt < tdp.pl1_spl || tdp.fppt < tdp.pl2_sppt {
@@ -311,6 +311,9 @@ pub enum Command {
     },
     Apply {
         request: ApplyRequest,
+    },
+    ApplyUndervoltOnce {
+        offset: i32,
     },
     SetBatteryLimit {
         limit: i32,
@@ -463,13 +466,32 @@ mod tests {
     }
 
     #[test]
+    fn one_shot_undervolt_command_roundtrips() {
+        let request = WireRequest {
+            version: PROTOCOL_VERSION,
+            command: Command::ApplyUndervoltOnce { offset: -20 },
+        };
+        let text = serde_json::to_string(&request).unwrap();
+        assert!(text.contains("\"cmd\":\"apply-undervolt-once\""));
+        let decoded: WireRequest = serde_json::from_str(&text).unwrap();
+        assert!(matches!(
+            decoded.command,
+            Command::ApplyUndervoltOnce { offset: -20 }
+        ));
+    }
+
+    #[test]
     fn complete_apply_is_prevalidated() {
         let mut profile = Profile::builtin("turbo", "Turbo");
         profile.apply_power_limits = true;
         profile.pl1_spl = 80;
         profile.pl2_sppt = 90;
-        profile.fppt = 94;
+        profile.fppt = 121;
         let request = ApplyRequest::from_profile(&profile, FanFloorConfig::default());
         assert!(request.validate().is_err());
+
+        profile.fppt = 120;
+        let request = ApplyRequest::from_profile(&profile, FanFloorConfig::default());
+        assert!(request.validate().is_ok());
     }
 }
