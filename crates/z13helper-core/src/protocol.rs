@@ -145,6 +145,8 @@ pub struct DaemonState {
     #[serde(default)]
     pub undervolt: Option<UndervoltState>,
     #[serde(default)]
+    pub cpu_temp_limit: Option<u8>,
+    #[serde(default)]
     pub undervolt_available: bool,
     #[serde(default)]
     pub temperature: Option<i32>,
@@ -194,6 +196,7 @@ impl Default for DaemonState {
             fan_control_mode: FanControlMode::Firmware,
             tdp: None,
             undervolt: None,
+            cpu_temp_limit: None,
             undervolt_available: false,
             temperature: None,
             fan_rpms: [0; 2],
@@ -217,6 +220,8 @@ pub struct ApplyRequest {
     pub fan_mode: FanControlMode,
     pub fan_curves: Option<[Curve; 2]>,
     pub undervolt: Option<i32>,
+    #[serde(default = "crate::profile::default_cpu_temp_limit")]
+    pub cpu_temp_limit: u8,
     #[serde(default)]
     pub fan_hysteresis: FanHysteresis,
     #[serde(default)]
@@ -245,6 +250,7 @@ impl ApplyRequest {
             fan_curves: (profile.apply_fan_curve || needs_protected_curve)
                 .then_some(profile.fan_curves),
             undervolt: profile.apply_undervolt.then_some(profile.cpu_co),
+            cpu_temp_limit: profile.cpu_temp_limit,
             fan_hysteresis: FanHysteresis {
                 up: profile.fan_hysteresis_up,
                 down: profile.fan_hysteresis_down,
@@ -292,6 +298,9 @@ impl ApplyRequest {
             .is_some_and(|offset| !(-40..=0).contains(&offset))
         {
             return Err("Curve Optimizer offset must be between -40 and 0".into());
+        }
+        if !(80..=99).contains(&self.cpu_temp_limit) {
+            return Err("APU temperature limit must be between 80 and 99°C".into());
         }
         Ok(())
     }
@@ -489,6 +498,10 @@ mod tests {
         profile.fppt = 120;
         let request = ApplyRequest::from_profile(&profile, false);
         assert!(request.validate().is_ok());
+
+        let mut request = request;
+        request.cpu_temp_limit = 79;
+        assert!(request.validate().is_err());
     }
 
     #[test]

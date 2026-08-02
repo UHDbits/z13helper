@@ -57,7 +57,9 @@ For an ordinary or lower-power apply:
    advertised selection is rejected.
 2. Lower/write optional PPT before relaxing prior high-power fan protection.
 3. Install firmware or direct fan control.
-4. Restore the requested undervolt offset.
+4. Restore the requested 80–99°C APU thermal limit through paired Strix Halo
+   Tctl/cHTC SMU commands and verify the effective PM-table value.
+5. Restore the requested undervolt offset last.
 
 When raising PL1 to 80 W or above, step 3 moves before the power write. A fan-setup
 failure abandons the power increase. If a later step fails, the daemon attempts

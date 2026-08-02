@@ -66,7 +66,9 @@ mode, so untouched profiles restore their measured per-PPD five-value table.
 
 Each apply is validated and serialized by `z13helperd`. PPD selects the firmware
 power policy, after which the daemon applies optional PPT, two eight-point fan
-curves, and undervolt state in a fail-closed order. A PL1
+curves, an 80–99°C per-profile APU thermal limit, and undervolt state in a
+fail-closed order. The thermal limit sets both Strix Halo Tctl (MP1 `0x19`) and
+cHTC (MP1 `0x63`), then verifies the effective Tctl value from the PM table. A PL1
 at 80 W or above is permitted only after fan protection has been prepared; lowering
 power happens before relaxing that protection.
 

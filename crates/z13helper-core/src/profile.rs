@@ -32,10 +32,16 @@ pub struct Profile {
     pub factory_fan_curves_loaded: bool,
     pub apply_undervolt: bool,
     pub cpu_co: i32,
+    #[serde(default = "default_cpu_temp_limit")]
+    pub cpu_temp_limit: u8,
 }
 
 pub const fn default_fan_hysteresis() -> u8 {
     3
+}
+
+pub const fn default_cpu_temp_limit() -> u8 {
+    95
 }
 
 fn builtin_ppd(id: &str) -> &'static str {
@@ -156,6 +162,7 @@ impl Profile {
             factory_fan_curves_loaded: false,
             apply_undervolt: false,
             cpu_co: 0,
+            cpu_temp_limit: default_cpu_temp_limit(),
         }
     }
 
@@ -179,6 +186,7 @@ impl Profile {
         self.factory_fan_curves_loaded = false;
         self.apply_undervolt = false;
         self.cpu_co = 0;
+        self.cpu_temp_limit = default_cpu_temp_limit();
     }
 }
 
@@ -201,6 +209,7 @@ mod tests {
         profile.fan_curves[0][0] = [1, 2];
         profile.apply_undervolt = true;
         profile.cpu_co = -20;
+        profile.cpu_temp_limit = 80;
         profile.factory_defaults();
         assert_eq!(profile, Profile::builtin("silent", "Silent"));
     }
@@ -211,5 +220,14 @@ mod tests {
             let curves = stock_fan_curves(Some(ppd));
             assert_ne!(curves[0], curves[1]);
         }
+    }
+
+    #[test]
+    fn factory_apu_temperature_limit_is_95c() {
+        let mut profile = Profile::builtin("balanced", "Balanced");
+        assert_eq!(profile.cpu_temp_limit, 95);
+        profile.cpu_temp_limit = 80;
+        profile.factory_defaults();
+        assert_eq!(profile.cpu_temp_limit, 95);
     }
 }

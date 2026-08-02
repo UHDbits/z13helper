@@ -20,6 +20,7 @@ pub trait Daemon {
         effective_pl1: u32,
     ) -> Result<(), DaemonError>;
     fn fans_release(&mut self) -> Result<(), DaemonError>;
+    fn cpu_temp_limit_set(&mut self, temperature_c: u8) -> Result<(), DaemonError>;
     fn undervolt_set(&mut self, cpu_co: i32) -> Result<(), DaemonError>;
     fn undervolt_available(&self) -> bool;
 }
@@ -77,10 +78,14 @@ pub fn apply_request(
         }
     }
 
-    if let Some(offset) = request.undervolt {
-        if daemon.undervolt_available() {
+    if daemon.undervolt_available() {
+        daemon.cpu_temp_limit_set(request.cpu_temp_limit)?;
+        if let Some(offset) = request.undervolt {
             daemon.undervolt_set(offset)?;
-        } else {
+        }
+    } else {
+        warnings.push("ryzen_smu is unavailable; APU temperature limit was not applied".into());
+        if request.undervolt.is_some() {
             warnings.push("ryzen_smu is unavailable; undervolt was not applied".into());
         }
     }
@@ -133,6 +138,9 @@ mod tests {
         }
         fn fans_release(&mut self) -> Result<(), DaemonError> {
             self.call("fans-release")
+        }
+        fn cpu_temp_limit_set(&mut self, temperature_c: u8) -> Result<(), DaemonError> {
+            self.call(format!("cpu-temp:{temperature_c}"))
         }
         fn undervolt_set(&mut self, offset: i32) -> Result<(), DaemonError> {
             self.call(format!("undervolt:{offset}"))
@@ -192,6 +200,25 @@ mod tests {
         let fan = calls.iter().position(|v| v == "firmware-fans").unwrap();
         let tdp = calls.iter().position(|v| v.starts_with("tdp:")).unwrap();
         assert!(tdp < fan);
+    }
+
+    #[test]
+    fn temperature_limit_is_applied_before_undervolt() {
+        let mut request = request(60);
+        request.cpu_temp_limit = 88;
+        request.undervolt = Some(-10);
+        let mut daemon = RecordingDaemon {
+            uv: true,
+            ..Default::default()
+        };
+        apply_request(&mut daemon, &request).unwrap();
+        let calls = daemon.calls.into_inner();
+        let temperature = calls.iter().position(|call| call == "cpu-temp:88").unwrap();
+        let undervolt = calls
+            .iter()
+            .position(|call| call == "undervolt:-10")
+            .unwrap();
+        assert!(temperature < undervolt);
     }
 
     #[test]

@@ -17,6 +17,7 @@ switch {
 }
 .warning { color: #FF8000; }
 .fans-split-view > .sidebar-pane { background-color: transparent; }
+scale.undervolt-scale > value.right { margin-left: 6px; }
 .hud {
   background-color: rgba(0, 0, 0, 0.72);
   border-radius: 12px;

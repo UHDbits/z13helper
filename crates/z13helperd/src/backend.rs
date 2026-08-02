@@ -187,6 +187,12 @@ impl Daemon for PlatformHardware {
             .map_err(DaemonError::Rejected)
     }
 
+    fn cpu_temp_limit_set(&mut self, temperature_c: u8) -> Result<(), DaemonError> {
+        self.sysfs
+            .set_cpu_temp_limit(temperature_c)
+            .map_err(DaemonError::Rejected)
+    }
+
     fn undervolt_available(&self) -> bool {
         self.undervolt_available
     }
@@ -298,6 +304,7 @@ impl Backend {
             if request.power_limits.is_some()
                 || request.fan_curves.is_some()
                 || request.undervolt.is_some()
+                || request.cpu_temp_limit != z13helper_core::profile::default_cpu_temp_limit()
             {
                 "custom"
             } else {
@@ -317,6 +324,7 @@ impl Backend {
                 z13helper_core::stock_fan_curves(request.ppd_profile.as_deref())
             }));
         self.persisted.state.fan_control_mode = request.fan_mode;
+        self.persisted.state.cpu_temp_limit = Some(request.cpu_temp_limit);
         self.persisted.state.fan_hysteresis = request.fan_hysteresis;
         self.persisted.state.disable_high_power_fan_protection =
             request.disable_high_power_fan_protection;

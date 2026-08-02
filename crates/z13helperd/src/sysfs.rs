@@ -1,8 +1,13 @@
 use std::fs;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
 
 use z13helper_core::curve::{validate, Curve};
 use z13helper_core::protocol::{BatteryTelemetry, TdpState};
+
+const STRIX_HALO_TCTL_COMMAND: u32 = 0x19;
+const STRIX_HALO_CHTC_COMMAND: u32 = 0x63;
+const STRIX_HALO_TCTL_PM_TABLE_OFFSET: usize = 22 * size_of::<f32>();
 
 #[derive(Clone, Debug)]
 pub struct Sysfs {
@@ -248,14 +253,23 @@ impl Sysfs {
 
     fn send_smu_co(&self, offset: i32) -> Result<(), String> {
         let args = encode_smu_co(offset)?;
+        self.send_smu_command(0x4C, args, "Curve Optimizer")
+    }
+
+    fn send_smu_command(
+        &self,
+        command: u32,
+        args: [u8; 24],
+        operation: &str,
+    ) -> Result<(), String> {
         fs::write(self.smu_path("smu_args"), args)
             .map_err(|error| format!("write smu_args: {error}"))?;
-        fs::write(self.smu_path("mp1_smu_cmd"), 0x4Cu32.to_le_bytes())
+        fs::write(self.smu_path("mp1_smu_cmd"), command.to_le_bytes())
             .map_err(|error| format!("write mp1_smu_cmd: {error}"))?;
         let response = fs::read(self.smu_path("mp1_smu_cmd"))
             .map_err(|error| format!("read mp1_smu_cmd: {error}"))?;
         if response.len() < 4 || u32::from_le_bytes(response[..4].try_into().unwrap()) != 1 {
-            return Err("SMU rejected Curve Optimizer command".into());
+            return Err(format!("SMU rejected {operation} command"));
         }
         Ok(())
     }
@@ -266,6 +280,25 @@ impl Sysfs {
 
     pub fn set_undervolt(&self, offset: i32) -> Result<(), String> {
         self.send_smu_co(offset)
+    }
+
+    pub fn set_cpu_temp_limit(&self, temperature_c: u8) -> Result<(), String> {
+        let args = encode_smu_temp_limit(temperature_c)?;
+        self.send_smu_command(STRIX_HALO_TCTL_COMMAND, args, "APU Tctl limit")?;
+        self.send_smu_command(STRIX_HALO_CHTC_COMMAND, args, "APU cHTC limit")?;
+        let effective = self.read_cpu_temp_limit()?;
+        if effective != temperature_c {
+            return Err(format!(
+                "APU temperature-limit verification failed: requested {temperature_c}°C, firmware reports {effective}°C"
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_cpu_temp_limit(&self) -> Result<u8, String> {
+        let table = fs::read(self.smu_path("pm_table"))
+            .map_err(|error| format!("read SMU PM table: {error}"))?;
+        decode_strix_halo_tctl(&table)
     }
 }
 
@@ -285,6 +318,31 @@ fn encode_smu_co(offset: i32) -> Result<[u8; 24], String> {
     let mut args = [0u8; 24];
     args[..4].copy_from_slice(&encoded.to_le_bytes());
     Ok(args)
+}
+
+fn encode_smu_temp_limit(temperature_c: u8) -> Result<[u8; 24], String> {
+    if !(80..=99).contains(&temperature_c) {
+        return Err("APU temperature limit must be between 80 and 99°C".into());
+    }
+    let mut args = [0u8; 24];
+    args[..4].copy_from_slice(&u32::from(temperature_c).to_le_bytes());
+    Ok(args)
+}
+
+fn decode_strix_halo_tctl(table: &[u8]) -> Result<u8, String> {
+    let end = STRIX_HALO_TCTL_PM_TABLE_OFFSET + size_of::<f32>();
+    let bytes: [u8; 4] = table
+        .get(STRIX_HALO_TCTL_PM_TABLE_OFFSET..end)
+        .ok_or_else(|| "SMU PM table is too short to verify the APU temperature limit".to_string())?
+        .try_into()
+        .expect("slice length was checked above");
+    let temperature = f32::from_le_bytes(bytes);
+    if !temperature.is_finite() || !(0.0..=255.0).contains(&temperature) {
+        return Err(format!(
+            "SMU PM table returned invalid Tctl limit {temperature}"
+        ));
+    }
+    Ok(temperature.round() as u8)
 }
 
 #[cfg(test)]
@@ -490,5 +548,23 @@ mod tests {
         assert_eq!(&bytes[..4], &0x000F_FFECu32.to_le_bytes());
         assert!(bytes[4..].iter().all(|byte| *byte == 0));
         assert!(encode_smu_co(-41).is_err());
+    }
+
+    #[test]
+    fn smu_temperature_limit_uses_celsius_as_first_argument() {
+        let bytes = encode_smu_temp_limit(88).unwrap();
+        assert_eq!(&bytes[..4], &88u32.to_le_bytes());
+        assert!(bytes[4..].iter().all(|byte| *byte == 0));
+        assert!(encode_smu_temp_limit(79).is_err());
+        assert!(encode_smu_temp_limit(100).is_err());
+    }
+
+    #[test]
+    fn strix_halo_tctl_is_read_from_pm_table_index_22() {
+        let mut table = vec![0u8; 4096];
+        table[STRIX_HALO_TCTL_PM_TABLE_OFFSET..STRIX_HALO_TCTL_PM_TABLE_OFFSET + 4]
+            .copy_from_slice(&99.0f32.to_le_bytes());
+        assert_eq!(decode_strix_halo_tctl(&table).unwrap(), 99);
+        assert!(decode_strix_halo_tctl(&table[..88]).is_err());
     }
 }

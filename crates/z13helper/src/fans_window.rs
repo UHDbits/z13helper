@@ -163,7 +163,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
 
     let restore = gtk::Button::with_label("Restore Factory Defaults");
     restore.set_tooltip_text(Some(
-        "Reset Silent, Balanced, Turbo (or the selected custom) to stock power, fans, and undervolt.",
+        "Reset Silent, Balanced, Turbo (or the selected custom) to stock power, fans, APU temperature, and undervolt.",
     ));
 
     let fan_toggle = gtk::CheckButton::with_label("Apply custom fan curve");
@@ -230,6 +230,8 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let uv_probe = advanced.1.clone();
     let apply_uv_probe = advanced.2.clone();
     let manual_uv_probe = advanced.3.clone();
+    let undervolt_note_probe = advanced.4.clone();
+    let cpu_temp_probe = advanced.5.clone();
     worker::blocking(
         move || manual_probe.get_state(),
         move |result| match result {
@@ -240,6 +242,8 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                 uv_probe.set_sensitive(status.undervolt_available);
                 apply_uv_probe.set_sensitive(status.undervolt_available);
                 manual_uv_probe.set_sensitive(status.undervolt_available);
+                cpu_temp_probe.set_sensitive(status.undervolt_available);
+                undervolt_note_probe.set_visible(!status.undervolt_available);
                 sync_ppd_choices(&ppd_probe, &status.capabilities.ppd_profiles, &state_probe);
                 direct_probe.set_sensitive(status.capabilities.direct_fans);
                 hysteresis_up_probe.set_sensitive(
@@ -275,6 +279,8 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                 uv_probe.set_sensitive(false);
                 apply_uv_probe.set_sensitive(false);
                 manual_uv_probe.set_sensitive(false);
+                cpu_temp_probe.set_sensitive(false);
+                undervolt_note_probe.set_visible(false);
                 status_probe.set_label(&format!("z13helperd unavailable: {error}"));
             }
         },
@@ -395,6 +401,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let apply_power = cpu.4.clone();
     let uv_scale = advanced.1.clone();
     let apply_uv = advanced.2.clone();
+    let cpu_temp_limit = advanced.5.clone();
     let editors = Rc::new(ProfileEditorView {
         fans: FanEditorView {
             first: editor.clone(),
@@ -415,6 +422,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         undervolt: UndervoltEditorView {
             value: uv_scale.clone(),
             enabled: apply_uv.clone(),
+            cpu_temp_limit,
         },
         loading: loading.clone(),
     });
@@ -534,7 +542,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             .active()
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "selected profile".into());
-        let body = format!("Reset “{name}” power, fan, and undervolt settings?");
+        let body = format!("Reset “{name}” power, fan, APU temperature, and undervolt settings?");
         let dialog = adw::AlertDialog::new(Some("Restore Factory Defaults?"), Some(&body));
         dialog.add_response("cancel", "Cancel");
         dialog.add_response("restore", "Restore");
@@ -796,9 +804,9 @@ fn build_cpu_page(
             .unwrap_or(false),
     );
 
-    let spl = slider_row("SPL (CPU sustained)", pl1, 5, 93);
-    let sppt = slider_row("sPPT (CPU long boost)", pl2, 5, 93);
-    let fppt = slider_row("fPPT (CPU short boost)", pl3, 5, 120);
+    let spl = sidebar_slider_row("SPL (CPU sustained)", pl1, 5, 93);
+    let sppt = sidebar_slider_row("sPPT (CPU long boost)", pl2, 5, 93);
+    let fppt = sidebar_slider_row("fPPT (CPU short boost)", pl3, 5, 120);
     power_group.add(&spl.0);
     power_group.add(&sppt.0);
     power_group.add(&fppt.0);
@@ -911,7 +919,14 @@ fn build_advanced_page(
     parent: &adw::Window,
     first_editor: &CurveEditor,
     second_editor: &CurveEditor,
-) -> (gtk::Box, gtk::Scale, gtk::CheckButton, gtk::Button) {
+) -> (
+    gtk::Box,
+    gtk::Scale,
+    gtk::CheckButton,
+    gtk::Button,
+    gtk::Label,
+    gtk::Scale,
+) {
     let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     page.set_margin_top(12);
     page.set_margin_bottom(12);
@@ -941,10 +956,10 @@ fn build_advanced_page(
     uv.set_draw_value(true);
     uv.set_value_pos(gtk::PositionType::Right);
     uv.set_digits(0);
+    uv.add_css_class("undervolt-scale");
     uv.set_hexpand(true);
-    uv.set_margin_start(12);
-    uv.set_margin_end(12);
-    uv.set_margin_bottom(8);
+    uv.set_margin_start(0);
+    uv.set_margin_end(0);
     uv.set_value(
         state
             .config
@@ -953,38 +968,54 @@ fn build_advanced_page(
             .map(|p| p.cpu_co)
             .unwrap_or(0) as f64,
     );
-    let uv_row = adw::ActionRow::builder()
-        .title("All-core Curve Optimizer")
-        .subtitle("Drag the slider below")
-        .build();
-    group.add(&uv_row);
     page.append(&group);
     page.append(&uv);
 
     let uv_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     uv_actions.set_margin_start(12);
     uv_actions.set_margin_end(12);
+    uv_actions.set_hexpand(true);
+    uv_actions.set_homogeneous(true);
     let manual_apply = gtk::Button::with_label("Apply");
+    manual_apply.set_halign(gtk::Align::Start);
     manual_apply.set_tooltip_text(Some(
         "Test this Curve Optimizer offset once without enabling Auto Apply.",
     ));
     manual_apply.update_property(&[gtk::accessible::Property::Label("Apply undervolt once")]);
-    uv_actions.append(&apply_uv);
+    apply_uv.set_halign(gtk::Align::End);
     uv_actions.append(&manual_apply);
+    uv_actions.append(&apply_uv);
     page.append(&uv_actions);
 
-    let note = gtk::Label::new(Some(
-        "If undervolt controls stay disabled, ryzen_smu (amkillam fork) is not loaded.",
-    ));
+    let note = gtk::Label::new(Some("Disabled because ryzen_smu is not loaded."));
     note.set_wrap(true);
     note.set_xalign(0.0);
+    note.set_visible(false);
     page.append(&note);
+
+    let temperature_group = adw::PreferencesGroup::builder()
+        .title("APU Temperature Limit")
+        .description("Sets the paired Strix Halo Tctl and cHTC thermal limits for this profile.")
+        .build();
+    let cpu_temp_limit = slider_row(
+        "Temperature limit (°C)",
+        state
+            .config
+            .borrow()
+            .active()
+            .map(|profile| u32::from(profile.cpu_temp_limit))
+            .unwrap_or(95),
+        80,
+        99,
+    );
+    temperature_group.add(&cpu_temp_limit.0);
+    page.append(&temperature_group);
 
     let protection_group = adw::PreferencesGroup::builder()
         .title("High-Power Fan Protection")
         .description(
-            "At 80 W and above, point 7 is locked to 80°C and at least 80%, and point 8 to \
-             90°C and 100%. Disabling this removes that safety constraint.",
+            "At 80 W and above, the fan is locked at higher speeds at 80°C or above. \
+             Disabling this removes that safety constraint.",
         )
         .build();
     let disable_protection = gtk::CheckButton::with_label("Disable high-power fan protection");
@@ -1051,7 +1082,24 @@ fn build_advanced_page(
         uv.set_sensitive(available);
         apply_uv.set_sensitive(available);
         manual_apply.set_sensitive(available);
+        cpu_temp_limit.1.set_sensitive(available);
+        note.set_visible(!available);
     }
+
+    let state_temperature = state.clone();
+    let editing_temperature = editing_id.clone();
+    let loading_temperature = loading.clone();
+    let apply_schedule_temperature = apply_schedule.clone();
+    cpu_temp_limit.1.connect_value_changed(move |scale| {
+        if loading_temperature.active() {
+            return;
+        }
+        let id = editing_temperature.borrow().clone();
+        if let Some(profile) = state_temperature.config.borrow_mut().find_mut(&id) {
+            profile.cpu_temp_limit = scale.value() as u8;
+        }
+        schedule_apply(&state_temperature, &apply_schedule_temperature);
+    });
 
     let state_uv = state.clone();
     let apply_uv_c = apply_uv.clone();
@@ -1119,7 +1167,7 @@ fn build_advanced_page(
         );
     });
 
-    (page, uv, apply_uv, manual_apply)
+    (page, uv, apply_uv, manual_apply, note, cpu_temp_limit.1)
 }
 
 fn schedule_apply(state: &Rc<AppState>, schedule: &ApplySchedule) {
@@ -1166,6 +1214,7 @@ struct PowerEditorView {
 struct UndervoltEditorView {
     value: gtk::Scale,
     enabled: gtk::CheckButton,
+    cpu_temp_limit: gtk::Scale,
 }
 
 impl ProfileEditorView {
@@ -1214,6 +1263,9 @@ impl ProfileEditorView {
             );
             self.undervolt.value.set_value(profile.cpu_co as f64);
             self.undervolt.enabled.set_active(profile.apply_undervolt);
+            self.undervolt
+                .cpu_temp_limit
+                .set_value(f64::from(profile.cpu_temp_limit));
         });
     }
 }
@@ -1260,9 +1312,23 @@ fn install_ordering(pl1: &gtk::Scale, pl2: &gtk::Scale, pl3: &gtk::Scale, loadin
 }
 
 fn slider_row(title: &str, initial: u32, min: u32, max: u32) -> (gtk::Box, gtk::Scale) {
+    slider_row_with_margin(title, initial, min, max, 12)
+}
+
+fn sidebar_slider_row(title: &str, initial: u32, min: u32, max: u32) -> (gtk::Box, gtk::Scale) {
+    slider_row_with_margin(title, initial, min, max, 4)
+}
+
+fn slider_row_with_margin(
+    title: &str,
+    initial: u32,
+    min: u32,
+    max: u32,
+    horizontal_margin: i32,
+) -> (gtk::Box, gtk::Scale) {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    row.set_margin_start(12);
-    row.set_margin_end(12);
+    row.set_margin_start(horizontal_margin);
+    row.set_margin_end(horizontal_margin);
     let label = gtk::Label::new(Some(title));
     label.set_xalign(0.0);
     row.append(&label);
