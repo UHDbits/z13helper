@@ -144,7 +144,28 @@ impl AppState {
         if window.is_visible() {
             window.set_visible(false);
         } else {
-            window.present();
+            present_from_hardware_button(window);
         }
     }
+}
+
+fn present_from_hardware_button(window: &adw::ApplicationWindow) {
+    window.present();
+
+    // The surface may not be mapped until the next main-loop iteration. Once
+    // it exists, repeat the explicit toplevel focus request so an opened
+    // window is raised instead of remaining underneath another application.
+    let window = window.downgrade();
+    glib::idle_add_local_once(move || {
+        let Some(window) = window.upgrade() else {
+            return;
+        };
+        let Some(surface) = window.surface() else {
+            return;
+        };
+        let Ok(toplevel) = surface.downcast::<gdk4::Toplevel>() else {
+            return;
+        };
+        toplevel.focus(gdk4::CURRENT_TIME);
+    });
 }
