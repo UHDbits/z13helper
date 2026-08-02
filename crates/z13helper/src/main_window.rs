@@ -127,7 +127,6 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
 
     // --- Display ---
     let display = adw::PreferencesGroup::builder().title("Display").build();
-    display.set_margin_top(-4);
     let overdrive = make_switch();
     let od_row = adw::ActionRow::builder().title("Panel Overdrive").build();
     od_row.add_suffix(&overdrive);
@@ -534,10 +533,16 @@ fn lighting_section(
     modes.set_tooltip_text(Some("Lighting mode"));
     controls.append(&modes);
 
-    let color = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+    let fallback_dialog = gtk::ColorDialog::builder()
+        .title("Choose Lighting Color")
+        .modal(true)
+        .with_alpha(false)
+        .build();
+    let color = gtk::ColorDialogButton::new(Some(fallback_dialog));
     color.set_valign(gtk::Align::Center);
     color.set_size_request(64, -1);
     color.set_tooltip_text(Some("Lighting color"));
+    install_color_chooser(&color);
     let color_control = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     color_control.append(&color);
     controls.append(&color_control);
@@ -589,6 +594,86 @@ fn lighting_section(
     speed.set_visible(false);
 
     LightingSection { root, view }
+}
+
+// GtkColorDialog intentionally does not expose its window or sizing. Use the
+// application-owned chooser here so it remains transient for the z13helper
+// window, opens at the size needed by the custom editor, and omits alpha.
+#[allow(deprecated)]
+fn install_color_chooser(button: &gtk::ColorDialogButton) {
+    // GtkColorDialogButton runs its built-in activation before regular signal
+    // handlers. Claim pointer activation during capture so only our
+    // application-owned transient is opened.
+    let click = gtk::GestureClick::new();
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    click.connect_pressed(|gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    let color_button = button.clone();
+    click.connect_released(move |gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        present_color_chooser(&color_button);
+    });
+    button.add_controller(click);
+}
+
+#[allow(deprecated)]
+fn present_color_chooser(button: &gtk::ColorDialogButton) {
+    let Some(parent) = button.root().and_downcast::<gtk::Window>() else {
+        return;
+    };
+    let dialog = gtk::ColorChooserDialog::new(Some("Choose Lighting Color"), Some(&parent));
+    dialog.set_modal(true);
+    dialog.set_resizable(false);
+    dialog.set_use_alpha(false);
+    dialog.set_rgba(&button.rgba().with_alpha(1.0));
+    connect_color_chooser_response(&dialog, button);
+
+    // Wayland does not let clients reposition a mapped transient after its
+    // contents resize. Remap the larger editor as a fresh transient instead;
+    // KWin then centers both sizes independently.
+    let color_button = button.clone();
+    dialog.connect_show_editor_notify(move |dialog| {
+        if dialog.shows_editor() {
+            let initial = dialog.rgba().with_alpha(1.0);
+            dialog.close();
+            present_custom_color_editor(&color_button, &initial);
+        }
+    });
+    dialog.present();
+}
+
+#[allow(deprecated)]
+fn present_custom_color_editor(button: &gtk::ColorDialogButton, initial: &gtk::gdk::RGBA) {
+    let Some(parent) = button.root().and_downcast::<gtk::Window>() else {
+        return;
+    };
+    let dialog = gtk::ColorChooserDialog::new(Some("Choose Lighting Color"), Some(&parent));
+    dialog.set_modal(true);
+    dialog.set_resizable(false);
+    dialog.set_size_request(340, 420);
+    dialog.set_use_alpha(false);
+    dialog.set_rgba(initial);
+    // Select the editor before mapping. Its reported natural size only covers
+    // the scrollable viewport, so retain a compact minimum that fits all of
+    // the editor controls without restoring the previous oversized panel.
+    dialog.set_show_editor(true);
+    connect_color_chooser_response(&dialog, button);
+    dialog.present();
+}
+
+#[allow(deprecated)]
+fn connect_color_chooser_response(
+    dialog: &gtk::ColorChooserDialog,
+    button: &gtk::ColorDialogButton,
+) {
+    let color_button = button.clone();
+    dialog.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Ok {
+            color_button.set_rgba(&dialog.rgba().with_alpha(1.0));
+        }
+        dialog.close();
+    });
 }
 
 fn send_lighting_intent(state: &Rc<AppState>, view: &LightingView, device: &'static str) {
