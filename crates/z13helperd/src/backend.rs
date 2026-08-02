@@ -439,6 +439,9 @@ impl Backend {
         if let Ok(limit) = self.hardware.sysfs.battery_limit() {
             self.persisted.state.battery_limit = Some(limit);
         }
+        if let Ok(battery) = self.hardware.sysfs.battery_telemetry() {
+            self.persisted.state.battery = battery;
+        }
         if let Ok(value) = self.hardware.sysfs.read_armoury_bool("panel_overdrive") {
             self.persisted.state.panel_overdrive = Some(value);
         }

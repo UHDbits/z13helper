@@ -122,6 +122,14 @@ pub struct Telemetry {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BatteryTelemetry {
+    pub charge_percent: Option<u8>,
+    pub status: Option<String>,
+    #[serde(default)]
+    pub power_microwatts: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Health {
     pub degraded: bool,
     pub warnings: Vec<String>,
@@ -145,6 +153,8 @@ pub struct DaemonState {
     pub devices: Option<HashMap<String, LightingState>>,
     #[serde(default)]
     pub battery_limit: Option<i32>,
+    #[serde(default)]
+    pub battery: BatteryTelemetry,
     #[serde(default)]
     pub boot_sound: Option<i32>,
     #[serde(default)]
@@ -197,6 +207,7 @@ impl Default for DaemonState {
             },
             devices: None,
             battery_limit: None,
+            battery: BatteryTelemetry::default(),
             boot_sound: None,
             panel_overdrive: None,
             fan_curves: None,

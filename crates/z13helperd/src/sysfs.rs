@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use z13helper_core::curve::{validate, Curve};
 use z13helper_core::profile::Base;
-use z13helper_core::protocol::TdpState;
+use z13helper_core::protocol::{BatteryTelemetry, TdpState};
 
 const STOCK_QUIET: TdpState = TdpState {
     pl1_spl: 40,
@@ -227,6 +227,43 @@ impl Sysfs {
         Err("battery charge threshold not found".into())
     }
 
+    pub fn battery_telemetry(&self) -> Result<BatteryTelemetry, String> {
+        let directory = self.path("/sys/class/power_supply");
+        for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
+            if !entry.file_name().to_string_lossy().starts_with("BAT") {
+                continue;
+            }
+            let charge_percent = self
+                .read_text(entry.path().join("capacity"))?
+                .parse::<u8>()
+                .map_err(|error| format!("parse battery capacity: {error}"))?;
+            if charge_percent > 100 {
+                return Err(format!(
+                    "battery capacity must be between 0 and 100, got {charge_percent}"
+                ));
+            }
+            let status = self.read_text(entry.path().join("status"))?;
+            let read_measurement = |name: &str| {
+                self.read_text(entry.path().join(name))
+                    .ok()?
+                    .parse::<i64>()
+                    .ok()
+                    .map(i64::unsigned_abs)
+            };
+            let power_microwatts = read_measurement("power_now").or_else(|| {
+                let current = read_measurement("current_now")?;
+                let voltage = read_measurement("voltage_now")?;
+                current.checked_mul(voltage).map(|value| value / 1_000_000)
+            });
+            return Ok(BatteryTelemetry {
+                charge_percent: Some(charge_percent),
+                status: (!status.is_empty()).then_some(status),
+                power_microwatts,
+            });
+        }
+        Err("battery telemetry not found".into())
+    }
+
     pub fn set_battery_limit(&self, limit: i32) -> Result<(), String> {
         if !(40..=100).contains(&limit) {
             return Err("battery limit must be between 40 and 100".into());
@@ -333,6 +370,26 @@ mod tests {
     #[test]
     fn battery_limit_is_clamped_by_validation() {
         assert!(Sysfs::new(root()).set_battery_limit(39).is_err());
+    }
+
+    #[test]
+    fn reads_battery_charge_and_status() {
+        let root = root();
+        let battery = root.join("class/power_supply/BAT0");
+        fs::create_dir_all(&battery).unwrap();
+        fs::write(battery.join("capacity"), "72\n").unwrap();
+        fs::write(battery.join("status"), "Discharging\n").unwrap();
+        fs::write(battery.join("power_now"), "14500000\n").unwrap();
+
+        assert_eq!(
+            Sysfs::new(&root).battery_telemetry().unwrap(),
+            BatteryTelemetry {
+                charge_percent: Some(72),
+                status: Some("Discharging".into()),
+                power_microwatts: Some(14_500_000),
+            }
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

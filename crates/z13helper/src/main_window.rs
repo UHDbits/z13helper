@@ -204,20 +204,34 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     batt_hint.set_xalign(0.0);
     batt_titles.append(&batt_title);
     batt_titles.append(&batt_hint);
-    let full = gtk::Button::with_label("100%");
-    full.add_css_class("flat");
-    full.set_tooltip_text(Some("Set charge limit to 100%"));
+    let battery_status = gtk::Label::new(Some("—"));
+    battery_status.add_css_class("dim-label");
+    battery_status.set_xalign(1.0);
     batt_header.append(&batt_icon);
     batt_header.append(&batt_titles);
-    batt_header.append(&full);
+    batt_header.append(&battery_status);
     battery.append(&batt_header);
 
+    let limit_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let limit = gtk::Scale::with_range(gtk::Orientation::Horizontal, 40.0, 100.0, 5.0);
     limit.set_draw_value(false);
     limit.set_hexpand(true);
     limit.set_digits(0);
     limit.set_round_digits(0);
-    battery.append(&limit);
+    let full = gtk::Button::with_label("100%");
+    full.add_css_class("pill");
+    full.set_valign(gtk::Align::Center);
+    full.set_size_request(64, -1);
+    full.set_tooltip_text(Some("Set charge limit to 100%"));
+    limit_row.append(&limit);
+    limit_row.append(&full);
+    battery.append(&limit_row);
+
+    let battery_charge = gtk::Label::new(Some("Charge: —%"));
+    battery_charge.add_css_class("dim-label");
+    battery_charge.add_css_class("caption");
+    battery_charge.set_halign(gtk::Align::End);
+    battery.append(&battery_charge);
     content.append(&battery);
 
     install_battery_debounce(state, &limit, &sync);
@@ -259,7 +273,9 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     let view = MainView {
         settings: SettingsView {
             overdrive,
-            battery: limit,
+            battery_limit: limit,
+            battery_charge,
+            battery_status,
             boot,
             lightbar: lightbar.view,
             keyboard: keyboard.view,
@@ -289,7 +305,9 @@ struct MainView {
 #[derive(Clone)]
 struct SettingsView {
     overdrive: gtk::Switch,
-    battery: gtk::Scale,
+    battery_limit: gtk::Scale,
+    battery_charge: gtk::Label,
+    battery_status: gtk::Label,
     boot: gtk::CheckButton,
     lightbar: LightingView,
     keyboard: LightingView,
@@ -332,8 +350,18 @@ impl SettingsView {
             self.overdrive.set_state(value != 0);
         }
         if let Some(value) = daemon.battery_limit {
-            self.battery.set_value(value.clamp(40, 100) as f64);
+            self.battery_limit.set_value(value.clamp(40, 100) as f64);
         }
+        self.battery_charge.set_label(
+            &daemon
+                .battery
+                .charge_percent
+                .map_or_else(|| "Charge: —%".into(), |value| format!("Charge: {value}%")),
+        );
+        self.battery_status.set_label(&battery_status_label(
+            daemon.battery.status.as_deref(),
+            daemon.battery.power_microwatts,
+        ));
         if let Some(value) = daemon.boot_sound {
             self.boot.set_active(value != 0);
         }
@@ -390,6 +418,14 @@ impl ModeView {
             daemon.fan_rpms[1]
         ));
     }
+}
+
+fn battery_status_label(status: Option<&str>, power_microwatts: Option<u64>) -> String {
+    let status = status.filter(|status| !status.is_empty()).unwrap_or("—");
+    power_microwatts.map_or_else(
+        || status.into(),
+        |power| format!("{status}: {:.1} W", power as f64 / 1_000_000.0),
+    )
 }
 
 fn make_switch() -> gtk::Switch {
@@ -646,4 +682,19 @@ fn current_label(state: &AppState) -> String {
 fn select_profile(state: &Rc<AppState>, id: &str) {
     state.config.borrow_mut().active_profile = id.into();
     state.apply_active(false);
+}
+
+#[cfg(test)]
+mod battery_tests {
+    use super::battery_status_label;
+
+    #[test]
+    fn formats_status_with_live_power() {
+        assert_eq!(
+            battery_status_label(Some("Charging"), Some(14_500_000)),
+            "Charging: 14.5 W"
+        );
+        assert_eq!(battery_status_label(Some("Full"), Some(0)), "Full: 0.0 W");
+        assert_eq!(battery_status_label(None, None), "—");
+    }
 }
