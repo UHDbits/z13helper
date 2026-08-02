@@ -15,6 +15,7 @@ use crate::ui::sync::SyncGuard;
 
 pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let window = adw::Window::builder()
+        .application(&state.app)
         .transient_for(parent)
         .title("Fans + Power")
         .default_width(920)

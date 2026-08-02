@@ -127,8 +127,10 @@ assistive technology. Ctrl+W closes the active auxiliary window or hides the
 main window. Ctrl+Q closes auxiliary windows and hides the main window without
 terminating the resident UI process, allowing the hardware button to present
 it again. The main title-bar close button follows the same hide behavior.
-Window headers expose close controls without minimize controls. Icon-only and
-profile action buttons expose explicit accessible names and tooltips.
+Auxiliary windows are registered with the GTK application so these accelerators
+and active-window routing apply consistently. Window headers expose close
+controls without minimize controls. Icon-only and profile action buttons expose
+explicit accessible names and tooltips.
 
 ## Lifecycle and packaging
 
