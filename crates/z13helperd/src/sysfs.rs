@@ -2,30 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use z13helper_core::curve::{validate, Curve};
-use z13helper_core::profile::Base;
 use z13helper_core::protocol::{BatteryTelemetry, TdpState};
-
-const STOCK_QUIET: TdpState = TdpState {
-    pl1_spl: 40,
-    pl2_sppt: 55,
-    fppt: 55,
-    apu_sppt: 70,
-    platform_sppt: 70,
-};
-const STOCK_BALANCED: TdpState = TdpState {
-    pl1_spl: 52,
-    pl2_sppt: 71,
-    fppt: 70,
-    apu_sppt: 70,
-    platform_sppt: 70,
-};
-const STOCK_PERFORMANCE: TdpState = TdpState {
-    pl1_spl: 70,
-    pl2_sppt: 86,
-    fppt: 86,
-    apu_sppt: 70,
-    platform_sppt: 70,
-};
 
 #[derive(Clone, Debug)]
 pub struct Sysfs {
@@ -74,65 +51,6 @@ impl Sysfs {
         Ok(())
     }
 
-    fn profile_devices(&self) -> Vec<PathBuf> {
-        let directory = self.path("/sys/class/platform-profile");
-        fs::read_dir(directory)
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.join("profile").exists())
-            .collect()
-    }
-
-    fn supports_profile(&self, directory: &Path, name: &str) -> bool {
-        self.read_text(directory.join("choices"))
-            .map(|choices| choices.split_whitespace().any(|choice| choice == name))
-            .unwrap_or(false)
-    }
-
-    pub fn read_base(&self) -> Result<Base, String> {
-        let preferred = self
-            .profile_devices()
-            .into_iter()
-            .find(|path| self.supports_profile(path, "quiet"))
-            .map(|path| path.join("profile"))
-            .unwrap_or_else(|| self.path("/sys/firmware/acpi/platform_profile"));
-        let value = self.read_text(preferred)?;
-        Base::from_str_lossy(&value)
-            .ok_or_else(|| format!("unsupported platform profile {value:?}"))
-    }
-
-    pub fn set_base(&self, base: Base) -> Result<(), String> {
-        let devices = self.profile_devices();
-        if devices.is_empty() {
-            return self.write_text(
-                self.path("/sys/firmware/acpi/platform_profile"),
-                base.as_str(),
-            );
-        }
-        for directory in &devices {
-            let name = if base == Base::Quiet
-                && !self.supports_profile(directory, "quiet")
-                && self.supports_profile(directory, "low-power")
-            {
-                "low-power"
-            } else {
-                base.as_str()
-            };
-            self.write_text(directory.join("profile"), name)?;
-        }
-        Ok(())
-    }
-
-    pub fn stock_tdp(base: Base) -> TdpState {
-        match base {
-            Base::Quiet => STOCK_QUIET,
-            Base::Balanced => STOCK_BALANCED,
-            Base::Performance => STOCK_PERFORMANCE,
-        }
-    }
-
     fn ppt_path(&self, name: &str) -> PathBuf {
         self.path("/sys/devices/platform/asus-nb-wmi").join(name)
     }
@@ -150,7 +68,7 @@ impl Sysfs {
         Ok(())
     }
 
-    pub fn read_tdp(&self, base: Base) -> Result<TdpState, String> {
+    pub fn read_tdp(&self) -> Result<TdpState, String> {
         let read = |name: &str| -> Result<i32, String> {
             self.read_text(self.ppt_path(name))?
                 .parse()
@@ -163,11 +81,7 @@ impl Sysfs {
             apu_sppt: read("ppt_apu_sppt")?,
             platform_sppt: read("ppt_platform_sppt")?,
         };
-        Ok(if state.pl1_spl == 5 {
-            Self::stock_tdp(base)
-        } else {
-            state
-        })
+        Ok(state)
     }
 
     fn find_hwmon(&self, name: &str) -> Result<PathBuf, String> {
@@ -364,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_five_watt_read_uses_stock_table() {
+    fn reads_five_watt_tdp_without_inventing_a_platform_profile() {
         let root = root();
         let ppt = root.join("devices/platform/asus-nb-wmi");
         fs::create_dir_all(&ppt).unwrap();
@@ -377,10 +291,7 @@ mod tests {
         ] {
             fs::write(ppt.join(name), "5\n").unwrap();
         }
-        assert_eq!(
-            Sysfs::new(&root).read_tdp(Base::Balanced).unwrap(),
-            STOCK_BALANCED
-        );
+        assert_eq!(Sysfs::new(&root).read_tdp().unwrap().pl1_spl, 5);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -420,31 +331,6 @@ mod tests {
     }
 
     #[test]
-    fn writes_every_platform_profile_device_with_quiet_mapping() {
-        let root = root();
-        let profiles = root.join("class/platform-profile");
-        for (device, choices) in [
-            ("cpu", "quiet balanced performance"),
-            ("gpu", "low-power balanced performance"),
-        ] {
-            let directory = profiles.join(device);
-            fs::create_dir_all(&directory).unwrap();
-            fs::write(directory.join("choices"), choices).unwrap();
-            fs::write(directory.join("profile"), "balanced").unwrap();
-        }
-        Sysfs::new(&root).set_base(Base::Quiet).unwrap();
-        assert_eq!(
-            fs::read_to_string(profiles.join("cpu/profile")).unwrap(),
-            "quiet\n"
-        );
-        assert_eq!(
-            fs::read_to_string(profiles.join("gpu/profile")).unwrap(),
-            "low-power\n"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn firmware_curves_write_and_enable_both_fans() {
         let root = root();
         let curve = root.join("class/hwmon/hwmon0");
@@ -456,10 +342,7 @@ mod tests {
         for index in 1..=2 {
             fs::write(readings.join(format!("pwm{index}_enable")), "2\n").unwrap();
         }
-        let curves = [
-            Base::Quiet.stock_fan_curve(),
-            Base::Performance.stock_fan_curve(),
-        ];
+        let curves = z13helper_core::stock_fan_curves(Some("performance"));
         Sysfs::new(&root).set_firmware_curves(&curves).unwrap();
         assert_eq!(
             fs::read_to_string(curve.join("pwm1_auto_point1_temp")).unwrap(),
@@ -467,7 +350,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(curve.join("pwm2_auto_point8_pwm")).unwrap(),
-            "229\n"
+            "242\n"
         );
         assert_eq!(
             fs::read_to_string(curve.join("pwm1_enable")).unwrap(),

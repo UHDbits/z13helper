@@ -6,7 +6,7 @@ use std::rc::Rc;
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use z13helper_core::{Base, FanControlMode, Profile};
+use z13helper_core::{FanControlMode, Profile};
 
 use crate::app::AppState;
 use crate::services::worker;
@@ -83,7 +83,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         .borrow()
         .active()
         .cloned()
-        .unwrap_or_else(|| Profile::builtin("balanced", "Balanced", Base::Balanced));
+        .unwrap_or_else(|| Profile::builtin("balanced", "Balanced"));
     let editor = CurveEditor::new(
         profile.fan_curves[0],
         state.config.borrow().fan_clamp_to_grid,
@@ -196,7 +196,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let manual_probe = state.client.clone();
     let direct_probe = direct_toggle.clone();
     let status_probe = direct_status.clone();
-    let ppd_probe = cpu.6.clone();
+    let ppd_probe = cpu.5.clone();
     let state_probe = state.clone();
     let uv_probe = advanced.1.clone();
     let apply_uv_probe = advanced.2.clone();
@@ -314,11 +314,10 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         schedule_apply(&state_curve, &apply_schedule_curve);
     });
 
-    let base_drop = cpu.1.clone();
-    let spl = cpu.2.clone();
-    let sppt = cpu.3.clone();
-    let fppt = cpu.4.clone();
-    let apply_power = cpu.5.clone();
+    let spl = cpu.1.clone();
+    let sppt = cpu.2.clone();
+    let fppt = cpu.3.clone();
+    let apply_power = cpu.4.clone();
     let uv_scale = advanced.1.clone();
     let apply_uv = advanced.2.clone();
     let editors = Rc::new(ProfileEditorView {
@@ -330,12 +329,11 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             direct_explanation: direct_warning.clone(),
         },
         power: PowerEditorView {
-            base: base_drop.clone(),
             spl: spl.clone(),
             sppt: sppt.clone(),
             fppt: fppt.clone(),
             enabled: apply_power.clone(),
-            ppd: cpu.6.clone(),
+            ppd: cpu.5.clone(),
         },
         undervolt: UndervoltEditorView {
             value: uv_scale.clone(),
@@ -605,7 +603,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     window.present();
 }
 
-/// Returns (page, base_drop, spl, sppt, fppt, apply_power).
+/// Returns (page, spl, sppt, fppt, apply_power, ppd).
 fn build_cpu_page(
     state: &Rc<AppState>,
     editing_id: &Rc<RefCell<String>>,
@@ -613,7 +611,6 @@ fn build_cpu_page(
     apply_schedule: &ApplySchedule,
 ) -> (
     gtk::Box,
-    adw::ComboRow,
     gtk::Scale,
     gtk::Scale,
     gtk::Scale,
@@ -626,26 +623,11 @@ fn build_cpu_page(
     page.set_margin_start(12);
     page.set_margin_end(12);
 
-    let base_group = adw::PreferencesGroup::builder()
+    let ppd_group = adw::PreferencesGroup::builder()
         .title("Power Profile")
-        .description("Platform profile and power-profiles-daemon are independent.")
         .build();
-    let base_drop = adw::ComboRow::new();
-    base_drop.set_title("Base");
-    base_drop.set_model(Some(&gtk::StringList::new(&[
-        Base::Quiet.short_label(),
-        Base::Balanced.short_label(),
-        Base::Performance.short_label(),
-    ])));
-    let base_idx = match state.config.borrow().active().map(|p| p.base) {
-        Some(Base::Quiet) => 0,
-        Some(Base::Performance) => 2,
-        _ => 1,
-    };
-    base_drop.set_selected(base_idx);
-    base_group.add(&base_drop);
     let ppd = adw::ComboRow::new();
-    ppd.set_title("Power Profiles Daemon");
+    ppd.set_title("PPD Profile");
     ppd.set_model(Some(&gtk::StringList::new(&[
         "power-saver",
         "balanced",
@@ -664,8 +646,8 @@ fn build_cpu_page(
         })
         .unwrap_or(3);
     ppd.set_selected(ppd_selected);
-    base_group.add(&ppd);
-    page.append(&base_group);
+    ppd_group.add(&ppd);
+    page.append(&ppd_group);
 
     let power_group = adw::PreferencesGroup::builder()
         .title("Power Limits")
@@ -712,7 +694,6 @@ fn build_cpu_page(
     let update = {
         let state = state.clone();
         let editing = editing_id.clone();
-        let base = base_drop.clone();
         let ppd = ppd.clone();
         let power = apply_power.clone();
         let pl1 = spl.1.clone();
@@ -726,11 +707,6 @@ fn build_cpu_page(
             }
             let id = editing.borrow().clone();
             if let Some(profile) = state.config.borrow_mut().find_mut(&id) {
-                profile.base = match base.selected() {
-                    0 => Base::Quiet,
-                    2 => Base::Performance,
-                    _ => Base::Balanced,
-                };
                 profile.ppd_profile = ppd
                     .selected_item()
                     .and_downcast::<gtk::StringObject>()
@@ -744,10 +720,8 @@ fn build_cpu_page(
             }
         })
     };
-    for drop in [&base_drop, &ppd] {
-        let update = update.clone();
-        drop.connect_selected_notify(move |_| update());
-    }
+    let update_ppd = update.clone();
+    ppd.connect_selected_notify(move |_| update_ppd());
     let update_toggle = update.clone();
     apply_power.connect_toggled(move |_| update_toggle());
     for scale in [&spl.1, &sppt.1, &fppt.1] {
@@ -755,7 +729,7 @@ fn build_cpu_page(
         scale.connect_value_changed(move |_| update());
     }
 
-    (page, base_drop, spl.1, sppt.1, fppt.1, apply_power, ppd)
+    (page, spl.1, sppt.1, fppt.1, apply_power, ppd)
 }
 
 fn build_advanced_page(
@@ -951,7 +925,6 @@ struct FanEditorView {
 }
 
 struct PowerEditorView {
-    base: adw::ComboRow,
     spl: gtk::Scale,
     sppt: gtk::Scale,
     fppt: gtk::Scale,
@@ -978,11 +951,6 @@ impl ProfileEditorView {
             self.fans
                 .direct_explanation
                 .set_visible(profile.fan_control_mode == FanControlMode::Direct);
-            self.power.base.set_selected(match profile.base {
-                Base::Quiet => 0,
-                Base::Balanced => 1,
-                Base::Performance => 2,
-            });
             self.power.spl.set_value(profile.pl1_spl as f64);
             self.power.sppt.set_value(profile.pl2_sppt as f64);
             self.power.fppt.set_value(profile.fppt as f64);

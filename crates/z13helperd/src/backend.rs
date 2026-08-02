@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use z13helper_core::apply::{apply_request, Daemon};
 use z13helper_core::curve::{Curve, TDP_MAX_SAFE};
 use z13helper_core::error::DaemonError;
-use z13helper_core::profile::Base;
 use z13helper_core::protocol::{
     ApplyRequest, ApplyResponse, Capabilities, DaemonState, FanFloorConfig, FloorEnforcement,
     FloorState, Health, LightingState, OverrideState, ProbeReply, TdpState, Telemetry,
@@ -123,13 +122,6 @@ impl PlatformHardware {
 }
 
 impl Daemon for PlatformHardware {
-    fn profile_set(&mut self, base: Base) -> Result<(), DaemonError> {
-        self.sysfs.set_base(base).map_err(DaemonError::Rejected)?;
-        self.sysfs
-            .set_tdp(Sysfs::stock_tdp(base))
-            .map_err(DaemonError::Rejected)
-    }
-
     fn ppd_set(&mut self, profile: Option<&str>) -> Result<Option<String>, DaemonError> {
         let Some(profile) = profile else {
             return Ok(None);
@@ -227,12 +219,10 @@ impl Backend {
                     .warnings
                     .push(format!("startup restore failed: {error}"));
             }
-        } else if let Ok(base) = backend.hardware.sysfs.read_base() {
-            let _ = backend.hardware.profile_set(base);
-            backend.persisted.state.base = base;
-            backend.persisted.state.tdp = Some(Sysfs::stock_tdp(base));
-            let stock = base.stock_fan_curve();
-            backend.persisted.state.fan_curves = Some([stock, stock]);
+        } else {
+            backend.persisted.state.fan_curves = Some(z13helper_core::stock_fan_curves(
+                backend.persisted.state.ppd_profile.as_deref(),
+            ));
             let _ = backend.save();
         }
         backend.restore_battery_policy();
@@ -289,7 +279,6 @@ impl Backend {
         };
         self.persisted.desired = Some(request.clone());
         self.persisted.state.generation = self.persisted.state.generation.saturating_add(1);
-        self.persisted.state.base = request.base;
         self.persisted.state.profile = Some(
             if request.power_limits.is_some()
                 || request.fan_curves.is_some()
@@ -297,7 +286,7 @@ impl Backend {
             {
                 "custom"
             } else {
-                request.base.as_str()
+                request.ppd_profile.as_deref().unwrap_or("unmanaged")
             }
             .into(),
         );
@@ -307,13 +296,11 @@ impl Backend {
             undervolt: request.undervolt.is_some(),
         };
         self.persisted.state.ppd_profile = request.ppd_profile.clone();
-        self.persisted.state.tdp = Some(
-            request
-                .power_limits
-                .unwrap_or_else(|| Sysfs::stock_tdp(request.base)),
-        );
-        let stock = request.base.stock_fan_curve();
-        self.persisted.state.fan_curves = Some(request.fan_curves.unwrap_or([stock, stock]));
+        self.persisted.state.tdp = request.power_limits;
+        self.persisted.state.fan_curves =
+            Some(request.fan_curves.unwrap_or_else(|| {
+                z13helper_core::stock_fan_curves(request.ppd_profile.as_deref())
+            }));
         self.persisted.state.fan_control_mode = request.fan_mode;
         self.persisted.state.floor_config = request.floor;
         self.persisted.state.undervolt = request.undervolt.map(|cpu_co| UndervoltState {
@@ -452,10 +439,7 @@ impl Backend {
     }
 
     fn observe(&mut self) {
-        if let Ok(base) = self.hardware.sysfs.read_base() {
-            self.persisted.state.base = base;
-        }
-        if let Ok(tdp) = self.hardware.sysfs.read_tdp(self.persisted.state.base) {
+        if let Ok(tdp) = self.hardware.sysfs.read_tdp() {
             self.persisted.state.tdp = Some(tdp);
         }
         if !self.persisted.state.battery_one_time_charge {

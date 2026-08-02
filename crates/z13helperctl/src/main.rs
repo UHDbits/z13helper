@@ -1,13 +1,13 @@
 use std::io::Read;
 
 use z13helper_client::Client;
-use z13helper_core::{ApplyRequest, Base, DaemonError, FanControlMode, LightingState};
+use z13helper_core::{ApplyRequest, DaemonError, FanControlMode, LightingState};
 
 fn usage() -> ! {
     eprintln!(
         "z13helperctl commands:\n\
          status\n  probe\n  watch [event]\n  apply <json-file|->\n\
-         profile <quiet|balanced|performance>\n  ppd <profile|off>\n\
+         ppd <profile|off>\n\
          tdp <pl1> <pl2> <fppt> [apu-sppt platform-sppt]\n  undervolt <-40..0|off>\n\
          fans <firmware|direct|off> [curves-json-file]\n\
          lighting <keyboard|lightbar> <off|mode> [color] [brightness]\n\
@@ -28,7 +28,6 @@ fn parse_bool(value: &str) -> Result<bool, String> {
 fn current_request(client: &Client) -> Result<ApplyRequest, DaemonError> {
     let state = client.get_state()?;
     Ok(ApplyRequest {
-        base: state.base,
         ppd_profile: state.ppd_profile,
         power_limits: state.overrides.power.then_some(state.tdp).flatten(),
         fan_mode: state.fan_control_mode,
@@ -87,12 +86,6 @@ fn run() -> Result<(), String> {
             let text = read_json(&args.next().unwrap_or_else(|| usage()))?;
             let request: ApplyRequest =
                 serde_json::from_str(&text).map_err(|error| error.to_string())?;
-            print_json(&client.apply(request).map_err(|error| error.to_string())?)?;
-        }
-        "profile" => {
-            let mut request = current_request(&client).map_err(|e| e.to_string())?;
-            request.base = Base::from_str_lossy(&args.next().unwrap_or_else(|| usage()))
-                .ok_or_else(|| "unknown base profile".to_owned())?;
             print_json(&client.apply(request).map_err(|error| error.to_string())?)?;
         }
         "ppd" => {

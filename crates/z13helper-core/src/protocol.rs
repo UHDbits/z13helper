@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::curve::Curve;
 use crate::error::WireError;
-use crate::profile::{Base, FanControlMode, Profile};
+use crate::profile::{stock_ppt, FanControlMode, Profile};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -141,9 +141,6 @@ pub struct Health {
 pub struct DaemonState {
     #[serde(default)]
     pub generation: u64,
-    #[serde(default)]
-    pub base: Base,
-    #[serde(default)]
     pub profile: Option<String>,
     #[serde(default)]
     pub overrides: OverrideState,
@@ -195,7 +192,6 @@ impl Default for DaemonState {
     fn default() -> Self {
         Self {
             generation: 0,
-            base: Base::Balanced,
             profile: Some("balanced".into()),
             overrides: OverrideState::default(),
             ppd_profile: Some("balanced".into()),
@@ -232,7 +228,6 @@ impl Default for DaemonState {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ApplyRequest {
-    pub base: Base,
     pub ppd_profile: Option<String>,
     pub power_limits: Option<TdpState>,
     pub fan_mode: FanControlMode,
@@ -251,7 +246,6 @@ impl ApplyRequest {
             platform_sppt: profile.pl2_sppt as i32,
         });
         Self {
-            base: profile.base,
             ppd_profile: profile.ppd_profile.clone(),
             power_limits,
             fan_mode: profile.fan_control_mode,
@@ -264,7 +258,7 @@ impl ApplyRequest {
     pub fn effective_pl1(&self) -> u32 {
         self.power_limits
             .map(|tdp| tdp.pl1_spl.max(0) as u32)
-            .unwrap_or_else(|| self.base.stock_ppt().0)
+            .unwrap_or_else(|| stock_ppt(self.ppd_profile.as_deref()).0)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -447,7 +441,7 @@ mod tests {
 
     #[test]
     fn complete_apply_is_prevalidated() {
-        let mut profile = Profile::builtin("turbo", "Turbo", Base::Performance);
+        let mut profile = Profile::builtin("turbo", "Turbo");
         profile.apply_power_limits = true;
         profile.pl1_spl = 80;
         profile.pl2_sppt = 90;

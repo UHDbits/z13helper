@@ -2,12 +2,11 @@
 
 use crate::curve::{Curve, TDP_MAX_SAFE};
 use crate::error::DaemonError;
-use crate::profile::{Base, FanControlMode};
+use crate::profile::{stock_fan_curves, FanControlMode};
 use crate::protocol::{ApplyRequest, TdpState};
 
 /// Hardware operations owned by `z13helperd`.
 pub trait Daemon {
-    fn profile_set(&mut self, base: Base) -> Result<(), DaemonError>;
     fn ppd_set(&mut self, profile: Option<&str>) -> Result<Option<String>, DaemonError>;
     fn tdp_set(&mut self, limits: TdpState, force: bool) -> Result<(), DaemonError>;
     fn firmware_fans_set(
@@ -26,10 +25,9 @@ pub trait Daemon {
 }
 
 fn selected_curves(request: &ApplyRequest) -> [Curve; 2] {
-    request.fan_curves.unwrap_or_else(|| {
-        let stock = request.base.stock_fan_curve();
-        [stock, stock]
-    })
+    request
+        .fan_curves
+        .unwrap_or_else(|| stock_fan_curves(request.ppd_profile.as_deref()))
 }
 
 fn set_fans(
@@ -46,8 +44,8 @@ fn set_fans(
 
 /// Apply one flattened request. The daemon serializes calls to this function.
 ///
-/// A base write always runs and restores stock PPT. For high-power requests,
-/// fan protection is installed before custom PPT. For safe requests, power is
+/// PPD selects the firmware policy first. For high-power requests, fan
+/// protection is installed before custom PPT. For safe requests, power is
 /// lowered before fan protection is relaxed.
 pub fn apply_request(
     daemon: &mut impl Daemon,
@@ -55,7 +53,6 @@ pub fn apply_request(
 ) -> Result<Vec<String>, DaemonError> {
     request.validate().map_err(DaemonError::Rejected)?;
 
-    daemon.profile_set(request.base)?;
     let mut warnings = Vec::new();
     if let Some(warning) = daemon.ppd_set(request.ppd_profile.as_deref())? {
         warnings.push(warning);
@@ -118,9 +115,6 @@ mod tests {
     }
 
     impl Daemon for RecordingDaemon {
-        fn profile_set(&mut self, base: Base) -> Result<(), DaemonError> {
-            self.call(format!("profile:{}", base.as_str()))
-        }
         fn ppd_set(&mut self, profile: Option<&str>) -> Result<Option<String>, DaemonError> {
             self.call(format!("ppd:{}", profile.unwrap_or("off")))?;
             Ok(None)
@@ -146,7 +140,7 @@ mod tests {
     }
 
     fn request(pl1: u32) -> ApplyRequest {
-        let mut profile = Profile::builtin("gaming", "Gaming", Base::Balanced);
+        let mut profile = Profile::builtin("gaming", "Gaming");
         profile.apply_power_limits = true;
         profile.pl1_spl = pl1;
         profile.pl2_sppt = pl1.max(80);
@@ -186,14 +180,11 @@ mod tests {
     }
 
     #[test]
-    fn base_always_runs_and_stock_releases_fans() {
-        let profile = Profile::builtin("balanced", "Balanced", Base::Balanced);
+    fn ppd_runs_and_stock_releases_fans() {
+        let profile = Profile::builtin("balanced", "Balanced");
         let request = ApplyRequest::from_profile(&profile, FanFloorConfig::default());
         let mut daemon = RecordingDaemon::default();
         apply_request(&mut daemon, &request).unwrap();
-        assert_eq!(
-            daemon.calls.into_inner(),
-            ["profile:balanced", "ppd:balanced", "fans-release"]
-        );
+        assert_eq!(daemon.calls.into_inner(), ["ppd:balanced", "fans-release"]);
     }
 }

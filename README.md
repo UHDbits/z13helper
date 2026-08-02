@@ -60,9 +60,9 @@ Silent, Balanced, and Turbo are fresh version-1 defaults. Named profiles live
 only in the user configuration. PPD is independently selectable when
 power-profiles-daemon is available.
 
-Each apply is validated and serialized by `z13helperd`. It restores the selected
-base's measured five-value stock PPT table, then applies independent PPD, PPT,
-two eight-point fan curves, and undervolt state in a fail-closed order. A PL1
+Each apply is validated and serialized by `z13helperd`. PPD selects the firmware
+power policy, after which the daemon applies optional PPT, two eight-point fan
+curves, and undervolt state in a fail-closed order. A PL1
 above 75 W is permitted only after fan protection has been prepared; lowering
 power happens before relaxing that protection.
 
@@ -76,7 +76,7 @@ and firmware throttling remain authoritative.
 
 `z13helperctl status` and `z13helperctl probe` print JSON. `watch` streams daemon
 events, while `apply -` accepts a complete version-1 apply request on stdin.
-Focused commands cover profile, PPD, PPT, fans, undervolt, lighting, battery,
+Focused commands cover PPD, PPT, fans, undervolt, lighting, battery,
 panel overdrive, and direct-fan release. The CLI never owns named GUI profiles.
 
 The battery slider stores the normal 40–100% charge limit. A separate one-time

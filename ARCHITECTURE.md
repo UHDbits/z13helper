@@ -40,10 +40,10 @@ file `$XDG_CONFIG_HOME/z13helper/config.json`. There are no schema migrations.
 Unknown schema versions are preserved and rejected.
 
 The daemon atomically persists only flattened desired machine state at
-`/var/lib/z13helper/state.json`. On first boot without that file, it retains the
-detected base, restores the measured stock PPT table, and leaves direct EC mode
-released. Startup and resume restore fan protection before high power, followed
-by undervolt, the persistent battery policy, and lighting. The stored battery
+`/var/lib/z13helper/state.json`. On first boot without that file, it observes
+the PPD-selected policy and leaves direct EC mode released. Startup and resume
+restore fan protection before high power, followed by undervolt, the persistent
+battery policy, and lighting. The stored battery
 limit remains the normal slider value; a separate one-time flag temporarily
 writes 100% and is cleared only after the normal limit is restored at full
 charge.
@@ -53,15 +53,13 @@ charge.
 The daemon prevalidates the entire request before the first hardware mutation.
 For an ordinary or lower-power apply:
 
-1. Select the base on every platform-profile device and restore its measured
-   five-value stock PPT table while retaining existing fan protection.
-2. Select PPD independently. Missing PPD produces a visible warning; an unknown
+1. Select PPD. Missing PPD produces a visible warning; an unknown
    advertised selection is rejected.
-3. Lower/write PPT before relaxing prior high-power fan protection.
-4. Install firmware or direct fan control.
-5. Restore the requested undervolt offset.
+2. Lower/write optional PPT before relaxing prior high-power fan protection.
+3. Install firmware or direct fan control.
+4. Restore the requested undervolt offset.
 
-When raising PL1 above 75 W, step 4 moves before the power write. A fan-setup
+When raising PL1 above 75 W, step 3 moves before the power write. A fan-setup
 failure abandons the power increase. If a later step fails, the daemon attempts
 rollback without dropping safety fan protection; incomplete rollback sets
 `degraded` and records warnings in `DaemonState`.
@@ -89,7 +87,6 @@ restricted systemd `ExecStopPost` recovery path.
 
 The daemon owns adapters for:
 
-- all platform-profile devices, including quiet/low-power mapping;
 - effective five-value PPT state;
 - power-profiles-daemon profiles/current selection over D-Bus;
 - both firmware fan interfaces and direct EC mailbox control;

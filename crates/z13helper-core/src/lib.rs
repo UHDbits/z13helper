@@ -12,5 +12,5 @@ pub mod protocol;
 pub use apply::{apply_request, Daemon};
 pub use config::Config;
 pub use error::DaemonError;
-pub use profile::{Base, FanControlMode, Profile};
+pub use profile::{stock_fan_curves, stock_ppt, FanControlMode, Profile};
 pub use protocol::*;

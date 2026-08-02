@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::profile::{Base, Profile};
+use crate::profile::{stock_fan_curves, Profile};
 
 pub const CONFIG_VERSION: u32 = 1;
 
@@ -61,9 +61,9 @@ impl Default for Config {
 
 pub fn builtin_profiles() -> Vec<Profile> {
     vec![
-        Profile::builtin("silent", "Silent", Base::Quiet),
-        Profile::builtin("balanced", "Balanced", Base::Balanced),
-        Profile::builtin("turbo", "Turbo", Base::Performance),
+        Profile::builtin("silent", "Silent"),
+        Profile::builtin("balanced", "Balanced"),
+        Profile::builtin("turbo", "Turbo"),
     ]
 }
 
@@ -142,7 +142,7 @@ impl Config {
 
     /// Ensure the three built-ins exist (re-seed if a user deleted them).
     /// When a builtin is not applying a custom curve, refresh the preview
-    /// curve from that base's stock table so Silent/Balanced/Turbo differ.
+    /// curve from the corresponding PPD fallback so the modes differ.
     pub fn ensure_builtins(&mut self) {
         for builtin in builtin_profiles() {
             if !self.profiles.iter().any(|p| p.id == builtin.id) {
@@ -151,7 +151,7 @@ impl Config {
         }
         for p in &mut self.profiles {
             if p.builtin && !p.apply_fan_curve {
-                p.fan_curves = [p.base.stock_fan_curve(), p.base.stock_fan_curve()];
+                p.fan_curves = stock_fan_curves(p.ppd_profile.as_deref());
             }
         }
         self.profiles.sort_by_key(|p| match p.id.as_str() {
@@ -180,7 +180,7 @@ impl Config {
         let source = self
             .active()
             .cloned()
-            .unwrap_or_else(|| Profile::builtin("balanced", "Balanced", Base::Balanced));
+            .unwrap_or_else(|| Profile::builtin("balanced", "Balanced"));
         let id = format!("custom-{next_n}");
         let mut profile = source;
         profile.id = id.clone();

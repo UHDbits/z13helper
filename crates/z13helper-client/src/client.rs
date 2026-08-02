@@ -305,7 +305,7 @@ mod tests {
             writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
         });
         let state = Client::with_path(path).get_state().unwrap();
-        assert_eq!(state.base, z13helper_core::Base::Balanced);
+        assert_eq!(state.ppd_profile.as_deref(), Some("balanced"));
     }
 
     #[test]

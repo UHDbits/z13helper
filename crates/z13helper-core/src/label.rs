@@ -18,17 +18,17 @@ pub fn mode_label(profile: &Profile) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::{Base, Profile};
+    use crate::profile::Profile;
 
     #[test]
     fn plain_builtin() {
-        let p = Profile::builtin("balanced", "Balanced", Base::Balanced);
+        let p = Profile::builtin("balanced", "Balanced");
         assert_eq!(mode_label(&p), "Mode: Balanced");
     }
 
     #[test]
     fn with_curve_and_power() {
-        let mut p = Profile::builtin("balanced", "Balanced", Base::Balanced);
+        let mut p = Profile::builtin("balanced", "Balanced");
         p.apply_fan_curve = true;
         p.apply_power_limits = true;
         p.pl1_spl = 20;
@@ -37,7 +37,7 @@ mod tests {
 
     #[test]
     fn direct_curve_is_identified() {
-        let mut p = Profile::builtin("balanced", "Balanced", Base::Balanced);
+        let mut p = Profile::builtin("balanced", "Balanced");
         p.apply_fan_curve = true;
         p.fan_control_mode = FanControlMode::Direct;
         assert_eq!(mode_label(&p), "Mode: Balanced+EC");
