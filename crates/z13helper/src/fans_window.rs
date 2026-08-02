@@ -613,12 +613,12 @@ fn build_cpu_page(
     apply_schedule: &ApplySchedule,
 ) -> (
     gtk::Box,
-    gtk::DropDown,
+    adw::ComboRow,
     gtk::Scale,
     gtk::Scale,
     gtk::Scale,
     gtk::CheckButton,
-    gtk::DropDown,
+    adw::ComboRow,
 ) {
     let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     page.set_margin_top(12);
@@ -630,22 +630,28 @@ fn build_cpu_page(
         .title("Power Profile")
         .description("Platform profile and power-profiles-daemon are independent.")
         .build();
-    let base_drop = gtk::DropDown::from_strings(&[
+    let base_drop = adw::ComboRow::new();
+    base_drop.set_title("Base");
+    base_drop.set_model(Some(&gtk::StringList::new(&[
         Base::Quiet.short_label(),
         Base::Balanced.short_label(),
         Base::Performance.short_label(),
-    ]);
+    ])));
     let base_idx = match state.config.borrow().active().map(|p| p.base) {
         Some(Base::Quiet) => 0,
         Some(Base::Performance) => 2,
         _ => 1,
     };
     base_drop.set_selected(base_idx);
-    base_drop.set_hexpand(true);
-    let base_row = adw::ActionRow::builder().title("Base").build();
-    base_row.add_suffix(&base_drop);
-    base_group.add(&base_row);
-    let ppd = gtk::DropDown::from_strings(&["power-saver", "balanced", "performance", "disabled"]);
+    base_group.add(&base_drop);
+    let ppd = adw::ComboRow::new();
+    ppd.set_title("Power Profiles Daemon");
+    ppd.set_model(Some(&gtk::StringList::new(&[
+        "power-saver",
+        "balanced",
+        "performance",
+        "disabled",
+    ])));
     let ppd_selected = state
         .config
         .borrow()
@@ -658,11 +664,7 @@ fn build_cpu_page(
         })
         .unwrap_or(3);
     ppd.set_selected(ppd_selected);
-    let ppd_row = adw::ActionRow::builder()
-        .title("Power Profiles Daemon")
-        .build();
-    ppd_row.add_suffix(&ppd);
-    base_group.add(&ppd_row);
+    base_group.add(&ppd);
     page.append(&base_group);
 
     let power_group = adw::PreferencesGroup::builder()
@@ -949,12 +951,12 @@ struct FanEditorView {
 }
 
 struct PowerEditorView {
-    base: gtk::DropDown,
+    base: adw::ComboRow,
     spl: gtk::Scale,
     sppt: gtk::Scale,
     fppt: gtk::Scale,
     enabled: gtk::CheckButton,
-    ppd: gtk::DropDown,
+    ppd: adw::ComboRow,
 }
 
 struct UndervoltEditorView {
@@ -1041,7 +1043,7 @@ fn slider_row(title: &str, initial: u32, min: u32, max: u32) -> (gtk::Box, gtk::
     (row, scale)
 }
 
-fn sync_ppd_choices(dropdown: &gtk::DropDown, profiles: &[String], state: &AppState) {
+fn sync_ppd_choices(dropdown: &adw::ComboRow, profiles: &[String], state: &AppState) {
     let mut choices = profiles.to_vec();
     choices.push("disabled".into());
     let references: Vec<&str> = choices.iter().map(String::as_str).collect();
@@ -1057,7 +1059,7 @@ fn sync_ppd_choices(dropdown: &gtk::DropDown, profiles: &[String], state: &AppSt
     dropdown.set_sensitive(!profiles.is_empty());
 }
 
-fn select_dropdown_string(dropdown: &gtk::DropDown, target: &str) {
+fn select_dropdown_string(dropdown: &adw::ComboRow, target: &str) {
     let Some(model) = dropdown.model().and_downcast::<gtk::StringList>() else {
         return;
     };
