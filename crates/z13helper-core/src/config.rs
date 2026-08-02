@@ -36,7 +36,6 @@ pub struct Config {
     pub show_hud: bool,
     #[serde(default)]
     pub panel_overdrive_always_on: bool,
-    pub fan_clamp_to_grid: bool,
     pub fan_floor: crate::protocol::FanFloorConfig,
     pub profiles: Vec<Profile>,
 }
@@ -52,7 +51,6 @@ impl Default for Config {
             power_source_debounce_ms: 2000,
             show_hud: true,
             panel_overdrive_always_on: false,
-            fan_clamp_to_grid: false,
             fan_floor: crate::protocol::FanFloorConfig::default(),
             profiles: builtin_profiles(),
         }

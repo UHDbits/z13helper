@@ -1,6 +1,6 @@
 //! Fan curve authoring math. Runtime safety floors are daemon-owned.
 //!
-//! Fan-curve validation, editing constraints, and grid bands.
+//! Fan-curve validation and editing constraints.
 
 use thiserror::Error;
 
@@ -52,18 +52,12 @@ pub fn validate(curve: &Curve) -> Result<(), CurveError> {
     Ok(())
 }
 
-/// G-Helper clamp-to-grid band for point index `i`: `[30+i*10, 30+i*10+9]`.
-pub fn grid_band(index: usize) -> (i32, i32) {
-    let lo = 30 + (index as i32) * 10;
-    (lo, lo + 9)
-}
-
 /// Enforce monotonicity and bounds after dragging point `idx`.
 ///
 /// Clamp the edited point and push neighbours so
 /// temps strictly increase and PWMs are non-decreasing, keep index-based
 /// bounds so points cannot collapse onto an edge.
-pub fn enforce_curve(curve: &mut Curve, idx: usize, clamp_to_grid: bool) {
+pub fn enforce_curve(curve: &mut Curve, idx: usize) {
     if idx >= POINT_COUNT {
         return;
     }
@@ -80,11 +74,6 @@ pub fn enforce_curve(curve: &mut Curve, idx: usize, clamp_to_grid: bool) {
     let hi = TEMP_MAX - (POINT_COUNT as i32 - 1 - idx as i32);
     curve[idx][0] = curve[idx][0].clamp(lo, hi);
 
-    if clamp_to_grid {
-        let (glo, ghi) = grid_band(idx);
-        curve[idx][0] = curve[idx][0].clamp(glo, ghi);
-    }
-
     // Forward cascade: temps strictly increasing, PWM non-decreasing.
     for i in idx + 1..POINT_COUNT {
         if curve[i][0] <= curve[i - 1][0] {
@@ -94,18 +83,6 @@ pub fn enforce_curve(curve: &mut Curve, idx: usize, clamp_to_grid: bool) {
             curve[i][1] = curve[i - 1][1];
         }
         clamp_point(&mut curve[i], PWM_MIN);
-        if clamp_to_grid {
-            let (glo, ghi) = grid_band(i);
-            // Prefer staying in band, but don't violate monotonicity.
-            if curve[i][0] < glo {
-                curve[i][0] = glo;
-            }
-            if curve[i][0] > ghi && curve[i][0] > curve[i - 1][0] {
-                // Only pull back if we still stay above previous.
-                let candidate = ghi.max(curve[i - 1][0] + 1);
-                curve[i][0] = candidate.min(TEMP_MAX);
-            }
-        }
     }
 
     // Backward cascade.
@@ -117,16 +94,6 @@ pub fn enforce_curve(curve: &mut Curve, idx: usize, clamp_to_grid: bool) {
             curve[i][1] = curve[i + 1][1];
         }
         clamp_point(&mut curve[i], PWM_MIN);
-        if clamp_to_grid {
-            let (glo, ghi) = grid_band(i);
-            if curve[i][0] > ghi {
-                curve[i][0] = ghi;
-            }
-            if curve[i][0] < glo && curve[i][0] < curve[i + 1][0] {
-                let candidate = glo.min(curve[i + 1][0] - 1);
-                curve[i][0] = candidate.max(TEMP_MIN);
-            }
-        }
     }
 
     // Final pass: re-clamp everything and fix any residual collisions.
@@ -188,17 +155,11 @@ mod tests {
     }
 
     #[test]
-    fn grid_bands() {
-        assert_eq!(grid_band(0), (30, 39));
-        assert_eq!(grid_band(7), (100, 109));
-    }
-
-    #[test]
     fn enforce_pushes_neighbours() {
         let mut c = default_fan_curve();
         // Drag point 3's temp above point 4's.
         c[3][0] = 70;
-        enforce_curve(&mut c, 3, false);
+        enforce_curve(&mut c, 3);
         for i in 1..POINT_COUNT {
             assert!(c[i][0] > c[i - 1][0], "temp not increasing at {i}: {:?}", c);
             assert!(c[i][1] >= c[i - 1][1], "pwm decreasing at {i}: {:?}", c);
@@ -209,21 +170,8 @@ mod tests {
     fn enforce_does_not_apply_runtime_floor() {
         let mut c = default_fan_curve();
         c[0][1] = 0;
-        enforce_curve(&mut c, 0, false);
+        enforce_curve(&mut c, 0);
         assert_eq!(c[0][1], 0);
-    }
-
-    #[test]
-    fn clamp_to_grid_locks_band() {
-        let mut c = default_fan_curve();
-        c[2][0] = 90; // way outside band 50–59
-        enforce_curve(&mut c, 2, true);
-        let (lo, hi) = grid_band(2);
-        assert!(
-            c[2][0] >= lo && c[2][0] <= hi,
-            "point 2 temp {} not in [{lo},{hi}]",
-            c[2][0]
-        );
     }
 
     #[test]
@@ -231,7 +179,7 @@ mod tests {
         let mut c = default_fan_curve();
         // Drag first point to far left.
         c[0][0] = TEMP_MIN;
-        enforce_curve(&mut c, 0, false);
+        enforce_curve(&mut c, 0);
         // All temps must remain distinct.
         let mut seen = std::collections::HashSet::new();
         for pt in &c {

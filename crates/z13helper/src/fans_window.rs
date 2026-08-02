@@ -84,16 +84,8 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         .active()
         .cloned()
         .unwrap_or_else(|| Profile::builtin("balanced", "Balanced"));
-    let editor = CurveEditor::new(
-        profile.fan_curves[0],
-        state.config.borrow().fan_clamp_to_grid,
-        "Fan 1 curve",
-    );
-    let editor2 = CurveEditor::new(
-        profile.fan_curves[1],
-        state.config.borrow().fan_clamp_to_grid,
-        "Fan 2 curve",
-    );
+    let editor = CurveEditor::new(profile.fan_curves[0], "Fan 1 curve");
+    let editor2 = CurveEditor::new(profile.fan_curves[1], "Fan 2 curve");
     editor.set_floor_config(state.config.borrow().fan_floor);
     editor2.set_floor_config(state.config.borrow().fan_floor);
 
@@ -151,20 +143,6 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     restore.set_tooltip_text(Some(
         "Reset Silent, Balanced, Turbo (or the selected custom) to stock power, fans, and undervolt.",
     ));
-
-    let clamp = gtk::CheckButton::with_label("Clamp to grid");
-    clamp.set_active(state.config.borrow().fan_clamp_to_grid);
-    let editor_clamp = editor.clone();
-    let editor2_clamp = editor2.clone();
-    let state_clamp = state.clone();
-    clamp.connect_toggled(move |t| {
-        let on = t.is_active();
-        state_clamp.config.borrow_mut().fan_clamp_to_grid = on;
-        editor_clamp.set_clamp_to_grid(on);
-        editor2_clamp.set_clamp_to_grid(on);
-        state_clamp.save_config();
-    });
-    right.append(&clamp);
 
     let fan_toggle = gtk::CheckButton::with_label("Apply custom fan curve");
     fan_toggle.set_active(profile.apply_fan_curve);

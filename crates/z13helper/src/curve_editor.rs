@@ -15,13 +15,12 @@ pub struct CurveEditor {
     curve: Rc<RefCell<Curve>>,
     selected: Rc<Cell<usize>>,
     muted: Rc<Cell<bool>>,
-    clamp_grid: Rc<Cell<bool>>,
     floor: Rc<Cell<FanFloorConfig>>,
     changed: Rc<RefCell<Option<ChangedCallback>>>,
 }
 
 impl CurveEditor {
-    pub fn new(curve: Curve, clamp_grid: bool, accessible_label: &str) -> Self {
+    pub fn new(curve: Curve, accessible_label: &str) -> Self {
         let area = gtk::DrawingArea::builder()
             .content_width(440)
             .content_height(320)
@@ -37,7 +36,6 @@ impl CurveEditor {
             curve: Rc::new(RefCell::new(curve)),
             selected: Rc::new(Cell::new(0)),
             muted: Rc::new(Cell::new(false)),
-            clamp_grid: Rc::new(Cell::new(clamp_grid)),
             floor: Rc::new(Cell::new(FanFloorConfig::default())),
             changed: Rc::new(RefCell::new(None)),
         };
@@ -64,10 +62,6 @@ impl CurveEditor {
     pub fn set_muted(&self, muted: bool) {
         self.muted.set(muted);
         self.area.queue_draw();
-    }
-
-    pub fn set_clamp_to_grid(&self, on: bool) {
-        self.clamp_grid.set(on);
     }
 
     pub fn set_floor_config(&self, floor: FanFloorConfig) {
@@ -249,15 +243,10 @@ impl CurveEditor {
     fn install_input(&self) {
         let gesture = gtk::GestureDrag::new();
         let editor = self.clone();
-        // Track whether this is the first update of a drag so we don't
-        // surprise-snap into a clamp-to-grid band mid-gesture start.
-        let drag_origin = Rc::new(Cell::new((0.0_f64, 0.0_f64)));
-        let origin = drag_origin.clone();
         gesture.connect_drag_begin(move |_, px, py| {
             editor.area.grab_focus();
             let idx = editor.closest_point(px, py);
             editor.selected.set(idx);
-            origin.set((px, py));
             editor.update_accessibility();
             editor.area.queue_draw();
         });
@@ -300,7 +289,7 @@ impl CurveEditor {
             let mut curve = editor.curve.borrow_mut();
             curve[idx][0] += dt;
             curve[idx][1] += curve::percent_to_pwm(dp) - curve::percent_to_pwm(0);
-            curve::enforce_curve(&mut curve, idx, editor.clamp_grid.get());
+            curve::enforce_curve(&mut curve, idx);
             drop(curve);
             editor.emit_changed();
             glib::Propagation::Stop
@@ -340,7 +329,7 @@ impl CurveEditor {
         } else {
             curve[idx][0] = temp;
             curve[idx][1] = pwm;
-            curve::enforce_curve(&mut curve, idx, self.clamp_grid.get());
+            curve::enforce_curve(&mut curve, idx);
         }
         drop(curve);
         self.emit_changed();
