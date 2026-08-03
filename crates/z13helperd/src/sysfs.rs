@@ -385,24 +385,21 @@ impl Sysfs {
                 "APU PPT limit",
             )?,
         ];
-        let expected = [
-            state.pl2_sppt as f32,
-            state.fppt as f32,
-            state.pl1_spl as f32,
-            state.apu_sppt as f32,
-        ];
-        if actual
-            .iter()
-            .zip(expected)
-            .all(|(actual, expected)| (actual - expected).abs() < 0.5)
-        {
-            Ok(())
-        } else {
-            Err(format!(
-                "SMU power-limit verification failed: requested {:?} W, firmware reports {:?} W",
-                expected, actual
-            ))
-        }
+        verify_smu_power_limits(
+            actual,
+            [state.pl2_sppt, state.fppt, state.pl1_spl, state.apu_sppt],
+        )
+    }
+}
+
+fn verify_smu_power_limits(actual: [f32; 4], expected: [i32; 4]) -> Result<(), String> {
+    let rounded_actual = actual.map(|value| value.round() as i32);
+    if rounded_actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "SMU power-limit verification failed: requested {expected:?} W, firmware reports {rounded_actual:?} W (raw {actual:?})"
+        ))
     }
 }
 
@@ -690,5 +687,22 @@ mod tests {
             .copy_from_slice(&99.0f32.to_le_bytes());
         assert_eq!(decode_strix_halo_tctl(&table).unwrap(), 99);
         assert!(decode_strix_halo_tctl(&table[..88]).is_err());
+    }
+
+    #[test]
+    fn smu_power_limit_verification_ignores_float_rounding_noise() {
+        assert!(verify_smu_power_limits(
+            [120.00001, 120.00001, 93.00001, 92.99999],
+            [120, 120, 93, 93],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn smu_power_limit_verification_rejects_a_real_mismatch() {
+        let error =
+            verify_smu_power_limits([120.0, 120.0, 94.0, 93.0], [93, 120, 93, 93]).unwrap_err();
+        assert!(error.contains("requested [93, 120, 93, 93]"));
+        assert!(error.contains("firmware reports [120, 120, 94, 93]"));
     }
 }

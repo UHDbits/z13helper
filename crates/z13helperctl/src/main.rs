@@ -40,6 +40,7 @@ fn current_request(client: &Client) -> Result<ApplyRequest, DaemonError> {
             .map(|value| value.cpu_co),
         cpu_temp_limit: state.cpu_temp_limit.unwrap_or(95),
         fan_hysteresis: state.fan_hysteresis,
+        fan_temperature_average_seconds: state.fan_temperature_average_seconds,
         disable_high_power_fan_protection: state.disable_high_power_fan_protection,
     })
 }

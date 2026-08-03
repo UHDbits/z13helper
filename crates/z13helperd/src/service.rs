@@ -1,7 +1,7 @@
 use z13helper_core::curve::Curve;
 use z13helper_core::protocol::{FanHysteresis, ProbeReply};
 
-use crate::curve::{duty_at, hysteretic_temperature, HysteresisState};
+use crate::curve::{duty_at, hysteretic_temperature, HysteresisState, TemperatureAverager};
 use crate::ec::{EcMailbox, PortIo};
 use crate::sensors::{self, SensorSnapshot};
 
@@ -25,6 +25,8 @@ pub struct Controller<P, S> {
     sensors: S,
     curves: Option<[Curve; 2]>,
     hysteresis: FanHysteresis,
+    temperature_average_seconds: u8,
+    temperature_average: TemperatureAverager,
     hysteresis_state: HysteresisState,
     last_duty: [u8; 2],
     consecutive_ec_errors: u32,
@@ -37,6 +39,9 @@ impl<P: PortIo, S: SensorSource> Controller<P, S> {
             sensors,
             curves: None,
             hysteresis: FanHysteresis::default(),
+            temperature_average_seconds:
+                z13helper_core::profile::default_fan_temperature_average_seconds(),
+            temperature_average: TemperatureAverager::default(),
             hysteresis_state: HysteresisState::default(),
             last_duty: [0; 2],
             consecutive_ec_errors: 0,
@@ -62,12 +67,19 @@ impl<P: PortIo, S: SensorSource> Controller<P, S> {
         })
     }
 
-    pub fn enable(&mut self, curves: [Curve; 2], hysteresis: FanHysteresis) -> Result<(), String> {
+    pub fn enable(
+        &mut self,
+        curves: [Curve; 2],
+        hysteresis: FanHysteresis,
+        temperature_average_seconds: u8,
+    ) -> Result<(), String> {
         self.ec
             .set_global_mode(true)
             .map_err(|error| self.note_ec_error(error.to_string()))?;
         self.curves = Some(curves);
         self.hysteresis = hysteresis;
+        self.temperature_average_seconds = temperature_average_seconds;
+        self.temperature_average.clear();
         self.hysteresis_state = HysteresisState::default();
         self.consecutive_ec_errors = 0;
         self.tick()
@@ -75,6 +87,7 @@ impl<P: PortIo, S: SensorSource> Controller<P, S> {
 
     pub fn release(&mut self) -> Result<(), String> {
         self.curves = None;
+        self.temperature_average.clear();
         self.hysteresis_state = HysteresisState::default();
         match self.ec.set_global_mode(false) {
             Ok(()) => {
@@ -97,8 +110,13 @@ impl<P: PortIo, S: SensorSource> Controller<P, S> {
                 return Err(format!("sensor failure; EC control released: {error}"));
             }
         };
-        let (temperature, hysteresis_state) = hysteretic_temperature(
+        let averaged_temperature = self.temperature_average.update(
+            std::time::Instant::now(),
             snapshot.apu_temperature_c,
+            self.temperature_average_seconds,
+        );
+        let (temperature, hysteresis_state) = hysteretic_temperature(
+            averaged_temperature,
             self.hysteresis.up,
             self.hysteresis.down,
             self.hysteresis_state,
@@ -137,6 +155,7 @@ impl<P: PortIo, S: SensorSource> Controller<P, S> {
 
     fn release_best_effort(&mut self) {
         self.curves = None;
+        self.temperature_average.clear();
         self.hysteresis_state = HysteresisState::default();
         if let Err(error) = self.ec.set_global_mode(false) {
             tracing::error!(%error, "failed to release EC automatic mode");

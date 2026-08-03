@@ -20,6 +20,7 @@ pub struct PlatformHardware {
     aura: AuraDevices,
     direct: Controller<LinuxPortIo, HwmonSensors>,
     fan_hysteresis: FanHysteresis,
+    fan_temperature_average_seconds: u8,
     disable_high_power_fan_protection: bool,
     undervolt_available: bool,
     ppd_profiles: Vec<String>,
@@ -42,6 +43,8 @@ impl PlatformHardware {
                 aura,
                 direct,
                 fan_hysteresis: FanHysteresis::default(),
+                fan_temperature_average_seconds:
+                    z13helper_core::profile::default_fan_temperature_average_seconds(),
                 disable_high_power_fan_protection: false,
                 undervolt_available,
                 ppd_profiles,
@@ -51,8 +54,14 @@ impl PlatformHardware {
         ))
     }
 
-    pub fn set_fan_policy(&mut self, hysteresis: FanHysteresis, disable_high_power: bool) {
+    pub fn set_fan_policy(
+        &mut self,
+        hysteresis: FanHysteresis,
+        temperature_average_seconds: u8,
+        disable_high_power: bool,
+    ) {
         self.fan_hysteresis = hysteresis;
+        self.fan_temperature_average_seconds = temperature_average_seconds;
         self.disable_high_power_fan_protection = disable_high_power;
     }
 
@@ -170,7 +179,11 @@ impl Daemon for PlatformHardware {
                 *curves
             };
         self.direct
-            .enable(written, self.fan_hysteresis)
+            .enable(
+                written,
+                self.fan_hysteresis,
+                self.fan_temperature_average_seconds,
+            )
             .map_err(DaemonError::Rejected)
     }
 
@@ -268,6 +281,7 @@ impl Backend {
         let previous = self.persisted.desired.clone();
         self.hardware.set_fan_policy(
             request.fan_hysteresis,
+            request.fan_temperature_average_seconds,
             request.disable_high_power_fan_protection,
         );
         let warnings = match apply_request(&mut self.hardware, &request) {
@@ -277,6 +291,7 @@ impl Backend {
                     Some(previous) => {
                         self.hardware.set_fan_policy(
                             previous.fan_hysteresis,
+                            previous.fan_temperature_average_seconds,
                             previous.disable_high_power_fan_protection,
                         );
                         if let Err(rollback) = apply_request(&mut self.hardware, &previous) {
@@ -326,6 +341,8 @@ impl Backend {
         self.persisted.state.fan_control_mode = request.fan_mode;
         self.persisted.state.cpu_temp_limit = Some(request.cpu_temp_limit);
         self.persisted.state.fan_hysteresis = request.fan_hysteresis;
+        self.persisted.state.fan_temperature_average_seconds =
+            request.fan_temperature_average_seconds;
         self.persisted.state.disable_high_power_fan_protection =
             request.disable_high_power_fan_protection;
         self.persisted.state.undervolt = request.undervolt.map(|cpu_co| UndervoltState {
@@ -403,6 +420,7 @@ impl Backend {
         let restore = if let Some(previous) = previous {
             self.hardware.set_fan_policy(
                 previous.fan_hysteresis,
+                previous.fan_temperature_average_seconds,
                 previous.disable_high_power_fan_protection,
             );
             apply_request(&mut self.hardware, &previous).map(|_| ())

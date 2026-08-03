@@ -201,7 +201,8 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         .title("Direct EC Hysteresis")
         .description(
             "Directional temperature deadbands for direct EC control. Values 1–5 mirror \
-             G-Helper and default to 3/3; firmware mode manages its own hysteresis.",
+             G-Helper and default to 3/3; firmware mode manages its own hysteresis. The \
+             temperature average below defaults to 6 seconds; set it to 0 to disable it.",
         )
         .build();
     let hysteresis_up = slider_row(
@@ -216,10 +217,20 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         1,
         5,
     );
+    let temperature_average = slider_row(
+        "Temperature averaging (seconds)",
+        u32::from(profile.fan_temperature_average_seconds),
+        0,
+        15,
+    );
     hysteresis_up.1.set_sensitive(direct_toggle.is_active());
     hysteresis_down.1.set_sensitive(direct_toggle.is_active());
+    temperature_average
+        .1
+        .set_sensitive(direct_toggle.is_active());
     hysteresis_group.add(&hysteresis_up.0);
     hysteresis_group.add(&hysteresis_down.0);
+    hysteresis_group.add(&temperature_average.0);
     right.append(&hysteresis_group);
 
     let direct_status = gtk::Label::new(Some("Direct EC control: checking…"));
@@ -234,6 +245,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let state_probe = state.clone();
     let hysteresis_up_probe = hysteresis_up.1.clone();
     let hysteresis_down_probe = hysteresis_down.1.clone();
+    let temperature_average_probe = temperature_average.1.clone();
     let uv_probe = advanced.1.clone();
     let apply_uv_probe = advanced.2.clone();
     let manual_uv_probe = advanced.3.clone();
@@ -267,6 +279,10 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                     status.capabilities.direct_fans
                         && status.fan_control_mode == FanControlMode::Direct,
                 );
+                temperature_average_probe.set_sensitive(
+                    status.capabilities.direct_fans
+                        && status.fan_control_mode == FanControlMode::Direct,
+                );
                 if !status.capabilities.direct_fans {
                     status_probe.set_label("Direct EC control is unavailable");
                     return;
@@ -289,6 +305,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                 direct_probe.set_sensitive(false);
                 hysteresis_up_probe.set_sensitive(false);
                 hysteresis_down_probe.set_sensitive(false);
+                temperature_average_probe.set_sensitive(false);
                 uv_probe.set_sensitive(false);
                 apply_uv_probe.set_sensitive(false);
                 manual_uv_probe.set_sensitive(false);
@@ -385,6 +402,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let apply_schedule_direct = apply_schedule.clone();
     let hysteresis_up_direct = hysteresis_up.1.clone();
     let hysteresis_down_direct = hysteresis_down.1.clone();
+    let temperature_average_direct = temperature_average.1.clone();
     direct_toggle.connect_toggled(move |toggle| {
         if loading_direct.active() {
             return;
@@ -392,6 +410,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         warning_direct.set_visible(toggle.is_active());
         hysteresis_up_direct.set_sensitive(toggle.is_active());
         hysteresis_down_direct.set_sensitive(toggle.is_active());
+        temperature_average_direct.set_sensitive(toggle.is_active());
         let id = editing_direct.borrow().clone();
         if let Some(profile) = state_direct.config.borrow_mut().find_mut(&id) {
             profile.fan_control_mode = if toggle.is_active() {
@@ -423,6 +442,21 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             schedule_apply(&state, &apply_schedule);
         });
     }
+
+    let state_average = state.clone();
+    let editing_average = editing_id.clone();
+    let loading_average = loading.clone();
+    let apply_schedule_average = apply_schedule.clone();
+    temperature_average.1.connect_value_changed(move |scale| {
+        if loading_average.active() {
+            return;
+        }
+        let id = editing_average.borrow().clone();
+        if let Some(profile) = state_average.config.borrow_mut().find_mut(&id) {
+            profile.fan_temperature_average_seconds = scale.value() as u8;
+        }
+        schedule_apply(&state_average, &apply_schedule_average);
+    });
 
     // Persist curve edits into the profile currently selected in this window.
     let state_curve = state.clone();
@@ -479,6 +513,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             direct_explanation: direct_warning.clone(),
             hysteresis_up: hysteresis_up.1.clone(),
             hysteresis_down: hysteresis_down.1.clone(),
+            temperature_average: temperature_average.1.clone(),
             chart_label: chart_label.clone(),
             chart2_label: chart2_label.clone(),
         },
@@ -1275,6 +1310,7 @@ struct FanEditorView {
     direct_explanation: gtk::Label,
     hysteresis_up: gtk::Scale,
     hysteresis_down: gtk::Scale,
+    temperature_average: gtk::Scale,
     chart_label: gtk::Label,
     chart2_label: gtk::Label,
 }
@@ -1342,10 +1378,16 @@ impl ProfileEditorView {
                 .hysteresis_down
                 .set_value(f64::from(profile.fan_hysteresis_down));
             self.fans
+                .temperature_average
+                .set_value(f64::from(profile.fan_temperature_average_seconds));
+            self.fans
                 .hysteresis_up
                 .set_sensitive(profile.fan_control_mode == FanControlMode::Direct);
             self.fans
                 .hysteresis_down
+                .set_sensitive(profile.fan_control_mode == FanControlMode::Direct);
+            self.fans
+                .temperature_average
                 .set_sensitive(profile.fan_control_mode == FanControlMode::Direct);
             self.power.spl.set_value(profile.pl1_spl as f64);
             self.power.sppt.set_value(profile.pl2_sppt as f64);

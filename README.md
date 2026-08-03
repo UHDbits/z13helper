@@ -74,11 +74,13 @@ power happens before relaxing that protection.
 
 At 80 W and above, the hardware copy locks point 7 to 80°C and at least 80% PWM and
 point 8 to 90°C and 100%. An Advanced override can disable this protection only
-after confirmation. Direct mode interpolates the curve into raw 0–255 EC PWM
-duty and provides per-profile 1–5 speed-up and slow-down temperature hysteresis,
-defaulting to 3/3 like G-Helper. RPM is read separately for telemetry. There is
-intentionally no 96°C panic override: CPU and firmware throttling remain
-authoritative.
+after confirmation. Direct mode averages recent temperature samples before
+interpolating the curve into raw 0–255 EC PWM duty. The per-profile averaging
+window defaults to 6 seconds and can be set from 0–15 seconds; 0 disables it.
+Direct mode also provides per-profile 1–5 speed-up and slow-down temperature
+hysteresis, defaulting to 3/3 like G-Helper. RPM is read separately for telemetry.
+There is intentionally no 96°C panic override: CPU and firmware throttling
+remain authoritative.
 
 ## CLI
 

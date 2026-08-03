@@ -74,9 +74,11 @@ select firmware or direct mode.
 - At 80 W and above, unless the confirmed Advanced override is enabled, a temporary
   hardware copy locks point 7 to 80°C and at least 80% PWM and point 8 to 90°C
   and 100%. Firmware mode verifies both ASUS `pwm_enable` interfaces.
-- Direct mode interpolates the effective curve and writes raw 0–255 PWM duty to
-  the EC. RPM is separate telemetry. Its 1–5 speed-up and slow-down hysteresis
-  values are per profile and default to 3/3.
+- Direct mode averages recent temperature samples before interpolating the
+  effective curve and writing raw 0–255 PWM duty to the EC. The per-profile
+  averaging window defaults to 6 seconds and can be set from 0–15 seconds; 0
+  disables averaging. RPM is separate telemetry. Its 1–5 speed-up and slow-down
+  hysteresis values are per profile and default to 3/3.
 - Below 80 W endpoint protection is inactive.
 - No temperature-only 96°C full-speed override exists. CPU and firmware thermal
   throttling remain the final authority.

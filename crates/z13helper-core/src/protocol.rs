@@ -14,6 +14,8 @@ pub struct FanHysteresis {
     pub down: u8,
 }
 
+pub const MAX_FAN_TEMPERATURE_AVERAGE_SECONDS: u8 = 15;
+
 impl Default for FanHysteresis {
     fn default() -> Self {
         Self { up: 3, down: 3 }
@@ -154,6 +156,8 @@ pub struct DaemonState {
     pub fan_rpms: [u32; 2],
     #[serde(default)]
     pub fan_hysteresis: FanHysteresis,
+    #[serde(default = "crate::profile::default_fan_temperature_average_seconds")]
+    pub fan_temperature_average_seconds: u8,
     #[serde(default)]
     pub direct_fan_duties: [u8; 2],
     #[serde(default)]
@@ -201,6 +205,8 @@ impl Default for DaemonState {
             temperature: None,
             fan_rpms: [0; 2],
             fan_hysteresis: FanHysteresis::default(),
+            fan_temperature_average_seconds:
+                crate::profile::default_fan_temperature_average_seconds(),
             direct_fan_duties: [0; 2],
             high_power_fan_protection: false,
             disable_high_power_fan_protection: false,
@@ -224,6 +230,8 @@ pub struct ApplyRequest {
     pub cpu_temp_limit: u8,
     #[serde(default)]
     pub fan_hysteresis: FanHysteresis,
+    #[serde(default = "crate::profile::default_fan_temperature_average_seconds")]
+    pub fan_temperature_average_seconds: u8,
     #[serde(default)]
     pub disable_high_power_fan_protection: bool,
 }
@@ -259,6 +267,7 @@ impl ApplyRequest {
                 up: profile.fan_hysteresis_up,
                 down: profile.fan_hysteresis_down,
             },
+            fan_temperature_average_seconds: profile.fan_temperature_average_seconds,
             disable_high_power_fan_protection,
         }
     }
@@ -276,6 +285,11 @@ impl ApplyRequest {
 
     pub fn validate(&self) -> Result<(), String> {
         self.fan_hysteresis.validate()?;
+        if self.fan_temperature_average_seconds > MAX_FAN_TEMPERATURE_AVERAGE_SECONDS {
+            return Err(format!(
+                "fan temperature averaging must be between 0 and {MAX_FAN_TEMPERATURE_AVERAGE_SECONDS} seconds"
+            ));
+        }
         if let Some(curves) = &self.fan_curves {
             for curve in curves {
                 crate::curve::validate(curve).map_err(|error| error.to_string())?;
@@ -428,6 +442,25 @@ mod tests {
         assert!(FanHysteresis { up: 1, down: 5 }.validate().is_ok());
         assert!(FanHysteresis { up: 0, down: 3 }.validate().is_err());
         assert!(FanHysteresis { up: 3, down: 6 }.validate().is_err());
+    }
+
+    #[test]
+    fn temperature_average_is_profile_configurable_and_bounded() {
+        let mut profile = Profile::builtin("balanced", "Balanced");
+        assert_eq!(
+            ApplyRequest::from_profile(&profile, false).fan_temperature_average_seconds,
+            6
+        );
+
+        profile.fan_temperature_average_seconds = 0;
+        assert!(ApplyRequest::from_profile(&profile, false)
+            .validate()
+            .is_ok());
+
+        profile.fan_temperature_average_seconds = MAX_FAN_TEMPERATURE_AVERAGE_SECONDS + 1;
+        assert!(ApplyRequest::from_profile(&profile, false)
+            .validate()
+            .is_err());
     }
 
     #[test]

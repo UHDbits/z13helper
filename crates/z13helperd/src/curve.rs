@@ -1,4 +1,47 @@
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
 use z13helper_core::curve::Curve;
+
+#[derive(Debug, Default)]
+pub struct TemperatureAverager {
+    samples: VecDeque<(Instant, i32)>,
+}
+
+impl TemperatureAverager {
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    pub fn update(&mut self, now: Instant, temperature_c: i32, seconds: u8) -> i32 {
+        if seconds == 0 {
+            self.clear();
+            return temperature_c;
+        }
+
+        self.samples.push_back((now, temperature_c));
+        let window = Duration::from_secs(u64::from(seconds));
+        while self
+            .samples
+            .front()
+            .is_some_and(|(sampled_at, _)| now.duration_since(*sampled_at) >= window)
+        {
+            self.samples.pop_front();
+        }
+
+        let count = self.samples.len() as i64;
+        let sum: i64 = self
+            .samples
+            .iter()
+            .map(|(_, temperature)| i64::from(*temperature))
+            .sum();
+        if sum >= 0 {
+            ((sum + count / 2) / count) as i32
+        } else {
+            ((sum - count / 2) / count) as i32
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct HysteresisState {
@@ -50,6 +93,8 @@ pub fn duty_at(curve: &Curve, temperature_c: i32) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     fn curve() -> Curve {
@@ -80,5 +125,27 @@ mod tests {
     #[test]
     fn temperature_alone_never_overrides_curve() {
         assert_eq!(duty_at(&curve(), 100), 180);
+    }
+
+    #[test]
+    fn temperature_average_uses_the_configured_rolling_window() {
+        let start = Instant::now();
+        let mut average = TemperatureAverager::default();
+        assert_eq!(average.update(start, 60, 6), 60);
+        assert_eq!(average.update(start + Duration::from_secs(1), 66, 6), 63);
+        assert_eq!(average.update(start + Duration::from_secs(2), 72, 6), 66);
+        assert_eq!(
+            average.update(start + Duration::from_secs(6), 78, 6),
+            (66 + 72 + 78) / 3
+        );
+    }
+
+    #[test]
+    fn zero_temperature_average_returns_raw_values_and_clears_history() {
+        let start = Instant::now();
+        let mut average = TemperatureAverager::default();
+        assert_eq!(average.update(start, 60, 6), 60);
+        assert_eq!(average.update(start + Duration::from_secs(1), 72, 0), 72);
+        assert_eq!(average.update(start + Duration::from_secs(2), 60, 6), 60);
     }
 }
