@@ -11,14 +11,15 @@ use z13helper_core::protocol::{
 use crate::aura::AuraDevices;
 use crate::ec::{EcMailbox, LinuxPortIo};
 use crate::sensors;
-use crate::service::{Controller, HwmonSensors};
+use crate::service::Controller;
 use crate::state::{PersistedState, StateStore};
 use crate::sysfs::Sysfs;
 
 pub struct PlatformHardware {
     sysfs: Sysfs,
     aura: AuraDevices,
-    direct: Controller<LinuxPortIo, HwmonSensors>,
+    direct: Controller<LinuxPortIo>,
+    latest_temperature_millic: Option<i32>,
     fan_hysteresis: FanHysteresis,
     fan_temperature_average_seconds: u8,
     disable_high_power_fan_protection: bool,
@@ -30,7 +31,7 @@ pub struct PlatformHardware {
 impl PlatformHardware {
     pub fn acquire() -> Result<(Self, ProbeReply), String> {
         let io = LinuxPortIo::acquire().map_err(|error| error.to_string())?;
-        let mut direct = Controller::new(EcMailbox::new(io), HwmonSensors);
+        let mut direct = Controller::new(EcMailbox::new(io));
         let probe = direct.startup_release_and_probe()?;
         let sysfs = Sysfs::default();
         let undervolt_available = sysfs.probe_undervolt_once();
@@ -42,6 +43,7 @@ impl PlatformHardware {
                 sysfs,
                 aura,
                 direct,
+                latest_temperature_millic: None,
                 fan_hysteresis: FanHysteresis::default(),
                 fan_temperature_average_seconds:
                     z13helper_core::profile::default_fan_temperature_average_seconds(),
@@ -66,7 +68,54 @@ impl PlatformHardware {
     }
 
     pub fn tick(&mut self) -> Result<(), String> {
-        self.direct.tick()
+        self.sample_direct_temperature(|direct, now, temperature| direct.tick(now, temperature))
+    }
+
+    fn prime_direct(&mut self) -> Result<(), String> {
+        self.sample_direct_temperature(|direct, now, temperature| direct.prime(now, temperature))
+    }
+
+    fn sample_direct_temperature(
+        &mut self,
+        control: impl FnOnce(
+            &mut Controller<LinuxPortIo>,
+            std::time::Instant,
+            i32,
+        ) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if !self.direct.direct_enabled() {
+            return Ok(());
+        }
+        let temperature_millic = match sensors::read_temperature_millic() {
+            Ok(temperature) => temperature,
+            Err(error) => {
+                self.latest_temperature_millic = None;
+                return Err(self.direct.sensor_failed(error.to_string()));
+            }
+        };
+        self.latest_temperature_millic = Some(temperature_millic);
+        control(
+            &mut self.direct,
+            std::time::Instant::now(),
+            temperature_millic,
+        )
+    }
+
+    fn observed_temperature_c(&mut self) -> Option<i32> {
+        if !self.direct.direct_enabled() || self.latest_temperature_millic.is_none() {
+            self.latest_temperature_millic = sensors::read_temperature_millic().ok();
+        }
+        self.latest_temperature_millic.map(|temperature| {
+            if temperature >= 0 {
+                (temperature + 500) / 1_000
+            } else {
+                (temperature - 500) / 1_000
+            }
+        })
+    }
+
+    fn observed_fan_rpms(&mut self) -> Option<[u32; 2]> {
+        sensors::read_fan_rpms().ok()
     }
 
     pub fn release_direct(&mut self) -> Result<(), String> {
@@ -184,7 +233,12 @@ impl Daemon for PlatformHardware {
                 self.fan_hysteresis,
                 self.fan_temperature_average_seconds,
             )
-            .map_err(DaemonError::Rejected)
+            .map_err(DaemonError::Rejected)?;
+        // A fresh direct-mode install has no trustworthy previous commanded
+        // duty to ramp from. Establish the authored curve target immediately;
+        // subsequent thermal changes use the asymmetric output ramp. This is
+        // also the proof of fan protection required before high-power PPT rises.
+        self.prime_direct().map_err(DaemonError::Rejected)
     }
 
     fn fans_release(&mut self) -> Result<(), DaemonError> {
@@ -273,7 +327,6 @@ impl Backend {
             self.persisted.state.degraded = true;
             self.persisted.state.warnings.push(error);
         }
-        self.observe();
     }
 
     pub fn apply(&mut self, request: ApplyRequest) -> Result<ApplyResponse, DaemonError> {
@@ -575,7 +628,9 @@ impl Backend {
         }
     }
 
-    fn observe(&mut self) {
+    /// Refresh expensive platform and UI telemetry. Direct fan sampling is
+    /// intentionally kept separate so this can remain on the one-second path.
+    pub fn observe(&mut self) {
         if let Ok(tdp) = self.hardware.sysfs.read_tdp() {
             self.persisted.state.tdp = Some(tdp);
         }
@@ -591,9 +646,11 @@ impl Backend {
         if let Ok(value) = self.hardware.sysfs.read_armoury_bool("panel_overdrive") {
             self.persisted.state.panel_overdrive = Some(value);
         }
-        if let Ok(snapshot) = sensors::read_snapshot() {
-            self.persisted.state.temperature = Some(snapshot.apu_temperature_c);
-            self.persisted.state.fan_rpms = snapshot.rpm;
+        if let Some(temperature) = self.hardware.observed_temperature_c() {
+            self.persisted.state.temperature = Some(temperature);
+        }
+        if let Some(rpms) = self.hardware.observed_fan_rpms() {
+            self.persisted.state.fan_rpms = rpms;
         }
         self.hardware.refresh_aura();
         self.hardware.refresh_ppd();

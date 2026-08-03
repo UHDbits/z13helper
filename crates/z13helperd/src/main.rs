@@ -17,7 +17,7 @@ use z13helperd::ec::{EcMailbox, LinuxPortIo};
 use z13helperd::input::spawn_button_watcher;
 use z13helperd::protocol::{handle_line, Dispatch};
 use z13helperd::resume::{spawn_resume_watcher, SleepEvent};
-use z13helperd::service::{Controller, HwmonSensors};
+use z13helperd::service::{Controller, DIRECT_TICK_INTERVAL};
 
 mod logging;
 
@@ -135,7 +135,7 @@ fn broadcast(subscribers: &Arc<Mutex<Vec<Subscriber>>>, kind: DaemonEventKind) {
 fn release_ec_only() -> Result<()> {
     verify_model()?;
     let io = LinuxPortIo::acquire().context("acquire EC mailbox ports")?;
-    let mut controller = Controller::new(EcMailbox::new(io), HwmonSensors);
+    let mut controller = Controller::new(EcMailbox::new(io));
     controller
         .release()
         .map_err(anyhow::Error::msg)
@@ -160,7 +160,8 @@ fn main() -> Result<()> {
     spawn_button_watcher(event_tx, Arc::clone(&terminate));
     let (sleep_tx, sleep_rx) = mpsc::channel();
     spawn_resume_watcher(sleep_tx);
-    let mut next_tick = Instant::now();
+    let mut next_direct_tick = Instant::now();
+    let mut next_observe = Instant::now();
     let mut next_hotplug = Instant::now();
     tracing::info!(
         socket = SOCKET_PATH,
@@ -187,9 +188,13 @@ fn main() -> Result<()> {
                 }
             }
         }
-        if Instant::now() >= next_tick {
+        if Instant::now() >= next_direct_tick {
             backend.lock().unwrap().tick();
-            next_tick = Instant::now() + Duration::from_secs(1);
+            next_direct_tick = Instant::now() + DIRECT_TICK_INTERVAL;
+        }
+        if Instant::now() >= next_observe {
+            backend.lock().unwrap().observe();
+            next_observe = Instant::now() + Duration::from_secs(1);
         }
         if Instant::now() >= next_hotplug {
             backend.lock().unwrap().restore_hotplugged_lighting();
