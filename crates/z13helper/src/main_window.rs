@@ -733,12 +733,9 @@ fn install_color_chooser(
 ) {
     // GtkColorDialogButton runs its built-in activation before regular signal
     // handlers. Claim pointer activation during capture so only our
-    // application-owned transient is opened.
+    // application-owned chooser is opened.
     let click = gtk::GestureClick::new();
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
-    click.connect_pressed(|gesture, _, _, _| {
-        gesture.set_state(gtk::EventSequenceState::Claimed);
-    });
     let color_button = button.clone();
     let gamescope_pages = gamescope_pages.cloned();
     let gamescope_picker_height = state.gamescope.as_ref().map(|gamescope| {
@@ -758,11 +755,33 @@ fn install_color_chooser(
             present_color_chooser(&chooser_state, &color_button);
         }
     });
+    let in_gamescope = state.gamescope.is_some();
     let click_chooser = open_chooser.clone();
-    click.connect_released(move |gesture, _, _, _| {
+    click.connect_pressed(move |gesture, _, _, _| {
         gesture.set_state(gtk::EventSequenceState::Claimed);
-        click_chooser();
+        // Under gamescope/Xwayland the release is often dropped after a
+        // capture-phase claim, so open immediately there. Desktop keeps the
+        // normal press-claim / release-open sequence.
+        if in_gamescope {
+            click_chooser();
+        }
     });
+    if !in_gamescope {
+        let click_chooser = open_chooser.clone();
+        click.connect_released(move |gesture, _, x, y| {
+            // Match ordinary button activation: releasing outside the widget
+            // cancels the click.
+            let Some(widget) = gesture.widget() else {
+                return;
+            };
+            if x < 0.0 || y < 0.0 || x > f64::from(widget.width()) || y > f64::from(widget.height())
+            {
+                return;
+            }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            click_chooser();
+        });
+    }
     button.add_controller(click);
     state.register_controller_activation(button, move || open_chooser());
 }
