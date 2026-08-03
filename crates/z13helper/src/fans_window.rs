@@ -199,11 +199,6 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
 
     let hysteresis_group = adw::PreferencesGroup::builder()
         .title("Direct EC Hysteresis")
-        .description(
-            "Directional temperature deadbands for direct EC control. Values 1–5 mirror \
-             G-Helper and default to 3/3; firmware mode manages its own hysteresis. The \
-             temperature average below defaults to 6 seconds; set it to 0 to disable it.",
-        )
         .build();
     let hysteresis_up = slider_row(
         "Fan speed-up hysteresis",
