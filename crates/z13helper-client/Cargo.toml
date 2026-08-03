@@ -6,7 +6,6 @@ license.workspace = true
 description = "Typed NDJSON client for z13helperd"
 
 [dependencies]
-serde = { workspace = true }
 serde_json = { workspace = true }
 z13helper-core = { path = "../z13helper-core" }
 

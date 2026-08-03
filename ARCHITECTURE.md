@@ -6,7 +6,7 @@ The Cargo workspace has five crates:
 
 | Crate | Boundary |
 |---|---|
-| `z13helper-core` | Pure profiles, v1 protocol, errors, config, curve math, safety policy, apply planning |
+| `z13helper-core` | Pure profiles, v2 protocol, errors, config, curve math, safety policy, apply planning |
 | `z13helper-client` | Versioned NDJSON Unix-socket transport |
 | `z13helper` | GTK application, controllers, section views, and background UI services |
 | `z13helperd` | Privileged hardware ownership, persistence, lifecycle, and event dispatch |
@@ -23,15 +23,17 @@ flowchart LR
   GUI --> CORE["z13helper-core"]
   CLI --> CORE
   CLIENT --> CORE
-  CLIENT -->|"v1 NDJSON / AF_UNIX"| DAEMON["z13helperd"]
+  CLIENT -->|"v2 NDJSON / AF_UNIX"| DAEMON["z13helperd"]
   DAEMON --> CORE
   DAEMON --> HW["sysfs · D-Bus · hidraw · input · SMU · EC"]
 ```
 
-Only `z13helperd` touches hardware. The socket is
-`/run/z13helper/z13helperd.sock`, owned by `root:z13helper`. Requests carry a
-protocol version, stable wire error codes, a bounded line size, and a command
-deadline. Complete applies are serialized so the last successful request wins.
+Only `z13helperd` writes hardware or opens hidraw, input, SMU, or raw I/O;
+the GTK process additionally reads `/sys/class/power_supply` read-only as a
+UPower fallback. The socket is `/run/z13helper/z13helperd.sock`, owned by
+`root:z13helper`. Requests carry a protocol version, stable wire error codes,
+and a command deadline; the daemon enforces a bounded request line size.
+Complete applies are serialized so the last successful request wins.
 
 ## State ownership
 
@@ -170,10 +172,11 @@ program using `CAP_BPF` and `CAP_PERFMON`. During capture it blocks only the
 daemon-derived Steam process tree from reading hidraw device nodes, which
 prevents duplicate PlayStation/Nintendo input without pausing Steam or granting
 capabilities to the GUI. The hidraw major is read from `/proc/devices`, and the
-BPF program uses the kernel `i_rdev` major encoding (`dev >> 20`). The BPF map is
-cleared before the controller is released and when the daemon shuts down. The
-system unit therefore keeps `/proc` visible enough to discover Steam and leaves
-`MemoryDenyWriteExecute` off so libbpf can load the LSM program.
+BPF program uses the kernel `i_rdev` major encoding (`dev >> 20`). The
+controller grab is released first and the BPF map is cleared immediately after;
+the map is also cleared on daemon shutdown. The system unit therefore keeps
+`/proc` visible enough to discover Steam and leaves `MemoryDenyWriteExecute` off
+so libbpf can load the LSM program.
 
 GTK accessibility remains enabled for screen readers and other assistive
 technology. Ctrl+W closes the active auxiliary window or hides the main window.

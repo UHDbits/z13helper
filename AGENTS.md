@@ -49,23 +49,29 @@ require execution outside a restricted sandbox.
 ## Apply invariants
 
 - Prevalidate a complete request before touching hardware and serialize applies.
-- Selecting a base writes every platform-profile device and restores its
-  measured five-value stock PPT table.
+- Selecting a base chooses the profile through power-profiles-daemon over D-Bus
+  and restores its measured five-value stock PPT table.
 - PPD is independent. Reject unknown selections; warn and continue if PPD is
   absent.
-- Above 75 W PL1, confirm target fan protection before raising power; abandon
-  the increase if preparation fails.
+- At 80 W or above PL1, confirm target fan protection before raising power;
+  abandon the increase if preparation fails.
 - When lowering power, write PPT before relaxing previous fan protection.
 - Undervolt is last. Retain safety fan protection on rollback/failure and report
   degraded state if rollback is incomplete.
 
 ## Fan policy
 
-- Preserve two authored eight-point curves without safety mutation.
-- Firmware mode transforms only the copy written to hardware.
-- Direct mode alone uses engage/release hysteresis and dwell.
-- Bounds: engage 60–70°C, release 50–65°C and at least 5°C lower, floor
-  204–255 PWM, dwell 5–30 s. Defaults: 70/65°C, 204 PWM, 5 s.
+- Preserve two authored eight-point curves without safety mutation; only the
+  copy written to hardware is transformed.
+- At 80 W and above, the hardware copy locks point 7 to 80°C and at least 204
+  PWM (80%) and point 8 to 90°C and 255 (100%), unless the confirmed Advanced
+  override is set.
+- Direct mode samples temperature every 250 ms, averages over a per-profile
+  window (default 6 s, settable 0–15 s, 0 disables), then interpolates the
+  curve to raw 0–255 PWM.
+- Per-profile directional hysteresis of 1–5 (default 3/3) applies only when
+  temperature direction reverses, and only in direct mode.
+- Unchanged PWM duties are not rewritten.
 - There is no 96°C panic/full-speed override; CPU/firmware throttling is
   authoritative.
 - Release direct EC control first at startup, before suspend, and on sensor/EC

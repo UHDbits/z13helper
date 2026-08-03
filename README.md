@@ -2,8 +2,9 @@
 
 `z13helper` is a self-contained Linux control platform for the ASUS ROG Flow
 Z13 (2025, GZ302EA). It ships a GTK4/libadwaita desktop application, one
-privileged hardware daemon, and a diagnostic CLI. The GTK process never opens
-sysfs, hidraw, input devices, the SMU, or raw I/O ports.
+privileged hardware daemon, and a diagnostic CLI. The GTK process never writes
+hardware or opens hidraw, input devices, the SMU, or raw I/O ports; it may read
+`/sys/class/power_supply` read-only as a UPower fallback.
 
 The shipped components are:
 
@@ -27,13 +28,15 @@ The configuration starts at schema version 1 and lives at:
 $XDG_CONFIG_HOME/z13helper/config.json
 ```
 
-Unsupported or corrupt files at that path are preserved and reported. The
-application does not discover, import, convert, alias, move, or delete data from
-other paths, and the installer manages only current `z13helper` identifiers.
+An unsupported schema version at that path is left untouched and reported. A
+corrupt or unparseable file is preserved alongside as `config.json.corrupt` and
+fresh defaults are written at the original path. The application does not
+discover, import, convert, alias, move, or delete data from other paths, and the
+installer manages only current `z13helper` identifiers.
 
 ## Build and install
 
-Rust 1.80+, GTK 4.14+, and libadwaita 1.5+ are required.
+Rust 1.92+, GTK 4.14+, and libadwaita 1.5+ are required.
 
 ```sh
 make build
@@ -132,7 +135,8 @@ remain authoritative.
 ## CLI
 
 `z13helperctl status` and `z13helperctl probe` print JSON. `watch` streams daemon
-events, while `apply -` accepts a complete version-1 apply request on stdin.
+events, while `apply -` accepts a complete apply request on stdin over the v2
+wire protocol.
 Focused commands cover PPD, PPT, fans, undervolt, lighting, battery,
 panel overdrive, and direct-fan release. The CLI never owns named GUI profiles.
 
