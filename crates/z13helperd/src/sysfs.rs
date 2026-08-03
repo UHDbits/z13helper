@@ -422,11 +422,15 @@ fn poll_smu_power_limits(
 
 fn verify_smu_power_limits(actual: [f32; 4], expected: [i32; 4]) -> Result<(), String> {
     let rounded_actual = actual.map(|value| value.round() as i32);
-    if rounded_actual == expected {
+    // STAPM is a firmware-managed skin-temperature limit and may be
+    // recalculated independently while the other PPT limits remain fixed.
+    if rounded_actual[1..] == expected[1..] {
         Ok(())
     } else {
         Err(format!(
-            "SMU power-limit verification failed: requested {expected:?} W, firmware reports {rounded_actual:?} W (raw {actual:?})"
+            "SMU power-limit verification failed: requested fast/slow/APU {:?} W, firmware reports {:?} W (STAPM ignored; raw {actual:?})",
+            &expected[1..],
+            &rounded_actual[1..]
         ))
     }
 }
@@ -727,6 +731,11 @@ mod tests {
     }
 
     #[test]
+    fn smu_power_limit_verification_ignores_firmware_managed_stapm() {
+        assert!(verify_smu_power_limits([84.0, 86.0, 70.0, 70.0], [86, 86, 70, 70],).is_ok());
+    }
+
+    #[test]
     fn smu_power_limit_verification_waits_through_a_transient_readback() {
         let mut readings = vec![
             [84.00001, 86.00001, 70.00001, 70.00001],
@@ -746,7 +755,8 @@ mod tests {
     fn smu_power_limit_verification_rejects_a_real_mismatch() {
         let error =
             verify_smu_power_limits([120.0, 120.0, 94.0, 93.0], [93, 120, 93, 93]).unwrap_err();
-        assert!(error.contains("requested [93, 120, 93, 93]"));
-        assert!(error.contains("firmware reports [120, 120, 94, 93]"));
+        assert!(error.contains("requested fast/slow/APU [120, 93, 93]"));
+        assert!(error.contains("firmware reports [120, 94, 93]"));
+        assert!(error.contains("STAPM ignored"));
     }
 }
