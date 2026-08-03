@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: z13helper
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build release package
+        run: |
+          nix build -L .#z13helper
+          mkdir -p dist
+          cp -a result/bin/z13helper dist/
+          cp -a result/bin/z13helperctl dist/
+          cp -a result/libexec/z13helperd dist/
+          tar -C dist -czf "z13helper-${GITHUB_REF_NAME}-x86_64-linux.tar.gz" \
+            z13helper z13helperctl z13helperd
+          cd dist
+          sha256sum z13helper z13helperctl z13helperd \
+            > "../z13helper-${GITHUB_REF_NAME}-x86_64-linux.sha256"
+          cd ..
+          mv "z13helper-${GITHUB_REF_NAME}-x86_64-linux.tar.gz" .
+          cp dist/z13helper "z13helper-${GITHUB_REF_NAME}-x86_64-linux"
+          cp dist/z13helperctl "z13helperctl-${GITHUB_REF_NAME}-x86_64-linux"
+          cp dist/z13helperd "z13helperd-${GITHUB_REF_NAME}-x86_64-linux"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            z13helper-${{ github.ref_name }}-x86_64-linux.tar.gz
+            z13helper-${{ github.ref_name }}-x86_64-linux.sha256
+            z13helper-${{ github.ref_name }}-x86_64-linux
+            z13helperctl-${{ github.ref_name }}-x86_64-linux
+            z13helperd-${{ github.ref_name }}-x86_64-linux

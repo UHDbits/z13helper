@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - uses: cachix/cachix-action@v15
+        with:
+          # Create a Cachix cache named "z13helper" and set CACHIX_AUTH_TOKEN.
+          name: z13helper
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          # Allow PRs from forks to evaluate without a push token.
+          skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+
+      - name: Build and check
+        run: |
+          nix flake check -L
+          nix build -L .#z13helper
+          nix build -L .#z13helper-debug

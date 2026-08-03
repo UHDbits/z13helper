@@ -65,6 +65,84 @@ Optional GTK layer-shell support can be built with:
 cargo build -p z13helper --features layer-shell
 ```
 
+## Nix
+
+A flake provides packages, a development shell, a NixOS module, and a Home
+Manager module.
+
+```sh
+nix develop          # Rust ≥1.92, GTK4, libadwaita, libbpf, clippy/rustfmt
+nix build            # release package (GUI, daemon, CLI)
+nix build .#z13helper-debug
+nix build .#z13helper-layer-shell
+nix flake check
+```
+
+The package installs `z13helper` and `z13helperctl` under `$out/bin`,
+`z13helperd` under `$out/libexec`, plus the desktop entry and icon.
+
+### NixOS
+
+```nix
+{
+  inputs.z13helper.url = "github:UHDbits/z13helper";
+
+  outputs = { nixpkgs, z13helper, ... }: {
+    nixosConfigurations.z13 = nixpkgs.lib.nixosSystem {
+      modules = [
+        z13helper.nixosModules.default
+        {
+          services.z13helperd.enable = true;
+          services.z13helperd.users = [ "alice" ];
+          # Optional machine knobs applied via z13helperctl after the daemon starts:
+          # services.z13helperd.settings = {
+          #   batteryLimit = 80;
+          #   lighting.keyboard = { mode = "static"; color = "FF0000"; brightness = 3; };
+          # };
+          programs.z13helper.enable = true;
+        }
+      ];
+    };
+  };
+}
+```
+
+### Home Manager
+
+Declarative user config serializes to schema-v1
+`$XDG_CONFIG_HOME/z13helper/config.json`. When `settings` is set, Home Manager
+owns that file (GUI edits may be overwritten on the next activation).
+
+```nix
+{
+  imports = [ inputs.z13helper.homeModules.default ];
+  # Also exported as homeManagerModules.default
+
+  programs.z13helper = {
+    enable = true;
+    systemd.enable = true; # optional resident GUI user service
+    settings = {
+      active_profile = "balanced";
+      auto_switch_on_power_source = true;
+      # profiles = [ ... ];  # full schema-v1 profile objects when desired
+    };
+  };
+}
+```
+
+### CI / Cachix / Releases
+
+GitHub Actions builds with Nix on push/PR and pushes to the `z13helper` Cachix
+cache when `CACHIX_AUTH_TOKEN` is set. Tag pushes matching `v*` also attach
+x86_64-linux binaries to a GitHub Release.
+
+Required repository secret:
+
+- `CACHIX_AUTH_TOKEN` — write token for the `z13helper` Cachix cache
+
+Create the cache at https://app.cachix.org/ and add the token before relying on
+CI pushes. Pull-through still works for public caches without a token.
+
 ## Gamescope
 
 When `GAMESCOPE_WAYLAND_DISPLAY` names a real socket inside
