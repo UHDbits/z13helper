@@ -81,8 +81,8 @@ are clamped to 1.0–3.0 so an accidental setting cannot make the interface
 unusable.
 
 While the Gamescope overlay is visible, `z13helperd` exclusively captures
-connected gamepads: the D-pad moves GTK focus, A activates the focused control,
-and B goes back or closes the active window. Capture is released just after the
+connected gamepads: the D-pad and left stick move GTK focus, A activates the
+focused control, and B goes back or closes the active window. Capture is released just after the
 dismiss-button release when the overlay hides. A short renewable lease also
 releases it automatically if the GUI exits unexpectedly, so a crashed overlay
 cannot keep input from a game.

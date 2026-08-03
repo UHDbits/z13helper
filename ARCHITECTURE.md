@@ -156,7 +156,8 @@ its color chooser is a page in the main window stack.
 
 Controller capture follows the hardware-access boundary: only `z13helperd`
 opens controller evdev nodes and issues `EVIOCGRAB`; the GUI receives normalized
-protocol-v2 D-pad/A/B actions and touches widgets only on GLib's main context.
+protocol-v2 D-pad, left-stick, and A/B actions and touches widgets only on
+GLib's main context.
 The GUI renews a three-second capture lease once per second while the Gamescope
 overlay is visible. Hiding or closing waits 200 ms to consume the dismiss
 release before relinquishing capture, and lease expiry provides crash recovery.

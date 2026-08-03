@@ -14,6 +14,8 @@ use z13helper_core::{ControllerAction, DaemonEventKind};
 const KEY_PROG3: u16 = 202;
 const EV_KEY: u16 = 1;
 const EV_ABS: u16 = 3;
+const ABS_X: u16 = 0;
+const ABS_Y: u16 = 1;
 const ABS_HAT0X: u16 = 16;
 const ABS_HAT0Y: u16 = 17;
 const INPUT_PROP_ACCELEROMETER: usize = 6;
@@ -29,6 +31,10 @@ const EVIOCGRAB: libc::c_ulong = 0x4004_4590;
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const REPEAT_INITIAL: Duration = Duration::from_millis(400);
 const REPEAT_INTERVAL: Duration = Duration::from_millis(120);
+/// ~40% of signed 16-bit stick range; engage a digital direction.
+const STICK_ENGAGE: i32 = 13107;
+/// ~25% of signed 16-bit stick range; release with hysteresis below engage.
+const STICK_RELEASE: i32 = 8192;
 
 const GAMEPAD_BUTTONS: &[usize] = &[
     304, 305, 307, 308, 310, 311, 312, 313, 314, 315, 316, 317, 318, 319,
@@ -92,12 +98,20 @@ impl CapabilityBits {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StickState {
+    x: i32,
+    y: i32,
+    direction: Option<ControllerAction>,
+}
+
 struct ControllerDevice {
     path: PathBuf,
     file: File,
     class: DeviceClass,
     grabbed: bool,
     held: HashMap<ControllerAction, Instant>,
+    stick: StickState,
 }
 
 pub struct ControllerCaptureHandle {
@@ -179,6 +193,7 @@ fn controller_loop(
                         }
                         set_grabbed(device, requested);
                         device.held.clear();
+                        device.stick = StickState::default();
                     }
                     capturing = requested;
                 }
@@ -279,6 +294,7 @@ fn scan_controllers(devices: &mut Vec<ControllerDevice>, capture: bool) {
             class,
             grabbed: false,
             held: HashMap::new(),
+            stick: StickState::default(),
         };
         if capture {
             drain_device(&mut device);
@@ -424,6 +440,14 @@ fn handle_controller_event(
                 device.held.remove(&action);
             }
         }
+        EV_ABS if code == ABS_X || code == ABS_Y => {
+            if code == ABS_X {
+                device.stick.x = value;
+            } else {
+                device.stick.y = value;
+            }
+            apply_stick_direction(device, sender);
+        }
         EV_ABS if code == ABS_HAT0X => {
             device.held.remove(&ControllerAction::Left);
             device.held.remove(&ControllerAction::Right);
@@ -443,6 +467,91 @@ fn handle_controller_event(
             }
         }
         _ => {}
+    }
+}
+
+/// Map left-stick axes to a single digital direction with deadzone hysteresis.
+/// Dominant-axis selection prevents diagonals from alternating Left/Up.
+fn stick_direction(x: i32, y: i32, current: Option<ControllerAction>) -> Option<ControllerAction> {
+    let ax = x.saturating_abs();
+    let ay = y.saturating_abs();
+    let dominant = |horizontal: bool| -> Option<ControllerAction> {
+        if horizontal {
+            if x < 0 {
+                Some(ControllerAction::Left)
+            } else if x > 0 {
+                Some(ControllerAction::Right)
+            } else {
+                None
+            }
+        } else if y < 0 {
+            Some(ControllerAction::Up)
+        } else if y > 0 {
+            Some(ControllerAction::Down)
+        } else {
+            None
+        }
+    };
+
+    match current {
+        None => {
+            if ax < STICK_ENGAGE && ay < STICK_ENGAGE {
+                None
+            } else if ax >= ay {
+                dominant(true)
+            } else {
+                dominant(false)
+            }
+        }
+        Some(held) => {
+            let held_horizontal = matches!(held, ControllerAction::Left | ControllerAction::Right);
+            let other_dominates = if held_horizontal {
+                ay > ax && ay >= STICK_ENGAGE
+            } else {
+                ax > ay && ax >= STICK_ENGAGE
+            };
+            if other_dominates {
+                return if ax >= ay {
+                    dominant(true)
+                } else {
+                    dominant(false)
+                };
+            }
+
+            let held_aligned = match held {
+                ControllerAction::Left => x < 0,
+                ControllerAction::Right => x > 0,
+                ControllerAction::Up => y < 0,
+                ControllerAction::Down => y > 0,
+                ControllerAction::Accept | ControllerAction::Back => false,
+            };
+            let held_mag = if held_horizontal { ax } else { ay };
+            if held_aligned && held_mag >= STICK_RELEASE {
+                Some(held)
+            } else if ax >= STICK_ENGAGE || ay >= STICK_ENGAGE {
+                if ax >= ay {
+                    dominant(true)
+                } else {
+                    dominant(false)
+                }
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn apply_stick_direction(device: &mut ControllerDevice, sender: &Sender<ControllerAction>) {
+    let next = stick_direction(device.stick.x, device.stick.y, device.stick.direction);
+    if next == device.stick.direction {
+        return;
+    }
+    if let Some(previous) = device.stick.direction {
+        device.held.remove(&previous);
+    }
+    device.stick.direction = next;
+    if let Some(action) = next {
+        emit_press(device, action, sender);
     }
 }
 
@@ -508,8 +617,60 @@ mod tests {
     fn key_constants_match_linux_input() {
         assert_eq!(EV_KEY, 1);
         assert_eq!(KEY_PROG3, 202);
+        assert_eq!(ABS_X, 0);
+        assert_eq!(ABS_Y, 1);
         assert_eq!(BTN_SOUTH, 0x130);
         assert_eq!(BTN_EAST, 0x131);
+    }
+
+    #[test]
+    fn stick_engages_above_deadzone_and_releases_with_hysteresis() {
+        assert_eq!(stick_direction(0, 0, None), None);
+        assert_eq!(stick_direction(STICK_ENGAGE - 1, 0, None), None);
+        assert_eq!(
+            stick_direction(STICK_ENGAGE, 0, None),
+            Some(ControllerAction::Right)
+        );
+        assert_eq!(
+            stick_direction(0, -STICK_ENGAGE, None),
+            Some(ControllerAction::Up)
+        );
+        assert_eq!(
+            stick_direction(STICK_RELEASE, 0, Some(ControllerAction::Right)),
+            Some(ControllerAction::Right)
+        );
+        assert_eq!(
+            stick_direction(STICK_RELEASE - 1, 0, Some(ControllerAction::Right)),
+            None
+        );
+    }
+
+    #[test]
+    fn stick_picks_dominant_axis_on_diagonals() {
+        assert_eq!(
+            stick_direction(20_000, 10_000, None),
+            Some(ControllerAction::Right)
+        );
+        assert_eq!(
+            stick_direction(10_000, -20_000, None),
+            Some(ControllerAction::Up)
+        );
+        assert_eq!(
+            stick_direction(-20_000, 20_000, None),
+            Some(ControllerAction::Left)
+        );
+    }
+
+    #[test]
+    fn stick_can_switch_axes_while_held() {
+        assert_eq!(
+            stick_direction(5_000, -20_000, Some(ControllerAction::Right)),
+            Some(ControllerAction::Up)
+        );
+        assert_eq!(
+            stick_direction(-20_000, 5_000, Some(ControllerAction::Down)),
+            Some(ControllerAction::Left)
+        );
     }
 
     #[test]
