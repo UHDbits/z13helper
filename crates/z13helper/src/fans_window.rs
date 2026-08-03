@@ -1036,6 +1036,7 @@ fn build_advanced_page(
     gtk::Scale,
 ) {
     let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    page.set_spacing(6);
     page.set_margin_top(12);
     page.set_margin_bottom(12);
     page.set_margin_start(12);

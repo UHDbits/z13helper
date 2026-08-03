@@ -2,7 +2,7 @@ use std::fs;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use z13helper_core::curve::{validate, Curve};
 use z13helper_core::protocol::{BatteryTelemetry, TdpState};
@@ -21,6 +21,8 @@ const STRIX_HALO_FAST_LIMIT_PM_TABLE_OFFSET: usize = 2 * size_of::<f32>();
 const STRIX_HALO_SLOW_LIMIT_PM_TABLE_OFFSET: usize = 4 * size_of::<f32>();
 const STRIX_HALO_APU_SLOW_LIMIT_PM_TABLE_OFFSET: usize = 6 * size_of::<f32>();
 const STRIX_HALO_TCTL_PM_TABLE_OFFSET: usize = 22 * size_of::<f32>();
+const STRIX_HALO_POWER_LIMIT_SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
+const STRIX_HALO_POWER_LIMIT_SETTLE_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone, Debug)]
 pub struct Sysfs {
@@ -365,9 +367,18 @@ impl Sysfs {
     }
 
     fn verify_strix_halo_tdp(&self, state: TdpState) -> Result<(), String> {
+        poll_smu_power_limits(
+            || self.read_strix_halo_power_limits(),
+            [state.pl2_sppt, state.fppt, state.pl1_spl, state.apu_sppt],
+            STRIX_HALO_POWER_LIMIT_SETTLE_TIMEOUT,
+            STRIX_HALO_POWER_LIMIT_SETTLE_INTERVAL,
+        )
+    }
+
+    fn read_strix_halo_power_limits(&self) -> Result<[f32; 4], String> {
         let table = fs::read(self.smu_path("pm_table"))
             .map_err(|error| format!("read SMU PM table: {error}"))?;
-        let actual = [
+        Ok([
             decode_smu_f32(&table, STRIX_HALO_STAPM_PM_TABLE_OFFSET, "STAPM limit")?,
             decode_smu_f32(
                 &table,
@@ -384,11 +395,28 @@ impl Sysfs {
                 STRIX_HALO_APU_SLOW_LIMIT_PM_TABLE_OFFSET,
                 "APU PPT limit",
             )?,
-        ];
-        verify_smu_power_limits(
-            actual,
-            [state.pl2_sppt, state.fppt, state.pl1_spl, state.apu_sppt],
-        )
+        ])
+    }
+}
+
+fn poll_smu_power_limits(
+    mut read_actual: impl FnMut() -> Result<[f32; 4], String>,
+    expected: [i32; 4],
+    timeout: Duration,
+    interval: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let error = match read_actual().and_then(|actual| verify_smu_power_limits(actual, expected))
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+
+        if Instant::now() >= deadline {
+            return Err(error);
+        }
+        thread::sleep(interval);
     }
 }
 
@@ -694,6 +722,22 @@ mod tests {
         assert!(verify_smu_power_limits(
             [120.00001, 120.00001, 93.00001, 92.99999],
             [120, 120, 93, 93],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn smu_power_limit_verification_waits_through_a_transient_readback() {
+        let mut readings = vec![
+            [84.00001, 86.00001, 70.00001, 70.00001],
+            [86.00001, 86.00001, 70.00001, 70.00001],
+        ]
+        .into_iter();
+        assert!(poll_smu_power_limits(
+            || Ok(readings.next().expect("test readback")),
+            [86, 86, 70, 70],
+            Duration::from_millis(10),
+            Duration::ZERO,
         )
         .is_ok());
     }
