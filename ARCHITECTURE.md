@@ -161,13 +161,15 @@ Touchscreen and touchpad nodes without gamepad buttons are excluded; Steam's
 known virtual gamepad is capture-only. Direction holds repeat after 400 ms at
 120 ms intervals. The reader blocks in `poll(2)` on controller fds and a private
 capture-control socket, waking for real input, lease transitions, repeat
-deadlines, or the two-second hotplug scan. Once a hidraw controller is present,
-the daemon attaches a small BPF LSM program using `CAP_BPF` and `CAP_PERFMON`.
-During capture it blocks
-only the daemon-derived Steam process tree from reading hidraw device nodes,
-which prevents duplicate PlayStation/Nintendo input without pausing Steam or
-granting capabilities to the GUI. The BPF map is cleared before the controller
-is released and when the daemon shuts down.
+deadlines, or the two-second hotplug scan. Once a Gamescope capture lease is active, the daemon attaches a small BPF LSM
+program using `CAP_BPF` and `CAP_PERFMON`. During capture it blocks only the
+daemon-derived Steam process tree from reading hidraw device nodes, which
+prevents duplicate PlayStation/Nintendo input without pausing Steam or granting
+capabilities to the GUI. The hidraw major is read from `/proc/devices`, and the
+BPF program uses the kernel `i_rdev` major encoding (`dev >> 20`). The BPF map is
+cleared before the controller is released and when the daemon shuts down. The
+system unit therefore keeps `/proc` visible enough to discover Steam and leaves
+`MemoryDenyWriteExecute` off so libbpf can load the LSM program.
 
 GTK accessibility remains enabled for screen readers and other assistive
 technology. Ctrl+W closes the active auxiliary window or hides the main window.

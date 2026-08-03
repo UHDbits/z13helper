@@ -244,17 +244,10 @@ fn main() -> Result<()> {
             .lock()
             .unwrap()
             .is_some_and(|deadline| deadline > Instant::now());
-        if capture_requested
-            && controller_capture_enabled
-            && steam_blocker.unavailable()
-            && Instant::now() >= next_steam_retry
-        {
-            steam_blocker.block();
-            next_steam_retry = Instant::now() + Duration::from_secs(2);
-        }
         if capture_requested != controller_capture_enabled {
             if capture_requested {
                 steam_blocker.block();
+                next_steam_retry = Instant::now() + Duration::from_secs(2);
                 match controller_capture.set_enabled(true) {
                     Ok(()) => controller_capture_enabled = true,
                     Err(error) => {
@@ -274,6 +267,12 @@ fn main() -> Result<()> {
                 }
             }
         }
+        // Refresh the Steam PID set while capture stays leased so late-started
+        // Steam helpers and newly spawned children are blocked too.
+        if capture_requested && controller_capture_enabled && Instant::now() >= next_steam_retry {
+            steam_blocker.block();
+            next_steam_retry = Instant::now() + Duration::from_secs(2);
+        }
         thread::sleep(Duration::from_millis(25));
     }
 
@@ -292,5 +291,10 @@ mod tests {
         let unit = include_str!("../../../contrib/systemd/z13helperd.service");
         assert!(unit.contains("CAP_SYS_RAWIO CAP_BPF CAP_PERFMON"));
         assert!(unit.contains("DeviceAllow=char-hidraw rw"));
+        assert!(unit.contains("LimitMEMLOCK=infinity"));
+        assert!(unit.contains("MemoryDenyWriteExecute=no"));
+        assert!(!unit
+            .lines()
+            .any(|line| line.starts_with("ProtectProc=") || line.starts_with("ProcSubset=")));
     }
 }

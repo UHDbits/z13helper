@@ -5,7 +5,6 @@
 use std::collections::BTreeSet;
 use std::ffi::{c_char, c_int, c_long, c_void};
 use std::fs;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::ptr;
 
 const BLOCKER: &[u8] = include_bytes!("../bpf/hidraw_blocker.bpf.o");
@@ -199,34 +198,39 @@ fn bpf_lsm_enabled() -> bool {
         .is_some_and(|modules| modules.split(',').any(|module| module.trim() == "bpf"))
 }
 
+/// Character-device major for hidraw, matching what the BPF program extracts
+/// from kernel `i_rdev` with `(dev >> 20)`.
 fn hidraw_major() -> Result<u32, String> {
-    let entries = fs::read_dir("/dev").map_err(|error| error.to_string())?;
-    entries
-        .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("hidraw"))
-        .find_map(|entry| {
-            let metadata = entry.metadata().ok()?;
-            metadata
-                .file_type()
-                .is_char_device()
-                .then(|| device_major(metadata.rdev()))
-        })
-        .ok_or_else(|| "no hidraw controller is currently connected".into())
-}
-
-/// Linux stores the device major in two fields within `dev_t`; this matches
-/// `MAJOR(dev)` in the kernel rather than the legacy 12-bit-only form.
-fn device_major(rdev: u64) -> u32 {
-    (((rdev >> 8) & 0x0fff) | ((rdev >> 32) & 0xffff_f000)) as u32
+    let devices = fs::read_to_string("/proc/devices").map_err(|error| error.to_string())?;
+    for line in devices.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(major) = fields.next() else {
+            continue;
+        };
+        if fields.next() == Some("hidraw") && fields.next().is_none() {
+            return major
+                .parse()
+                .map_err(|error| format!("parse hidraw major {major:?}: {error}"));
+        }
+    }
+    Err("hidraw not found in /proc/devices".into())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::device_major;
+    use super::hidraw_major;
 
     #[test]
-    fn extracts_linux_device_major() {
-        assert_eq!(device_major(244 << 8), 244);
-        assert_eq!(device_major((0x12_000_u64 << 32) | (0x345 << 8)), 0x1_2345);
+    fn reads_hidraw_major_from_proc_devices() {
+        match hidraw_major() {
+            Ok(major) => assert_ne!(major, 0, "hidraw major should be non-zero"),
+            Err(error) => {
+                // CI and containers may lack the hidraw driver.
+                assert!(
+                    error.contains("hidraw not found") || error.contains("No such file"),
+                    "unexpected hidraw major error: {error}"
+                );
+            }
+        }
     }
 }

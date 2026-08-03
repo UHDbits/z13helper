@@ -45,8 +45,9 @@ ProtectKernelModules=yes
 # ReadWritePaths bind cannot undo that superblock flag, so use explicit
 # read-only mounts and grant only the hardware endpoints below.
 ProtectKernelTunables=no
-ProtectProc=invisible
-ProcSubset=pid
+# Steam hidraw suppression walks /proc for the Steam process tree and the
+# hidraw major. Keeping other processes and /proc/devices visible is required
+# so DualSense/Switch hidraw reads can be blocked for Steam.
 ReadOnlyPaths=/sys -/proc/sys -/proc/sysrq-trigger -/proc/latency_stats
 ReadOnlyPaths=-/proc/acpi -/proc/timer_stats -/proc/fs -/proc/irq
 InaccessiblePaths=-/proc/kallsyms -/proc/kcore
@@ -64,7 +65,11 @@ RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
-MemoryDenyWriteExecute=yes
+# libbpf loads the hidraw LSM program through bpf(2); MDWE breaks that path.
+MemoryDenyWriteExecute=no
+# CAP_SYS_RESOURCE is intentionally not granted; raise the memlock ceiling here
+# so BPF map/program creation cannot fail on RLIMIT_MEMLOCK.
+LimitMEMLOCK=infinity
 SystemCallArchitectures=native
 
 [Install]

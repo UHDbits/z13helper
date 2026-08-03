@@ -4,6 +4,9 @@
 // current PID is in blocked_pids and the target file is a hidraw character
 // device. The GPL declaration below is required by the kernel for the CO-RE
 // helper used to read i_rdev.
+//
+// Kernel i_rdev uses MINORBITS=20 encoding, so MAJOR is (dev >> 20). That is
+// not the glibc userspace rdev layout.
 
 #include <linux/bpf.h>
 #include <linux/types.h>
@@ -13,50 +16,54 @@
 
 #define EAGAIN 11
 #define MAY_READ 4
-#define MAJOR(dev) \
-    ((unsigned int)(((dev) >> 8 & 0xfff) | ((dev) >> 32 & 0xfffff000)))
+#define MAJOR(dev) ((unsigned int)((dev) >> 20))
 
 struct inode {
-    __u64 i_ino;
-    __u64 i_mode;
-    __u64 i_rdev;
+	__u64 i_ino;
+	__u64 i_mode;
+	__u64 i_rdev;
 } __attribute__((preserve_access_index));
 
 struct file {
-    struct inode *f_inode;
+	struct inode *f_inode;
 } __attribute__((preserve_access_index));
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 64);
-    __type(key, __u32);
-    __type(value, __u8);
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, __u32);
+	__type(value, __u8);
 } blocked_pids SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u32);
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
 } hidraw_config SEC(".maps");
 
 SEC("lsm/file_permission")
-int hidraw_block(struct file *file, int mask, int ret)
+int BPF_PROG(hidraw_block, struct file *file, int mask, int ret)
 {
-    if (ret != 0 || !(mask & MAY_READ))
-        return ret;
+	if (ret != 0)
+		return ret;
 
-    __u32 pid = bpf_get_current_pid_tgid() >> 32;
-    if (!bpf_map_lookup_elem(&blocked_pids, &pid))
-        return 0;
+	if (!(mask & MAY_READ))
+		return 0;
 
-    __u64 rdev = BPF_CORE_READ(file, f_inode, i_rdev);
-    __u32 key = 0;
-    __u32 *hidraw_major = bpf_map_lookup_elem(&hidraw_config, &key);
-    if (!hidraw_major || MAJOR(rdev) != *hidraw_major)
-        return 0;
+	__u32 pid = bpf_get_current_pid_tgid() >> 32;
+	if (!bpf_map_lookup_elem(&blocked_pids, &pid))
+		return 0;
 
-    return -EAGAIN;
+	__u64 rdev = BPF_CORE_READ(file, f_inode, i_rdev);
+	__u32 major = MAJOR(rdev);
+
+	__u32 key = 0;
+	__u32 *hidraw_major = bpf_map_lookup_elem(&hidraw_config, &key);
+	if (!hidraw_major || major != *hidraw_major)
+		return 0;
+
+	return -EAGAIN;
 }
 
 char LICENSE[] SEC("license") = "GPL";

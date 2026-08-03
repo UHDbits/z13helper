@@ -90,14 +90,13 @@ Touchscreen and touchpad nodes without gamepad buttons are explicitly excluded
 from controller capture.
 
 For PlayStation and Nintendo controllers, the daemon attaches a narrow BPF LSM
-program when a hidraw controller is present and the overlay is active. It
-returns `EAGAIN` only for Steam's process tree reading hidraw devices,
-preventing Steam Input from also receiving the same controller presses. The
-installed system unit grants only the required `CAP_BPF` and `CAP_PERFMON`
-capabilities in addition to its existing raw-I/O capability; z13helper never
-pauses Steam as a fallback. If the kernel does not provide BPF LSM support,
-ordinary evdev capture still works and the daemon records that hidraw
-suppression is unavailable.
+program while the Gamescope overlay capture lease is active. It returns
+`EAGAIN` only for Steam's process tree reading hidraw devices, preventing Steam
+Input from also receiving the same controller presses. The installed system unit
+grants only the required `CAP_BPF` and `CAP_PERFMON` capabilities in addition to
+its existing raw-I/O capability; z13helper never pauses Steam as a fallback. If
+the kernel does not provide BPF LSM support, ordinary evdev capture still works
+and the daemon records that hidraw suppression is unavailable.
 
 ## Profiles and safety
 

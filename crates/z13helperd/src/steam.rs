@@ -65,10 +65,6 @@ impl SteamBlocker {
         }
     }
 
-    pub fn unavailable(&self) -> bool {
-        self.hidraw.is_none()
-    }
-
     pub fn unblock(&mut self) {
         let Some(hidraw) = self.hidraw.as_mut() else {
             return;
