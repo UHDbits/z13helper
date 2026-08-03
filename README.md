@@ -47,7 +47,9 @@ sudo usermod -aG z13helper "$USER"
 
 `make install-user-service` installs the GUI as a user systemd service bound to
 `graphical-session.target`. It starts hidden so the hardware GUI button can
-open it. The privileged `z13helperd` service remains separate and must still be
+open it. The unit optionally loads `%t/gamescope-environment`, allowing the
+resident process to connect to gamescope's Xwayland display when Gaming Mode
+starts. The privileged `z13helperd` service remains separate and must still be
 installed and enabled as root.
 
 Log out and back in after changing group membership. The system service creates
@@ -59,6 +61,43 @@ Optional GTK layer-shell support can be built with:
 ```sh
 cargo build -p z13helper --features layer-shell
 ```
+
+## Gamescope
+
+When `GAMESCOPE_WAYLAND_DISPLAY` names a real socket inside
+`XDG_RUNTIME_DIR` and `DISPLAY` is available, z13helper uses gamescope's
+Xwayland overlay path. The resident main surface stays mapped while hidden;
+the app clears input focus before setting its opacity to zero so an invisible
+window cannot consume game input. Opening Fans + Power transfers overlay input
+and visibility to that window, then restores the main window when it closes.
+The Gamescope color chooser is an inline page, and selectors use in-surface
+controls instead of popup surfaces that Gamescope cannot reliably composite.
+
+The main Gamescope drawer starts at 320 logical pixels wide. Gamescope scaling
+is derived from the X11 output width; on the Z13's native 2560-pixel-wide panel
+this is approximately 1.5x. Set
+`Z13HELPER_GAMESCOPE_SCALE` to a positive value to override detection; values
+are clamped to 1.0–3.0 so an accidental setting cannot make the interface
+unusable.
+
+While the Gamescope overlay is visible, `z13helperd` exclusively captures
+connected gamepads: the D-pad moves GTK focus, A activates the focused control,
+and B goes back or closes the active window. Capture is released just after the
+dismiss-button release when the overlay hides. A short renewable lease also
+releases it automatically if the GUI exits unexpectedly, so a crashed overlay
+cannot keep input from a game.
+Touchscreen and touchpad nodes without gamepad buttons are explicitly excluded
+from controller capture.
+
+For PlayStation and Nintendo controllers, the daemon attaches a narrow BPF LSM
+program when a hidraw controller is present and the overlay is active. It
+returns `EAGAIN` only for Steam's process tree reading hidraw devices,
+preventing Steam Input from also receiving the same controller presses. The
+installed system unit grants only the required `CAP_BPF` and `CAP_PERFMON`
+capabilities in addition to its existing raw-I/O capability; z13helper never
+pauses Steam as a fallback. If the kernel does not provide BPF LSM support,
+ordinary evdev capture still works and the daemon records that hidraw
+suppression is unavailable.
 
 ## Profiles and safety
 

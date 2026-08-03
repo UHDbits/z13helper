@@ -9,6 +9,11 @@ ExecStart=%h/.local/bin/z13helper
 Environment=GTK_A11Y=none
 Environment=Z13HELPER_START_HIDDEN=1
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# gamescope-session exports DISPLAY, WAYLAND_DISPLAY, and
+# GAMESCOPE_WAYLAND_DISPLAY here for user services. Without it, the resident
+# process starts outside gamescope and cannot receive/present the hardware
+# button overlay. The file is intentionally optional for ordinary desktops.
+EnvironmentFile=-%t/gamescope-environment
 Restart=on-failure
 RestartSec=3
 

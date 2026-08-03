@@ -1,25 +1,29 @@
 //! G-Helper-style HUD toast for power-source / profile switches.
 //!
 //! Prefer gtk4-layer-shell on Wayland (click-through via empty input region).
+//! Under gamescope, use its non-interactive external-overlay plane.
 //! Fall back to org.freedesktop.Notifications.
+
+use std::rc::Rc;
 
 use gtk::prelude::*;
 use gtk4 as gtk;
-use libadwaita as adw;
 
-pub fn show(app: &adw::Application, profile_name: &str, on_battery: bool) {
+use crate::app::AppState;
+
+pub fn show(state: &Rc<AppState>, profile_name: &str, on_battery: bool) {
     let glyph = if on_battery { "🔋" } else { "🔌" };
     let message = format!("{glyph}  {profile_name}");
 
-    if try_popup(app, &message) {
+    if try_popup(state, &message) {
         return;
     }
     notify_fallback(&message);
 }
 
-fn try_popup(app: &adw::Application, message: &str) -> bool {
+fn try_popup(state: &Rc<AppState>, message: &str) -> bool {
     let window = gtk::Window::builder()
-        .application(app.upcast_ref::<gtk::Application>())
+        .application(state.app.upcast_ref::<gtk::Application>())
         .title("z13helper HUD")
         .default_width(300)
         .default_height(100)
@@ -36,16 +40,20 @@ fn try_popup(app: &adw::Application, message: &str) -> bool {
     label.set_margin_end(24);
     window.set_child(Some(&label));
 
+    if let Some(gamescope) = state.gamescope.as_ref() {
+        gamescope.prepare_hud(&window);
+    }
+
     #[cfg(feature = "layer-shell")]
     {
-        use gtk4_layer_shell::{Edge, KeyboardMode, Layer};
+        use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
         if gtk4_layer_shell::is_supported() {
-            gtk4_layer_shell::init_for_window(&window);
-            gtk4_layer_shell::set_layer(&window, Layer::Overlay);
-            gtk4_layer_shell::set_anchor(&window, Edge::Bottom, true);
-            gtk4_layer_shell::set_margin(&window, Edge::Bottom, 80);
-            gtk4_layer_shell::set_keyboard_mode(&window, KeyboardMode::None);
-            gtk4_layer_shell::set_exclusive_zone(&window, -1);
+            window.init_layer_shell();
+            window.set_layer(Layer::Overlay);
+            window.set_anchor(Edge::Bottom, true);
+            window.set_margin(Edge::Bottom, 80);
+            window.set_keyboard_mode(KeyboardMode::None);
+            window.set_exclusive_zone(-1);
         }
     }
 

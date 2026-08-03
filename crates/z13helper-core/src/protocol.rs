@@ -6,7 +6,7 @@ use crate::curve::Curve;
 use crate::error::WireError;
 use crate::profile::{stock_ppt, FanControlMode, Profile};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FanHysteresis {
@@ -359,6 +359,9 @@ pub enum Command {
         state: LightingState,
     },
     ReleaseFans,
+    SetControllerCapture {
+        enabled: bool,
+    },
     Subscribe {
         events: Vec<String>,
     },
@@ -384,6 +387,7 @@ pub struct ApplyResponse {
 pub enum DaemonEventKind {
     StateChanged,
     GuiToggle,
+    ControllerAction,
 }
 
 impl DaemonEventKind {
@@ -391,13 +395,27 @@ impl DaemonEventKind {
         match self {
             Self::StateChanged => "state-changed",
             Self::GuiToggle => "gui-toggle",
+            Self::ControllerAction => "controller-action",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ControllerAction {
+    Up,
+    Down,
+    Left,
+    Right,
+    Accept,
+    Back,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DaemonEvent {
     pub kind: DaemonEventKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ControllerAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
 }
@@ -470,8 +488,27 @@ mod tests {
             command: Command::GetState,
         };
         let text = serde_json::to_string(&request).unwrap();
-        assert!(text.contains("\"version\":1"));
+        assert!(text.contains("\"version\":2"));
         assert!(text.contains("\"cmd\":\"get-state\""));
+    }
+
+    #[test]
+    fn controller_capture_and_action_roundtrip() {
+        let request = WireRequest {
+            version: PROTOCOL_VERSION,
+            command: Command::SetControllerCapture { enabled: true },
+        };
+        let text = serde_json::to_string(&request).unwrap();
+        assert!(text.contains("\"cmd\":\"set-controller-capture\""));
+        let event = DaemonEvent {
+            kind: DaemonEventKind::ControllerAction,
+            action: Some(ControllerAction::Accept),
+            generation: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            r#"{"kind":"controller-action","action":"accept"}"#
+        );
     }
 
     #[test]

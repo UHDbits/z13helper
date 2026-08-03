@@ -4,11 +4,16 @@ use std::rc::Rc;
 
 use gtk4::prelude::*;
 use libadwaita as adw;
+use libadwaita::prelude::AdwDialogExt;
 use z13helper_client::Client;
-use z13helper_core::{ApplyRequest, Config};
+use z13helper_core::{ApplyRequest, Config, ControllerAction};
 
-use crate::services::{subscribe, worker};
+use crate::css;
+use crate::gamescope::Gamescope;
+use crate::services::{controller::ControllerCapture, subscribe, worker};
 use crate::ui::main_window;
+
+type ControllerActivation = (glib::WeakRef<gtk4::Widget>, Rc<dyn Fn()>);
 
 /// UI-owned state. The client is cloneable; every daemon call is moved to a
 /// worker thread by the individual views.
@@ -24,6 +29,9 @@ pub struct AppState {
     pub undervolt_available: Cell<Option<bool>>,
     pub main_window: RefCell<Option<adw::ApplicationWindow>>,
     main_window_visible: Cell<bool>,
+    pub gamescope: Option<Rc<Gamescope>>,
+    controller_capture: Option<ControllerCapture>,
+    controller_activations: RefCell<Vec<ControllerActivation>>,
     pub persistent_banner: RefCell<Option<adw::Banner>>,
     toast_overlays: RefCell<Vec<glib::WeakRef<adw::ToastOverlay>>>,
     pending_persistent_error: RefCell<Option<String>>,
@@ -32,7 +40,15 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(app: &adw::Application) -> Rc<Self> {
+        let gamescope = Gamescope::connect();
+        if let Some(gamescope) = gamescope.as_ref() {
+            css::install_gamescope_scale(gamescope.scale());
+        }
         let config_path = Config::default_path();
+        let client = Client::new();
+        let controller_capture = gamescope
+            .as_ref()
+            .map(|_| ControllerCapture::start(client.clone()));
         let (config, pending_error, config_writable) = match Config::load_or_default(&config_path) {
             Ok(config) => (config, None, true),
             Err(error) => {
@@ -51,13 +67,16 @@ impl AppState {
             config: RefCell::new(config),
             config_path,
             config_writable: Cell::new(config_writable),
-            client: Client::new(),
+            client,
             applying: Cell::new(false),
             apply_pending: Cell::new(false),
             on_battery: Cell::new(false),
             undervolt_available: Cell::new(None),
             main_window: RefCell::new(None),
             main_window_visible: Cell::new(false),
+            gamescope,
+            controller_capture,
+            controller_activations: RefCell::new(Vec::new()),
             persistent_banner: RefCell::new(None),
             toast_overlays: RefCell::new(Vec::new()),
             pending_persistent_error: RefCell::new(pending_error),
@@ -228,10 +247,16 @@ impl AppState {
         }
         *self.main_window.borrow_mut() = Some(window.clone());
         subscribe::start(self);
-        if show {
-            self.show_window();
+        self.main_window_visible.set(show);
+        if let Some(capture) = self.controller_capture.as_ref() {
+            capture.set_enabled(show);
+        }
+        if let Some(gamescope) = self.gamescope.as_ref() {
+            gamescope.prepare_main(&window, show);
+        } else if show {
+            present_from_hardware_button(&window);
         } else {
-            self.hide_window();
+            window.set_visible(false);
         }
         self.seed_factory_fan_curves();
     }
@@ -241,7 +266,14 @@ impl AppState {
             return;
         };
         self.main_window_visible.set(true);
-        present_from_hardware_button(&window);
+        if let Some(capture) = self.controller_capture.as_ref() {
+            capture.set_enabled(true);
+        }
+        if let Some(gamescope) = self.gamescope.as_ref() {
+            gamescope.show();
+        } else {
+            present_from_hardware_button(&window);
+        }
     }
 
     pub fn hide_window(&self) {
@@ -249,7 +281,14 @@ impl AppState {
             return;
         };
         self.main_window_visible.set(false);
-        window.set_visible(false);
+        if let Some(capture) = self.controller_capture.as_ref() {
+            capture.set_enabled(false);
+        }
+        if let Some(gamescope) = self.gamescope.as_ref() {
+            gamescope.hide();
+        } else {
+            window.set_visible(false);
+        }
     }
 
     pub fn toggle_window(&self) {
@@ -259,6 +298,134 @@ impl AppState {
             self.show_window();
         }
     }
+
+    pub fn main_window_is_visible(&self) -> bool {
+        self.main_window_visible.get()
+    }
+
+    pub fn register_controller_activation(
+        &self,
+        widget: &impl IsA<gtk4::Widget>,
+        activate: impl Fn() + 'static,
+    ) {
+        self.controller_activations
+            .borrow_mut()
+            .push((widget.as_ref().downgrade(), Rc::new(activate)));
+    }
+
+    /// Handle normalized daemon controller input on the GTK main thread.
+    pub fn handle_controller_action(self: &Rc<Self>, action: ControllerAction) {
+        if !self.main_window_visible.get() {
+            return;
+        }
+        let Some(gamescope) = self.gamescope.as_ref() else {
+            return;
+        };
+        let Some(window) = gamescope.current_window() else {
+            return;
+        };
+        window.set_focus_visible(true);
+        match action {
+            ControllerAction::Up => focus_direction(&window, gtk4::DirectionType::Up),
+            ControllerAction::Down => focus_direction(&window, gtk4::DirectionType::Down),
+            ControllerAction::Left => focus_direction(&window, gtk4::DirectionType::Left),
+            ControllerAction::Right => focus_direction(&window, gtk4::DirectionType::Right),
+            ControllerAction::Accept => {
+                if window_focus(&window).is_none() {
+                    window.child_focus(gtk4::DirectionType::TabForward);
+                } else if let Some(focused) = window_focus(&window) {
+                    if !self.activate_controller_override(&focused) {
+                        focused.activate();
+                    }
+                }
+            }
+            ControllerAction::Back => self.controller_back(&window),
+        }
+    }
+
+    fn activate_controller_override(&self, focused: &gtk4::Widget) -> bool {
+        let mut activations = self.controller_activations.borrow_mut();
+        activations.retain(|(widget, _)| widget.upgrade().is_some());
+        let activation = activations.iter().find_map(|(widget, activate)| {
+            widget
+                .upgrade()
+                .filter(|widget| widget == focused)
+                .map(|_| activate.clone())
+        });
+        drop(activations);
+        if let Some(activate) = activation {
+            activate();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn controller_back(self: &Rc<Self>, window: &gtk4::Window) {
+        if let Some(dialog) = window_focus(window).and_then(|focused| {
+            focused
+                .ancestor(adw::Dialog::static_type())
+                .and_then(|ancestor| ancestor.downcast::<adw::Dialog>().ok())
+        }) {
+            dialog.close();
+            return;
+        }
+
+        let is_main = self
+            .main_window
+            .borrow()
+            .as_ref()
+            .is_some_and(|main| main.upcast_ref::<gtk4::Window>() == window);
+        if !is_main {
+            window.close();
+            return;
+        }
+
+        if let Some(stack) = find_named_descendant(window, "gamescope-main-pages")
+            .and_then(|widget| widget.downcast::<gtk4::Stack>().ok())
+        {
+            if stack.visible_child_name().as_deref() != Some("main") {
+                stack.set_visible_child_name("main");
+                return;
+            }
+        }
+        self.hide_window();
+    }
+
+    pub fn present_auxiliary(&self, window: &impl IsA<gtk4::Window>) {
+        if let Some(gamescope) = self.gamescope.as_ref() {
+            gamescope.present_auxiliary(window);
+        } else {
+            window.present();
+        }
+    }
+}
+
+fn focus_direction(window: &gtk4::Window, direction: gtk4::DirectionType) {
+    if window_focus(window).is_none() {
+        window.child_focus(gtk4::DirectionType::TabForward);
+    } else {
+        window.child_focus(direction);
+    }
+}
+
+fn window_focus(window: &gtk4::Window) -> Option<gtk4::Widget> {
+    gtk4::prelude::GtkWindowExt::focus(window)
+}
+
+fn find_named_descendant(root: &impl IsA<gtk4::Widget>, name: &str) -> Option<gtk4::Widget> {
+    let root = root.as_ref();
+    if root.widget_name() == name {
+        return Some(root.clone());
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(found) = find_named_descendant(&widget, name) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
 }
 
 fn present_from_hardware_button(window: &adw::ApplicationWindow) {

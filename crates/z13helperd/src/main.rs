@@ -11,13 +11,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
-use z13helper_core::protocol::{DaemonEvent, DaemonEventKind, WireResponse, PROTOCOL_VERSION};
+use z13helper_core::protocol::{
+    ControllerAction, DaemonEvent, DaemonEventKind, WireResponse, PROTOCOL_VERSION,
+};
 use z13helperd::backend::Backend;
 use z13helperd::ec::{EcMailbox, LinuxPortIo};
-use z13helperd::input::spawn_button_watcher;
+use z13helperd::input::{spawn_button_watcher, spawn_controller_watcher};
 use z13helperd::protocol::{handle_line, Dispatch};
 use z13helperd::resume::{spawn_resume_watcher, SleepEvent};
 use z13helperd::service::{Controller, DIRECT_TICK_INTERVAL};
+use z13helperd::steam::SteamBlocker;
 
 mod logging;
 
@@ -25,6 +28,7 @@ const EXPECTED_MODEL: &str = "GZ302EA";
 const DMI_PRODUCT_NAME: &str = "/sys/class/dmi/id/product_name";
 const SOCKET_PATH: &str = "/run/z13helper/z13helperd.sock";
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+const CONTROLLER_CAPTURE_LEASE: Duration = Duration::from_secs(3);
 
 struct Subscriber {
     events: Vec<String>,
@@ -70,6 +74,7 @@ fn handle_client(
     mut stream: UnixStream,
     backend: Arc<Mutex<Backend>>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
+    controller_capture_deadline: Arc<Mutex<Option<Instant>>>,
 ) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -91,7 +96,7 @@ fn handle_client(
                 && !line.contains("\"cmd\":\"probe\"");
             write_response(&mut stream, &response)?;
             if mutating {
-                broadcast(&subscribers, DaemonEventKind::StateChanged);
+                broadcast(&subscribers, DaemonEventKind::StateChanged, None);
             }
         }
         Dispatch::Subscribe(events) => {
@@ -102,11 +107,20 @@ fn handle_client(
                 .unwrap()
                 .push(Subscriber { events, stream });
         }
+        Dispatch::ControllerCapture(enabled) => {
+            *controller_capture_deadline.lock().unwrap() =
+                enabled.then(|| Instant::now() + CONTROLLER_CAPTURE_LEASE);
+            write_response(&mut stream, &WireResponse::success())?;
+        }
     }
     Ok(())
 }
 
-fn broadcast(subscribers: &Arc<Mutex<Vec<Subscriber>>>, kind: DaemonEventKind) {
+fn broadcast(
+    subscribers: &Arc<Mutex<Vec<Subscriber>>>,
+    kind: DaemonEventKind,
+    action: Option<ControllerAction>,
+) {
     let response = WireResponse {
         ok: true,
         state: None,
@@ -115,6 +129,7 @@ fn broadcast(subscribers: &Arc<Mutex<Vec<Subscriber>>>, kind: DaemonEventKind) {
         factory_fan_curves: None,
         event: Some(DaemonEvent {
             kind,
+            action,
             generation: None,
         }),
         error: None,
@@ -152,17 +167,23 @@ fn main() -> Result<()> {
     let listener = bind_socket(Path::new(SOCKET_PATH))?;
     let subscribers = Arc::new(Mutex::new(Vec::new()));
     let terminate = Arc::new(AtomicBool::new(false));
+    let controller_capture_deadline = Arc::new(Mutex::new(None::<Instant>));
     for signal in [SIGINT, SIGTERM, SIGHUP] {
         signal_hook::flag::register(signal, Arc::clone(&terminate))?;
     }
 
     let (event_tx, event_rx) = mpsc::channel();
     spawn_button_watcher(event_tx, Arc::clone(&terminate));
+    let (controller_tx, controller_rx) = mpsc::channel();
+    let controller_capture = spawn_controller_watcher(controller_tx, Arc::clone(&terminate))?;
     let (sleep_tx, sleep_rx) = mpsc::channel();
     spawn_resume_watcher(sleep_tx);
     let mut next_direct_tick = Instant::now();
     let mut next_observe = Instant::now();
     let mut next_hotplug = Instant::now();
+    let mut next_steam_retry = Instant::now();
+    let mut controller_capture_enabled = false;
+    let mut steam_blocker = SteamBlocker::new();
     tracing::info!(
         socket = SOCKET_PATH,
         protocol = PROTOCOL_VERSION,
@@ -175,8 +196,11 @@ fn main() -> Result<()> {
                 Ok((stream, _)) => {
                     let backend = Arc::clone(&backend);
                     let subscribers = Arc::clone(&subscribers);
+                    let controller_capture_deadline = Arc::clone(&controller_capture_deadline);
                     thread::spawn(move || {
-                        if let Err(error) = handle_client(stream, backend, subscribers) {
+                        if let Err(error) =
+                            handle_client(stream, backend, subscribers, controller_capture_deadline)
+                        {
                             tracing::warn!(%error, "client request failed");
                         }
                     });
@@ -201,7 +225,14 @@ fn main() -> Result<()> {
             next_hotplug = Instant::now() + Duration::from_secs(2);
         }
         while let Ok(event) = event_rx.try_recv() {
-            broadcast(&subscribers, event);
+            broadcast(&subscribers, event, None);
+        }
+        while let Ok(action) = controller_rx.try_recv() {
+            broadcast(
+                &subscribers,
+                DaemonEventKind::ControllerAction,
+                Some(action),
+            );
         }
         while let Ok(event) = sleep_rx.try_recv() {
             match event {
@@ -209,11 +240,57 @@ fn main() -> Result<()> {
                 SleepEvent::Resumed => backend.lock().unwrap().restore_volatile(),
             }
         }
+        let capture_requested = controller_capture_deadline
+            .lock()
+            .unwrap()
+            .is_some_and(|deadline| deadline > Instant::now());
+        if capture_requested
+            && controller_capture_enabled
+            && steam_blocker.unavailable()
+            && Instant::now() >= next_steam_retry
+        {
+            steam_blocker.block();
+            next_steam_retry = Instant::now() + Duration::from_secs(2);
+        }
+        if capture_requested != controller_capture_enabled {
+            if capture_requested {
+                steam_blocker.block();
+                match controller_capture.set_enabled(true) {
+                    Ok(()) => controller_capture_enabled = true,
+                    Err(error) => {
+                        steam_blocker.unblock();
+                        tracing::warn!(%error, "could not enable controller capture")
+                    }
+                }
+            } else {
+                match controller_capture.set_enabled(false) {
+                    Ok(()) => {
+                        controller_capture_enabled = false;
+                        steam_blocker.unblock();
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not disable controller capture")
+                    }
+                }
+            }
+        }
         thread::sleep(Duration::from_millis(25));
     }
 
+    let _ = controller_capture.set_enabled(false);
+    steam_blocker.unblock();
     backend.lock().unwrap().shutdown();
     drop(listener);
     let _ = fs::remove_file(SOCKET_PATH);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn system_unit_grants_only_required_bpf_capabilities() {
+        let unit = include_str!("../../../contrib/systemd/z13helperd.service");
+        assert!(unit.contains("CAP_SYS_RAWIO CAP_BPF CAP_PERFMON"));
+        assert!(unit.contains("DeviceAllow=char-hidraw rw"));
+    }
 }

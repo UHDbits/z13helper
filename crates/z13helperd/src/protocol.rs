@@ -6,6 +6,7 @@ use crate::backend::Backend;
 pub enum Dispatch {
     Reply(Box<WireResponse>),
     Subscribe(Vec<String>),
+    ControllerCapture(bool),
 }
 
 pub fn handle_line(backend: &mut Backend, line: &str) -> Dispatch {
@@ -26,6 +27,9 @@ pub fn handle_line(backend: &mut Backend, line: &str) -> Dispatch {
     }
     if let Command::Subscribe { events } = request.command {
         return Dispatch::Subscribe(events);
+    }
+    if let Command::SetControllerCapture { enabled } = request.command {
+        return Dispatch::ControllerCapture(enabled);
     }
     Dispatch::Reply(Box::new(match dispatch(backend, request.command) {
         Ok(response) => response,
@@ -50,6 +54,7 @@ fn dispatch(backend: &mut Backend, command: Command) -> Result<WireResponse, Dae
         Command::SetPanelOverdrive { enabled } => backend.set_panel_overdrive(enabled)?,
         Command::SetLighting { device, state } => backend.set_lighting(device, state)?,
         Command::ReleaseFans => backend.release_fans()?,
+        Command::SetControllerCapture { .. } => unreachable!(),
         Command::Subscribe { .. } => unreachable!(),
     }
     Ok(response)

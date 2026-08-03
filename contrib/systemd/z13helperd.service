@@ -24,8 +24,10 @@ ExecStopPost=/usr/libexec/z13helperd --release-ec
 
 # The EC mailbox requires raw x86 port I/O via ioperm(2). Do not set
 # PrivateDevices=yes — that drops CAP_SYS_RAWIO effectiveness for port I/O.
-CapabilityBoundingSet=CAP_SYS_RAWIO
-AmbientCapabilities=CAP_SYS_RAWIO
+# CAP_BPF + CAP_PERFMON are used only for the narrow, attached BPF LSM program
+# that temporarily returns EAGAIN for Steam-family hidraw reads in Gamescope.
+CapabilityBoundingSet=CAP_SYS_RAWIO CAP_BPF CAP_PERFMON
+AmbientCapabilities=CAP_SYS_RAWIO CAP_BPF CAP_PERFMON
 NoNewPrivileges=yes
 DevicePolicy=closed
 DeviceAllow=char-hidraw rw

@@ -162,6 +162,11 @@ impl Client {
         Ok(())
     }
 
+    pub fn set_controller_capture(&self, enabled: bool) -> Result<(), DaemonError> {
+        self.exchange(Command::SetControllerCapture { enabled })?;
+        Ok(())
+    }
+
     pub fn subscribe(
         &self,
         events: &[&str],
@@ -307,7 +312,7 @@ mod tests {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut request = String::new();
             reader.read_line(&mut request).unwrap();
-            assert!(request.contains("\"version\":1"));
+            assert!(request.contains("\"version\":2"));
             assert!(request.contains("\"cmd\":\"get-state\""));
             let response = WireResponse {
                 ok: true,

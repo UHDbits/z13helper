@@ -137,17 +137,47 @@ selected points to assistive technology. Outer/section/row/compact spacing is
 12/12/8/6 px.
 
 GTK rules retained from field testing: never use CSS `hexpand`,
-`Scale::add_mark`, or animated box shadows; force X11 only for a real gamescope
-Wayland socket; use `GAMESCOPE_EXTERNAL_OVERLAY`; and keep custom chart drawing
-theme-aware. GTK accessibility remains enabled for screen readers and other
-assistive technology. Ctrl+W closes the active auxiliary window or hides the
-main window. Ctrl+Q closes auxiliary windows and hides the main window without
-terminating the resident UI process, allowing the hardware button to present
-it again. The main title-bar close button follows the same hide behavior.
-Auxiliary windows are registered with the GTK application so these accelerators
-and active-window routing apply consistently. Window headers expose close
-controls without minimize controls. Icon-only and profile action buttons expose
-explicit accessible names and tooltips.
+`Scale::add_mark`, or animated box shadows, and keep custom chart drawing
+theme-aware. X11 is forced only when `GAMESCOPE_WAYLAND_DISPLAY` resolves to a
+real socket inside `XDG_RUNTIME_DIR` and an X11 display is advertised. In that
+mode interactive toplevels use gamescope's `STEAM_OVERLAY` and
+`STEAM_INPUT_FOCUS` properties, while click-through HUDs use
+`GAMESCOPE_EXTERNAL_OVERLAY`. Exactly one interactive toplevel has nonzero
+opacity and input focus; hidden windows remain mapped to avoid Xwayland surface
+lifecycle loss, and input focus is cleared before opacity. Resolution-derived
+CSS and panel sizing default to about 1.5x on the native Z13 panel and accept a
+clamped `Z13HELPER_GAMESCOPE_SCALE` override. The main drawer is clamped to 320
+logical pixels. Because Gamescope does not reliably composite GTK popup
+surfaces, its selectors use in-surface button groups or embedded dialogs and
+its color chooser is a page in the main window stack.
+
+Controller capture follows the hardware-access boundary: only `z13helperd`
+opens controller evdev nodes and issues `EVIOCGRAB`; the GUI receives normalized
+protocol-v2 D-pad/A/B actions and touches widgets only on GLib's main context.
+The GUI renews a three-second capture lease once per second while the Gamescope
+overlay is visible. Hiding or closing waits 200 ms to consume the dismiss
+release before relinquishing capture, and lease expiry provides crash recovery.
+Touchscreen and touchpad nodes without gamepad buttons are excluded; Steam's
+known virtual gamepad is capture-only. Direction holds repeat after 400 ms at
+120 ms intervals. The reader blocks in `poll(2)` on controller fds and a private
+capture-control socket, waking for real input, lease transitions, repeat
+deadlines, or the two-second hotplug scan. Once a hidraw controller is present,
+the daemon attaches a small BPF LSM program using `CAP_BPF` and `CAP_PERFMON`.
+During capture it blocks
+only the daemon-derived Steam process tree from reading hidraw device nodes,
+which prevents duplicate PlayStation/Nintendo input without pausing Steam or
+granting capabilities to the GUI. The BPF map is cleared before the controller
+is released and when the daemon shuts down.
+
+GTK accessibility remains enabled for screen readers and other assistive
+technology. Ctrl+W closes the active auxiliary window or hides the main window.
+Ctrl+Q closes auxiliary windows and hides the main window without terminating
+the resident UI process, allowing the hardware button to present it again. The
+main title-bar close button follows the same hide behavior. Auxiliary windows
+are registered with the GTK application and the gamescope window stack so these
+accelerators and active-window routing apply consistently. Window headers expose
+close controls without minimize controls. Icon-only and profile action buttons
+expose explicit accessible names and tooltips.
 
 On KDE, the process consumes the legacy GTK dark-theme preference before
 libadwaita initializes and transfers it to `AdwStyleManager::PreferDark`. This
@@ -156,10 +186,16 @@ preserves Plasma's dark appearance without using libadwaita's unsupported
 
 ## Lifecycle and packaging
 
+The user service optionally loads `%t/gamescope-environment`; gamescope-session
+uses that file to export its display variables to background user services. The
+GUI validates the advertised gamescope socket before selecting X11, so a stale
+environment file cannot by itself enable the overlay backend.
+
 The systemd unit uses `RuntimeDirectory=z13helper`,
 `StateDirectory=z13helper`, AF_UNIX-only networking, `ProtectSystem=strict`,
-explicit writable hardware paths, and only `CAP_SYS_RAWIO`. The installed
-application ID is `com.ashtonantila.z13helper`.
+explicit writable hardware paths, `CAP_SYS_RAWIO`, and the narrowly scoped
+`CAP_BPF`/`CAP_PERFMON` pair required to attach the hidraw blocker. The
+installed application ID is `com.ashtonantila.z13helper`.
 
 No compatibility aliases, predecessor-path discovery, or automatic removal
 actions are shipped.

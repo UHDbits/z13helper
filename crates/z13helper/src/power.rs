@@ -78,7 +78,7 @@ fn on_confirmed_transition(state: &Rc<AppState>, on_battery: bool) {
     // notify=true: HUD should show (non-button path).
     state.apply_active(true);
     if state.config.borrow().show_hud {
-        hud::show(&state.app, &name, on_battery);
+        hud::show(state, &name, on_battery);
     }
 }
 

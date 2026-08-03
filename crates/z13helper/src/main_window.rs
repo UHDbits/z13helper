@@ -15,8 +15,19 @@ use crate::ui::fans_window;
 use crate::ui::sync::SyncGuard;
 
 const MAIN_WINDOW_WIDTH: i32 = 368;
+const GAMESCOPE_MAIN_WINDOW_WIDTH: i32 = 320;
+const GAMESCOPE_COLOR_PICKER_HEIGHT: i32 = 500;
 
 pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
+    let gamescope_pages = state.gamescope.as_ref().map(|_| {
+        let stack = gtk::Stack::new();
+        stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+        stack.set_transition_duration(120);
+        stack.set_hhomogeneous(false);
+        stack.set_vhomogeneous(false);
+        stack.set_widget_name("gamescope-main-pages");
+        stack
+    });
     let window = adw::ApplicationWindow::builder()
         .application(&state.app)
         .title("z13helper")
@@ -31,6 +42,18 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         state_close.hide_window();
         glib::Propagation::Stop
     });
+
+    let key = gtk::EventControllerKey::new();
+    let state_escape = state.clone();
+    key.connect_key_pressed(move |_, keyval, _, _| {
+        if keyval == gtk::gdk::Key::Escape {
+            state_escape.hide_window();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(key);
 
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
@@ -177,6 +200,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         "lightbar",
         state,
         &sync,
+        gamescope_pages.as_ref(),
     );
     let keyboard = lighting_section(
         "Laptop Keyboard",
@@ -184,6 +208,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         "keyboard",
         state,
         &sync,
+        gamescope_pages.as_ref(),
     );
     content.append(&lightbar.root);
     content.append(&keyboard.root);
@@ -292,8 +317,12 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     content.append(&footer);
 
     let clamp = adw::Clamp::new();
-    clamp.set_maximum_size(600);
-    clamp.set_tightening_threshold(500);
+    let (maximum_size, tightening_threshold) =
+        state.gamescope.as_ref().map_or((600, 500), |gamescope| {
+            (gamescope.pixels(600), gamescope.pixels(500))
+        });
+    clamp.set_maximum_size(maximum_size);
+    clamp.set_tightening_threshold(tightening_threshold);
     clamp.set_child(Some(&content));
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -305,7 +334,18 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     toast_overlay.set_child(Some(&scroller));
     state.register_toast_overlay(&toast_overlay);
     toolbar.set_content(Some(&toast_overlay));
-    window.set_content(Some(&toolbar));
+    if let Some(gamescope) = state.gamescope.as_ref() {
+        let pages = gamescope_pages.as_ref().expect("gamescope page stack");
+        pages.add_named(&toolbar, Some("main"));
+        pages.set_visible_child_name("main");
+        let dismiss = state.clone();
+        let wrapper = gamescope.wrap_panel(pages, GAMESCOPE_MAIN_WINDOW_WIDTH, None, move || {
+            dismiss.hide_window();
+        });
+        window.set_content(Some(&wrapper));
+    } else {
+        window.set_content(Some(&toolbar));
+    }
 
     // Initial + periodic sync from daemon.
     let view = MainView {
@@ -536,6 +576,7 @@ fn lighting_section(
     device: &'static str,
     state: &Rc<AppState>,
     sync: &SyncGuard,
+    gamescope_pages: Option<&gtk::Stack>,
 ) -> LightingSection {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -548,13 +589,16 @@ fn lighting_section(
     header.append(&heading);
     root.append(&header);
 
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let modes =
-        gtk::DropDown::from_strings(&["Off", "Static", "Breathe", "Cycle", "Rainbow", "Strobe"]);
+    let mode_names = ["Off", "Static", "Breathe", "Cycle", "Rainbow", "Strobe"];
+    let modes = gtk::DropDown::from_strings(&mode_names);
     modes.set_valign(gtk::Align::Center);
     modes.set_hexpand(true);
     modes.set_tooltip_text(Some("Lighting mode"));
-    controls.append(&modes);
+    let mode_control: gtk::Widget = if state.gamescope.is_some() {
+        gamescope_choice_grid(&modes, &mode_names, 3).upcast()
+    } else {
+        modes.clone().upcast()
+    };
 
     let fallback_dialog = gtk::ColorDialog::builder()
         .title("Choose Lighting Color")
@@ -565,16 +609,33 @@ fn lighting_section(
     color.set_valign(gtk::Align::Center);
     color.set_size_request(64, -1);
     color.set_tooltip_text(Some("Lighting color"));
-    install_color_chooser(&color);
+    install_color_chooser(state, &color, gamescope_pages);
     let color_control = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     color_control.append(&color);
-    controls.append(&color_control);
 
-    let speed = gtk::DropDown::from_strings(&["Slow", "Normal", "Fast"]);
+    let speed_names = ["Slow", "Normal", "Fast"];
+    let speed = gtk::DropDown::from_strings(&speed_names);
     speed.set_valign(gtk::Align::Center);
     speed.set_tooltip_text(Some("Animation speed"));
-    controls.append(&speed);
-    root.append(&controls);
+    let speed_control: gtk::Widget = if state.gamescope.is_some() {
+        gamescope_choice_grid(&speed, &speed_names, 3).upcast()
+    } else {
+        speed.clone().upcast()
+    };
+
+    if state.gamescope.is_some() {
+        root.append(&mode_control);
+        let secondary = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        secondary.append(&color_control);
+        secondary.append(&speed_control);
+        root.append(&secondary);
+    } else {
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        controls.append(&mode_control);
+        controls.append(&color_control);
+        controls.append(&speed_control);
+        root.append(&controls);
+    }
 
     let view = LightingView {
         modes: modes.clone(),
@@ -583,7 +644,7 @@ fn lighting_section(
     };
 
     let color_control_c = color_control.clone();
-    let speed_c = speed.clone();
+    let speed_c = speed_control.clone();
     let intent_view = view.clone();
     let intent_state = state.clone();
     let intent_sync = sync.clone();
@@ -614,16 +675,62 @@ fn lighting_section(
     });
     // Initial visibility for Off.
     color_control.set_visible(false);
-    speed.set_visible(false);
+    speed_control.set_visible(false);
 
     LightingSection { root, view }
 }
 
-// GtkColorDialog intentionally does not expose its window or sizing. Use the
-// application-owned chooser here so it remains transient for the z13helper
-// window, opens at the size needed by the custom editor, and omits alpha.
+fn gamescope_choice_grid(selection: &gtk::DropDown, labels: &[&str], columns: usize) -> gtk::Grid {
+    let grid = gtk::Grid::builder()
+        .column_spacing(4)
+        .row_spacing(4)
+        .column_homogeneous(true)
+        .build();
+    grid.add_css_class("gamescope-choice-grid");
+    let buttons = Rc::new(RefCell::new(Vec::<gtk::ToggleButton>::new()));
+    let mut group: Option<gtk::ToggleButton> = None;
+    for (index, label) in labels.iter().enumerate() {
+        let button = gtk::ToggleButton::with_label(label);
+        button.add_css_class("gamescope-choice");
+        if let Some(group) = group.as_ref() {
+            button.set_group(Some(group));
+        } else {
+            group = Some(button.clone());
+        }
+        button.set_active(selection.selected() == index as u32);
+        let selection = selection.clone();
+        button.connect_toggled(move |button| {
+            if button.is_active() {
+                selection.set_selected(index as u32);
+            }
+        });
+        grid.attach(
+            &button,
+            (index % columns) as i32,
+            (index / columns) as i32,
+            1,
+            1,
+        );
+        buttons.borrow_mut().push(button);
+    }
+    let buttons_sync = buttons.clone();
+    selection.connect_selected_notify(move |selection| {
+        for (index, button) in buttons_sync.borrow().iter().enumerate() {
+            button.set_active(selection.selected() == index as u32);
+        }
+    });
+    grid
+}
+
+// GtkColorDialog intentionally does not expose its window or sizing. Gamescope
+// keeps the chooser inside the existing overlay surface; desktop sessions use
+// the application-owned transient below.
 #[allow(deprecated)]
-fn install_color_chooser(button: &gtk::ColorDialogButton) {
+fn install_color_chooser(
+    state: &Rc<AppState>,
+    button: &gtk::ColorDialogButton,
+    gamescope_pages: Option<&gtk::Stack>,
+) {
     // GtkColorDialogButton runs its built-in activation before regular signal
     // handlers. Claim pointer activation during capture so only our
     // application-owned transient is opened.
@@ -633,15 +740,84 @@ fn install_color_chooser(button: &gtk::ColorDialogButton) {
         gesture.set_state(gtk::EventSequenceState::Claimed);
     });
     let color_button = button.clone();
+    let gamescope_pages = gamescope_pages.cloned();
+    let gamescope_picker_height = state.gamescope.as_ref().map(|gamescope| {
+        gamescope
+            .panel_size(GAMESCOPE_MAIN_WINDOW_WIDTH, GAMESCOPE_COLOR_PICKER_HEIGHT)
+            .1
+    });
+    let chooser_state = state.clone();
+    let open_chooser: Rc<dyn Fn()> = Rc::new(move || {
+        if let Some(pages) = gamescope_pages.as_ref() {
+            present_inline_color_chooser(
+                pages,
+                &color_button,
+                gamescope_picker_height.expect("gamescope picker height"),
+            );
+        } else {
+            present_color_chooser(&chooser_state, &color_button);
+        }
+    });
+    let click_chooser = open_chooser.clone();
     click.connect_released(move |gesture, _, _, _| {
         gesture.set_state(gtk::EventSequenceState::Claimed);
-        present_color_chooser(&color_button);
+        click_chooser();
     });
     button.add_controller(click);
+    state.register_controller_activation(button, move || open_chooser());
 }
 
 #[allow(deprecated)]
-fn present_color_chooser(button: &gtk::ColorDialogButton) {
+fn present_inline_color_chooser(pages: &gtk::Stack, button: &gtk::ColorDialogButton, height: i32) {
+    if let Some(previous) = pages.child_by_name("color-picker") {
+        pages.remove(&previous);
+    }
+
+    let chooser = gtk::ColorChooserWidget::new();
+    chooser.set_use_alpha(false);
+    chooser.set_rgba(&button.rgba().with_alpha(1.0));
+    chooser.set_hexpand(true);
+    chooser.set_vexpand(true);
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.set_height_request(height);
+    let header = adw::HeaderBar::new();
+    header.set_show_start_title_buttons(false);
+    header.set_show_end_title_buttons(false);
+    header.set_title_widget(Some(&gtk::Label::new(Some("Choose Lighting Color"))));
+
+    let back = gtk::Button::with_label("Back");
+    back.set_tooltip_text(Some("Cancel color selection"));
+    let pages_back = pages.clone();
+    back.connect_clicked(move |_| pages_back.set_visible_child_name("main"));
+    header.pack_start(&back);
+
+    let apply = gtk::Button::with_label("Apply");
+    apply.add_css_class("suggested-action");
+    let pages_apply = pages.clone();
+    let chooser_apply = chooser.clone();
+    let color_button = button.clone();
+    apply.connect_clicked(move |_| {
+        color_button.set_rgba(&chooser_apply.rgba().with_alpha(1.0));
+        pages_apply.set_visible_child_name("main");
+    });
+    header.pack_end(&apply);
+    toolbar.add_top_bar(&header);
+
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .hexpand(true)
+        .vexpand(true)
+        .child(&chooser)
+        .build();
+    toolbar.set_content(Some(&scroller));
+    pages.add_named(&toolbar, Some("color-picker"));
+    pages.set_visible_child_name("color-picker");
+}
+
+#[allow(deprecated)]
+fn present_color_chooser(state: &Rc<AppState>, button: &gtk::ColorDialogButton) {
     let Some(parent) = button.root().and_downcast::<gtk::Window>() else {
         return;
     };
@@ -656,18 +832,23 @@ fn present_color_chooser(button: &gtk::ColorDialogButton) {
     // contents resize. Remap the larger editor as a fresh transient instead;
     // KWin then centers both sizes independently.
     let color_button = button.clone();
+    let editor_state = state.clone();
     dialog.connect_show_editor_notify(move |dialog| {
         if dialog.shows_editor() {
             let initial = dialog.rgba().with_alpha(1.0);
             dialog.close();
-            present_custom_color_editor(&color_button, &initial);
+            present_custom_color_editor(&editor_state, &color_button, &initial);
         }
     });
-    dialog.present();
+    state.present_auxiliary(&dialog);
 }
 
 #[allow(deprecated)]
-fn present_custom_color_editor(button: &gtk::ColorDialogButton, initial: &gtk::gdk::RGBA) {
+fn present_custom_color_editor(
+    state: &Rc<AppState>,
+    button: &gtk::ColorDialogButton,
+    initial: &gtk::gdk::RGBA,
+) {
     let Some(parent) = button.root().and_downcast::<gtk::Window>() else {
         return;
     };
@@ -682,7 +863,7 @@ fn present_custom_color_editor(button: &gtk::ColorDialogButton, initial: &gtk::g
     // the editor controls without restoring the previous oversized panel.
     dialog.set_show_editor(true);
     connect_color_chooser_response(&dialog, button);
-    dialog.present();
+    state.present_auxiliary(&dialog);
 }
 
 #[allow(deprecated)]
@@ -802,12 +983,11 @@ fn sync_once(state: &Rc<AppState>, view: &MainView) {
     );
 }
 
-fn install_telemetry(state: &Rc<AppState>, window: &adw::ApplicationWindow, view: MainView) {
+fn install_telemetry(state: &Rc<AppState>, _window: &adw::ApplicationWindow, view: MainView) {
     let busy = Rc::new(Cell::new(false));
     let state = state.clone();
-    let window = window.clone();
     glib::timeout_add_seconds_local(1, move || {
-        if !window.is_visible() || busy.replace(true) {
+        if !state.main_window_is_visible() || busy.replace(true) {
             return glib::ControlFlow::Continue;
         }
         let client = state.client.clone();

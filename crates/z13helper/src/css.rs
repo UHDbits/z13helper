@@ -27,6 +27,13 @@ scale.undervolt-scale > value.right { margin-left: 6px; }
   font-weight: 700;
   color: white;
 }
+.gamescope-overlay-window { background: transparent; }
+.gamescope-wrapper { background: transparent; }
+.gamescope-backdrop { background: rgba(0, 0, 0, 0.30); }
+.gamescope-panel {
+  background: @window_bg_color;
+  border-radius: 12px;
+}
 "#;
 
 pub fn install() {
@@ -37,6 +44,40 @@ pub fn install() {
             &display,
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
+pub fn install_gamescope_scale(scale: f64) {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(&format!(
+        r#"
+.gamescope-ui {{ font-size: {:.0}px; }}
+.gamescope-ui .mode-button,
+.gamescope-ui .editor-button {{ min-width: {:.0}px; min-height: {:.0}px; }}
+.gamescope-ui button {{ min-height: {:.0}px; }}
+.gamescope-ui .gamescope-choice {{ padding: {:.0}px {:.0}px; }}
+.gamescope-ui switch {{ min-width: {:.0}px; min-height: {:.0}px; }}
+.gamescope-ui scale slider {{ min-width: {:.0}px; min-height: {:.0}px; }}
+.gamescope-ui .hud-label {{ font-size: {:.0}px; }}
+"#,
+        14.0 * scale,
+        56.0 * scale,
+        56.0 * scale,
+        30.0 * scale,
+        3.0 * scale,
+        5.0 * scale,
+        48.0 * scale,
+        24.0 * scale,
+        20.0 * scale,
+        20.0 * scale,
+        28.0 * scale,
+    ));
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
         );
     }
 }

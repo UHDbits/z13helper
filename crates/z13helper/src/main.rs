@@ -1,6 +1,7 @@
 //! z13helper — G-Helper-style control panel for z13helperd.
 mod app;
 mod css;
+mod gamescope;
 mod resources;
 mod services;
 mod ui;
@@ -13,6 +14,7 @@ use std::rc::Rc;
 const APPLICATION_ID: &str = "com.ashtonantila.z13helper";
 
 fn main() {
+    gamescope::select_gdk_backend();
     let prefer_dark = consume_legacy_dark_preference();
     let app = adw::Application::new(Some(APPLICATION_ID), gio::ApplicationFlags::empty());
     if prefer_dark {
@@ -86,5 +88,12 @@ mod tests {
         let desktop = include_str!("../../../contrib/com.ashtonantila.z13helper.desktop");
         assert!(desktop.contains(&format!("StartupWMClass={APPLICATION_ID}")));
         assert!(desktop.contains(&format!("X-GNOME-Application-ID={APPLICATION_ID}")));
+    }
+
+    #[test]
+    fn user_service_loads_gamescope_session_environment() {
+        let service = include_str!("../../../contrib/z13helper.service");
+        assert!(service.contains("EnvironmentFile=-%t/gamescope-environment"));
+        assert!(service.contains("Environment=Z13HELPER_START_HIDDEN=1"));
     }
 }

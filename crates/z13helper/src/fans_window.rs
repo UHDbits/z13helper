@@ -18,12 +18,16 @@ use crate::ui::sync::SyncGuard;
 type ApplySchedule = Rc<RefCell<Option<glib::SourceId>>>;
 
 pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
+    let (window_width, window_height) = state
+        .gamescope
+        .as_ref()
+        .map_or((920, 720), |gamescope| gamescope.panel_size(920, 720));
     let window = adw::Window::builder()
         .application(&state.app)
         .transient_for(parent)
         .title("Fans + Power")
-        .default_width(920)
-        .default_height(720)
+        .default_width(window_width)
+        .default_height(window_height)
         .build();
 
     let toolbar = adw::ToolbarView::new();
@@ -145,6 +149,11 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         .unwrap_or(0);
     selector.set_selected(selected as u32);
     selector.set_hexpand(true);
+    let selector_control: gtk::Widget = if state.gamescope.is_some() {
+        gamescope_dropdown_button(&selector, "Profile").upcast()
+    } else {
+        selector.clone().upcast()
+    };
     let plus = gtk::Button::with_label("Add");
     plus.set_tooltip_text(Some("Add profile"));
     plus.update_property(&[gtk::accessible::Property::Label("Add profile")]);
@@ -155,7 +164,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     rename.set_tooltip_text(Some("Rename selected profile"));
     rename.update_property(&[gtk::accessible::Property::Label("Rename selected profile")]);
     set_profile_action_sensitivity(state, &profile.id, &rename, &minus);
-    sel_row.append(&selector);
+    sel_row.append(&selector_control);
     sel_row.append(&plus);
     sel_row.append(&rename);
     sel_row.append(&minus);
@@ -836,8 +845,17 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     root.append(&actions);
     toast_overlay.set_child(Some(&root));
     toolbar.set_content(Some(&toast_overlay));
-    window.set_content(Some(&toolbar));
-    window.present();
+    if let Some(gamescope) = state.gamescope.as_ref() {
+        window.add_css_class("gamescope-overlay-window");
+        window.set_decorated(false);
+        window.fullscreen();
+        let closing = window.clone();
+        let wrapper = gamescope.wrap_panel(&toolbar, 920, Some(720), move || closing.close());
+        window.set_content(Some(&wrapper));
+    } else {
+        window.set_content(Some(&toolbar));
+    }
+    state.present_auxiliary(&window);
 }
 
 /// Returns (page, spl, sppt, fppt, apply_power, ppd).
@@ -885,7 +903,11 @@ fn build_cpu_page(
         })
         .unwrap_or(3);
     ppd.set_selected(ppd_selected);
-    ppd_group.add(&ppd);
+    if state.gamescope.is_some() {
+        ppd_group.add(&gamescope_combo_row(&ppd, "PPD Profile"));
+    } else {
+        ppd_group.add(&ppd);
+    }
     page.append(&ppd_group);
 
     let power_group = adw::PreferencesGroup::builder()
@@ -1475,6 +1497,127 @@ fn slider_row_with_margin(
     scale.set_hexpand(true);
     row.append(&scale);
     (row, scale)
+}
+
+fn gamescope_dropdown_button(dropdown: &gtk::DropDown, title: &'static str) -> gtk::Button {
+    let button = gtk::Button::new();
+    button.set_hexpand(true);
+    update_dropdown_button_label(&button, dropdown, title);
+
+    let button_selected = button.clone();
+    dropdown.connect_selected_notify(move |dropdown| {
+        update_dropdown_button_label(&button_selected, dropdown, title);
+    });
+    let button_model = button.clone();
+    dropdown.connect_model_notify(move |dropdown| {
+        update_dropdown_button_label(&button_model, dropdown, title);
+    });
+
+    let dropdown_select = dropdown.clone();
+    let button_parent = button.clone();
+    button.connect_clicked(move |_| {
+        let Some(model) = dropdown_select.model() else {
+            return;
+        };
+        let dialog = adw::AlertDialog::new(Some(title), Some("Choose a selection"));
+        dialog.add_response("cancel", "Cancel");
+        dialog.set_close_response("cancel");
+        for index in 0..model.n_items() {
+            let Some(label) = model
+                .item(index)
+                .and_downcast::<gtk::StringObject>()
+                .map(|item| item.string())
+            else {
+                continue;
+            };
+            let response = format!("choice-{index}");
+            dialog.add_response(&response, &label);
+            if dropdown_select.selected() == index {
+                dialog.set_response_appearance(&response, adw::ResponseAppearance::Suggested);
+            }
+        }
+        let dropdown = dropdown_select.clone();
+        dialog.connect_response(None, move |_, response| {
+            if let Some(index) = response
+                .strip_prefix("choice-")
+                .and_then(|index| index.parse::<u32>().ok())
+            {
+                dropdown.set_selected(index);
+            }
+        });
+        dialog.present(Some(&button_parent));
+    });
+    button
+}
+
+fn update_dropdown_button_label(button: &gtk::Button, dropdown: &gtk::DropDown, title: &str) {
+    let selected = dropdown
+        .selected_item()
+        .and_downcast::<gtk::StringObject>()
+        .map(|item| item.string().to_string())
+        .unwrap_or_else(|| "None".into());
+    button.set_label(&format!("{title}: {selected}"));
+}
+
+fn gamescope_combo_row(combo: &adw::ComboRow, title: &'static str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder().title(title).build();
+    let button = gtk::Button::new();
+    update_combo_button_label(&button, combo);
+    row.add_suffix(&button);
+    row.set_activatable_widget(Some(&button));
+    row.set_sensitive(combo.is_sensitive());
+
+    let button_selected = button.clone();
+    combo.connect_selected_notify(move |combo| update_combo_button_label(&button_selected, combo));
+    let button_model = button.clone();
+    combo.connect_model_notify(move |combo| update_combo_button_label(&button_model, combo));
+    let row_sensitive = row.clone();
+    combo.connect_sensitive_notify(move |combo| row_sensitive.set_sensitive(combo.is_sensitive()));
+
+    let combo_select = combo.clone();
+    let button_parent = button.clone();
+    button.connect_clicked(move |_| {
+        let Some(model) = combo_select.model() else {
+            return;
+        };
+        let dialog = adw::AlertDialog::new(Some(title), Some("Choose a selection"));
+        dialog.add_response("cancel", "Cancel");
+        dialog.set_close_response("cancel");
+        for index in 0..model.n_items() {
+            let Some(label) = model
+                .item(index)
+                .and_downcast::<gtk::StringObject>()
+                .map(|item| item.string())
+            else {
+                continue;
+            };
+            let response = format!("choice-{index}");
+            dialog.add_response(&response, &label);
+            if combo_select.selected() == index {
+                dialog.set_response_appearance(&response, adw::ResponseAppearance::Suggested);
+            }
+        }
+        let combo = combo_select.clone();
+        dialog.connect_response(None, move |_, response| {
+            if let Some(index) = response
+                .strip_prefix("choice-")
+                .and_then(|index| index.parse::<u32>().ok())
+            {
+                combo.set_selected(index);
+            }
+        });
+        dialog.present(Some(&button_parent));
+    });
+    row
+}
+
+fn update_combo_button_label(button: &gtk::Button, combo: &adw::ComboRow) {
+    let selected = combo
+        .selected_item()
+        .and_downcast::<gtk::StringObject>()
+        .map(|item| item.string().to_string())
+        .unwrap_or_else(|| "None".into());
+    button.set_label(&selected);
 }
 
 fn sync_ppd_choices(
