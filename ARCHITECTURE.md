@@ -43,7 +43,10 @@ The daemon atomically persists only flattened desired machine state at
 `/var/lib/z13helper/state.json`. On first boot without that file, it observes
 the PPD-selected policy and leaves direct EC mode released. Startup and resume
 restore fan protection before high power, followed by undervolt, the persistent
-battery policy, and lighting. The stored battery
+battery policy, panel overdrive, and lighting. Around suspend the daemon records
+the pre-sleep power source, reapplies the complete request on resume, and
+notifies the GUI when AC/battery changed so source-specific profile and panel
+policies are reconciled immediately. The stored battery
 limit remains the normal slider value; a separate one-time flag temporarily
 writes 100% and is cleared only after the normal limit is restored at full
 charge.

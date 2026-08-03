@@ -239,6 +239,47 @@ impl Sysfs {
         Err("battery telemetry not found".into())
     }
 
+    /// Return the current power source as `true` for battery power.
+    ///
+    /// The adapter's online state is authoritative when available. Battery
+    /// status is only a fallback because a charging battery can still be
+    /// connected to AC.
+    pub fn on_battery(&self) -> Result<bool, String> {
+        let directory = self.path("/sys/class/power_supply");
+        let mut found_adapter = false;
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("read {}: {error}", directory.display()))?
+            .flatten()
+        {
+            let kind = self.read_text(entry.path().join("type"))?;
+            if kind != "Mains" && kind != "ADP" {
+                continue;
+            }
+            found_adapter = true;
+            let online = self
+                .read_text(entry.path().join("online"))?
+                .parse::<u8>()
+                .map_err(|error| format!("parse adapter online state: {error}"))?;
+            if online == 1 {
+                return Ok(false);
+            }
+        }
+        if found_adapter {
+            return Ok(true);
+        }
+
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("read {}: {error}", directory.display()))?
+            .flatten()
+        {
+            if self.read_text(entry.path().join("type"))? != "Battery" {
+                continue;
+            }
+            return Ok(self.read_text(entry.path().join("status"))? == "Discharging");
+        }
+        Err("power source not found".into())
+    }
+
     pub fn set_battery_limit(&self, limit: i32) -> Result<(), String> {
         if !(40..=100).contains(&limit) {
             return Err("battery limit must be between 40 and 100".into());
@@ -557,6 +598,29 @@ mod tests {
             }
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reads_power_source_from_adapter_and_falls_back_to_battery_status() {
+        let source_root = root();
+        let adapter = source_root.join("class/power_supply/AC0");
+        fs::create_dir_all(&adapter).unwrap();
+        fs::write(adapter.join("type"), "Mains\n").unwrap();
+        fs::write(adapter.join("online"), "1\n").unwrap();
+        assert!(!Sysfs::new(&source_root).on_battery().unwrap());
+        fs::write(adapter.join("online"), "0\n").unwrap();
+        assert!(Sysfs::new(&source_root).on_battery().unwrap());
+        let _ = fs::remove_dir_all(&source_root);
+
+        let source_root = root();
+        let battery = source_root.join("class/power_supply/BAT0");
+        fs::create_dir_all(&battery).unwrap();
+        fs::write(battery.join("type"), "Battery\n").unwrap();
+        fs::write(battery.join("status"), "Charging\n").unwrap();
+        assert!(!Sysfs::new(&source_root).on_battery().unwrap());
+        fs::write(battery.join("status"), "Discharging\n").unwrap();
+        assert!(Sysfs::new(&source_root).on_battery().unwrap());
+        let _ = fs::remove_dir_all(source_root);
     }
 
     #[test]

@@ -82,6 +82,15 @@ fn on_confirmed_transition(state: &Rc<AppState>, on_battery: bool) {
     }
 }
 
+/// The daemon has sampled the source on both sides of suspend. Treat its
+/// post-resume value as already debounced so source-specific profile and panel
+/// policies are repaired immediately instead of waiting for the polling
+/// watcher to discover the transition.
+pub fn on_resume(state: &Rc<AppState>, on_battery: bool) {
+    tracing::info!(on_battery, "power source changed during suspend");
+    on_confirmed_transition(state, on_battery);
+}
+
 fn upower_watch(tx: async_channel::Sender<bool>) -> Result<(), Box<dyn std::error::Error>> {
     let conn = zbus::blocking::Connection::system()?;
     // Initial read.

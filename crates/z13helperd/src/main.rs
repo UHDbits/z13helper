@@ -96,7 +96,7 @@ fn handle_client(
                 && !line.contains("\"cmd\":\"probe\"");
             write_response(&mut stream, &response)?;
             if mutating {
-                broadcast(&subscribers, DaemonEventKind::StateChanged, None);
+                broadcast(&subscribers, DaemonEventKind::StateChanged, None, None);
             }
         }
         Dispatch::Subscribe(events) => {
@@ -120,6 +120,7 @@ fn broadcast(
     subscribers: &Arc<Mutex<Vec<Subscriber>>>,
     kind: DaemonEventKind,
     action: Option<ControllerAction>,
+    on_battery: Option<bool>,
 ) {
     let response = WireResponse {
         ok: true,
@@ -131,6 +132,7 @@ fn broadcast(
             kind,
             action,
             generation: None,
+            on_battery,
         }),
         error: None,
     };
@@ -225,19 +227,30 @@ fn main() -> Result<()> {
             next_hotplug = Instant::now() + Duration::from_secs(2);
         }
         while let Ok(event) = event_rx.try_recv() {
-            broadcast(&subscribers, event, None);
+            broadcast(&subscribers, event, None, None);
         }
         while let Ok(action) = controller_rx.try_recv() {
             broadcast(
                 &subscribers,
                 DaemonEventKind::ControllerAction,
                 Some(action),
+                None,
             );
         }
         while let Ok(event) = sleep_rx.try_recv() {
             match event {
                 SleepEvent::Sleeping => backend.lock().unwrap().shutdown(),
-                SleepEvent::Resumed => backend.lock().unwrap().restore_volatile(),
+                SleepEvent::Resumed => {
+                    let power_source_changed = backend.lock().unwrap().restore_volatile();
+                    if let Some(on_battery) = power_source_changed {
+                        broadcast(
+                            &subscribers,
+                            DaemonEventKind::PowerSourceChanged,
+                            None,
+                            Some(on_battery),
+                        );
+                    }
+                }
             }
         }
         let capture_requested = controller_capture_deadline

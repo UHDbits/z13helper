@@ -388,6 +388,7 @@ pub enum DaemonEventKind {
     StateChanged,
     GuiToggle,
     ControllerAction,
+    PowerSourceChanged,
 }
 
 impl DaemonEventKind {
@@ -396,6 +397,7 @@ impl DaemonEventKind {
             Self::StateChanged => "state-changed",
             Self::GuiToggle => "gui-toggle",
             Self::ControllerAction => "controller-action",
+            Self::PowerSourceChanged => "power-source-changed",
         }
     }
 }
@@ -418,6 +420,8 @@ pub struct DaemonEvent {
     pub action: Option<ControllerAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_battery: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -504,11 +508,26 @@ mod tests {
             kind: DaemonEventKind::ControllerAction,
             action: Some(ControllerAction::Accept),
             generation: None,
+            on_battery: None,
         };
         assert_eq!(
             serde_json::to_string(&event).unwrap(),
             r#"{"kind":"controller-action","action":"accept"}"#
         );
+    }
+
+    #[test]
+    fn power_source_resume_event_roundtrips_the_post_resume_source() {
+        let event = DaemonEvent {
+            kind: DaemonEventKind::PowerSourceChanged,
+            action: None,
+            generation: None,
+            on_battery: Some(true),
+        };
+        let decoded: DaemonEvent = serde_json::from_str(&serde_json::to_string(&event).unwrap())
+            .expect("power-source event should decode");
+        assert_eq!(decoded.kind, DaemonEventKind::PowerSourceChanged);
+        assert_eq!(decoded.on_battery, Some(true));
     }
 
     #[test]

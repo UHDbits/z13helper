@@ -270,6 +270,7 @@ pub struct Backend {
     persisted: PersistedState,
     store: StateStore,
     probe: ProbeReply,
+    suspended_on_battery: Option<bool>,
 }
 
 impl Backend {
@@ -290,7 +291,9 @@ impl Backend {
             persisted,
             store,
             probe,
+            suspended_on_battery: None,
         };
+        backend.restore_panel_overdrive();
         backend.observe();
         if let Some(desired) = backend.persisted.desired.clone() {
             if let Err(error) = backend.apply(desired) {
@@ -593,21 +596,43 @@ impl Backend {
     }
 
     pub fn shutdown(&mut self) {
+        self.suspended_on_battery = match self.hardware.sysfs.on_battery() {
+            Ok(on_battery) => Some(on_battery),
+            Err(error) => {
+                tracing::debug!(%error, "could not record power source before suspend");
+                None
+            }
+        };
         if let Err(error) = self.hardware.release_direct() {
             tracing::error!(%error, "failed to release EC control during shutdown");
         }
     }
 
-    pub fn restore_volatile(&mut self) {
+    /// Reapply every state that firmware may lose across suspend. Returns the
+    /// current power source only when it differs from the source recorded
+    /// before suspend, so the UI can immediately select its source-specific
+    /// profile and panel policy.
+    pub fn restore_volatile(&mut self) -> Option<bool> {
+        let resumed_on_battery = self.hardware.sysfs.on_battery().ok();
+        let power_source_changed =
+            power_source_changed(self.suspended_on_battery, resumed_on_battery);
+        self.suspended_on_battery = None;
+
         if let Some(desired) = self.persisted.desired.clone() {
             if let Err(error) = self.apply(desired) {
                 tracing::error!(%error, "failed to restore volatile hardware state");
+                self.note_restore_failure("resume restore failed", &error.to_string());
                 let _ = self.hardware.release_direct();
-                return;
             }
         }
         self.restore_battery_policy();
+        self.restore_panel_overdrive();
         self.restore_lighting();
+        self.observe();
+        if let Err(error) = self.save() {
+            tracing::warn!(%error, "failed to persist post-resume state");
+        }
+        power_source_changed
     }
 
     pub fn restore_hotplugged_lighting(&mut self) {
@@ -701,7 +726,22 @@ impl Backend {
         if let Some(target) = target {
             if let Err(error) = self.hardware.sysfs.set_battery_limit(target) {
                 tracing::warn!(%error, target, "failed to restore battery charge policy");
+                self.note_restore_failure("battery policy restore failed", &error);
             }
+        }
+    }
+
+    fn restore_panel_overdrive(&mut self) {
+        let Some(value) = self.persisted.state.panel_overdrive else {
+            return;
+        };
+        if let Err(error) = self
+            .hardware
+            .sysfs
+            .set_armoury_bool("panel_overdrive", value != 0)
+        {
+            tracing::warn!(%error, value, "failed to restore panel overdrive");
+            self.note_restore_failure("panel overdrive restore failed", &error);
         }
     }
 
@@ -736,8 +776,17 @@ impl Backend {
         for (device, state) in lighting {
             if let Err(error) = self.hardware.apply_lighting(&device, &state) {
                 tracing::warn!(%error, %device, "failed to restore lighting");
+                self.note_restore_failure(&format!("{device} lighting restore failed"), &error);
             }
         }
+    }
+
+    fn note_restore_failure(&mut self, context: &str, error: &str) {
+        self.persisted.state.degraded = true;
+        self.persisted
+            .state
+            .warnings
+            .push(format!("{context}: {error}"));
     }
 
     fn prevalidate(&self, request: &ApplyRequest) -> Result<(), DaemonError> {
@@ -756,6 +805,14 @@ impl Backend {
             }
         }
         Ok(())
+    }
+}
+
+fn power_source_changed(before: Option<bool>, after: Option<bool>) -> Option<bool> {
+    match (before, after) {
+        (Some(before), Some(after)) if before != after => Some(after),
+        (None, Some(after)) => Some(after),
+        _ => None,
     }
 }
 
@@ -794,8 +851,8 @@ fn validate_manual_undervolt(offset: i32, available: bool) -> Result<(), DaemonE
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_battery_limit, one_time_charge_is_complete, validate_factory_curve_query_power,
-        validate_manual_undervolt,
+        effective_battery_limit, one_time_charge_is_complete, power_source_changed,
+        validate_factory_curve_query_power, validate_manual_undervolt,
     };
     use z13helper_core::protocol::TdpState;
 
@@ -823,5 +880,14 @@ mod tests {
         assert!(validate_manual_undervolt(-20, true).is_ok());
         assert!(validate_manual_undervolt(-41, true).is_err());
         assert!(validate_manual_undervolt(-20, false).is_err());
+    }
+
+    #[test]
+    fn resume_reports_only_a_real_power_source_transition() {
+        assert_eq!(power_source_changed(Some(false), Some(true)), Some(true));
+        assert_eq!(power_source_changed(Some(true), Some(false)), Some(false));
+        assert_eq!(power_source_changed(Some(false), Some(false)), None);
+        assert_eq!(power_source_changed(Some(true), None), None);
+        assert_eq!(power_source_changed(None, Some(false)), Some(false));
     }
 }
