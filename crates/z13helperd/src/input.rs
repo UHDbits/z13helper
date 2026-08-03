@@ -5,9 +5,9 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use z13helper_core::{ControllerAction, DaemonEventKind};
 
@@ -184,20 +184,19 @@ fn controller_loop(
             continue;
         }
 
-        if poll_fds[0].revents & libc::POLLIN != 0 {
-            if let Some(requested) = receive_capture_state(&control) {
-                if requested != capturing {
-                    for device in &mut devices {
-                        if requested {
-                            drain_device(device);
-                        }
-                        set_grabbed(device, requested);
-                        device.held.clear();
-                        device.stick = StickState::default();
-                    }
-                    capturing = requested;
+        if poll_fds[0].revents & libc::POLLIN != 0
+            && let Some(requested) = receive_capture_state(&control)
+            && requested != capturing
+        {
+            for device in &mut devices {
+                if requested {
+                    drain_device(device);
                 }
+                set_grabbed(device, requested);
+                device.held.clear();
+                device.stick = StickState::default();
             }
+            capturing = requested;
         }
 
         let ready: HashSet<_> = poll_fds
@@ -253,10 +252,9 @@ fn next_poll_timeout(last_scan: Instant, capturing: bool, devices: &[ControllerD
     let now = Instant::now();
     let next_scan = last_scan + SCAN_INTERVAL;
     let mut deadline = next_scan;
-    if capturing {
-        if let Some(repeat) = devices.iter().flat_map(|device| device.held.values()).min() {
-            deadline = deadline.min(*repeat);
-        }
+    if capturing && let Some(repeat) = devices.iter().flat_map(|device| device.held.values()).min()
+    {
+        deadline = deadline.min(*repeat);
     }
     let remaining = deadline.saturating_duration_since(now);
     remaining.as_millis().max(1).min(i32::MAX as u128) as i32

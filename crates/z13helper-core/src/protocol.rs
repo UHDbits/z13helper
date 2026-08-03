@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::curve::Curve;
 use crate::error::WireError;
-use crate::profile::{stock_ppt, FanControlMode, Profile};
+use crate::profile::{FanControlMode, Profile, stock_ppt};
 
 pub const PROTOCOL_VERSION: u32 = 2;
 
@@ -475,14 +475,18 @@ mod tests {
         );
 
         profile.fan_temperature_average_seconds = 0;
-        assert!(ApplyRequest::from_profile(&profile, false)
-            .validate()
-            .is_ok());
+        assert!(
+            ApplyRequest::from_profile(&profile, false)
+                .validate()
+                .is_ok()
+        );
 
         profile.fan_temperature_average_seconds = MAX_FAN_TEMPERATURE_AVERAGE_SECONDS + 1;
-        assert!(ApplyRequest::from_profile(&profile, false)
-            .validate()
-            .is_err());
+        assert!(
+            ApplyRequest::from_profile(&profile, false)
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]

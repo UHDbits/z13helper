@@ -36,7 +36,7 @@ installer manages only current `z13helper` identifiers.
 
 ## Build and install
 
-Rust 1.92+, GTK 4.14+, and libadwaita 1.5+ are required.
+Rust 1.92+ (edition 2024), GTK 4.14+, and libadwaita 1.5+ are required.
 
 ```sh
 make build

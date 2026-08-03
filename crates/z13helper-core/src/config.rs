@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::profile::{stock_fan_curves, stock_ppt, Profile};
+use crate::profile::{Profile, stock_fan_curves, stock_ppt};
 
 pub const CONFIG_VERSION: u32 = 1;
 

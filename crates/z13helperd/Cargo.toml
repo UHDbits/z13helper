@@ -2,6 +2,7 @@
 name = "z13helperd"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Privileged hardware backend for the ASUS ROG Flow Z13 GZ302EA"

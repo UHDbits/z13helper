@@ -441,10 +441,11 @@ mod tests {
             ec.version(),
             Err(EcError::Timeout("input buffer"))
         ));
-        assert!(!ec
-            .into_inner()
-            .ops
-            .iter()
-            .any(|op| matches!(op, Op::Write(_, _))));
+        assert!(
+            !ec.into_inner()
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::Write(_, _)))
+        );
     }
 }

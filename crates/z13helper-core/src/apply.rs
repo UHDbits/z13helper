@@ -2,7 +2,7 @@
 
 use crate::curve::{Curve, HIGH_POWER_THRESHOLD_W};
 use crate::error::DaemonError;
-use crate::profile::{stock_fan_curves, FanControlMode};
+use crate::profile::{FanControlMode, stock_fan_curves};
 use crate::protocol::{ApplyRequest, TdpState};
 
 /// Hardware operations owned by `z13helperd`.
@@ -248,11 +248,13 @@ mod tests {
             let request = ApplyRequest::from_profile(&profile, false);
             let mut daemon = RecordingDaemon::default();
             apply_request(&mut daemon, &request).unwrap();
-            assert!(daemon
-                .calls
-                .into_inner()
-                .iter()
-                .any(|call| call == expected));
+            assert!(
+                daemon
+                    .calls
+                    .into_inner()
+                    .iter()
+                    .any(|call| call == expected)
+            );
         }
     }
 }

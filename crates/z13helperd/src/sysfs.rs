@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use z13helper_core::curve::{validate, Curve};
+use z13helper_core::curve::{Curve, validate};
 use z13helper_core::protocol::{BatteryTelemetry, TdpState};
 
 const STRIX_HALO_TCTL_COMMAND: u32 = 0x19;
@@ -787,11 +787,13 @@ mod tests {
 
     #[test]
     fn smu_power_limit_verification_ignores_float_rounding_noise() {
-        assert!(verify_smu_power_limits(
-            [120.00001, 120.00001, 93.00001, 92.99999],
-            [120, 120, 93, 93],
-        )
-        .is_ok());
+        assert!(
+            verify_smu_power_limits(
+                [120.00001, 120.00001, 93.00001, 92.99999],
+                [120, 120, 93, 93],
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -806,13 +808,15 @@ mod tests {
             [86.00001, 86.00001, 70.00001, 70.00001],
         ]
         .into_iter();
-        assert!(poll_smu_power_limits(
-            || Ok(readings.next().expect("test readback")),
-            [86, 86, 70, 70],
-            Duration::from_millis(10),
-            Duration::ZERO,
-        )
-        .is_ok());
+        assert!(
+            poll_smu_power_limits(
+                || Ok(readings.next().expect("test readback")),
+                [86, 86, 70, 70],
+                Duration::from_millis(10),
+                Duration::ZERO,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

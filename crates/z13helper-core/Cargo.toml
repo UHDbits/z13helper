@@ -2,6 +2,7 @@
 name = "z13helper-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "Pure logic for z13helper: profiles, apply sequencing, curve math, config"
 

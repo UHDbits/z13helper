@@ -3,7 +3,7 @@ use z13helper_core::protocol::{FanHysteresis, ProbeReply};
 
 use std::time::{Duration, Instant};
 
-use crate::curve::{duty_at, hysteretic_temperature, HysteresisState, TemperatureAverager};
+use crate::curve::{HysteresisState, TemperatureAverager, duty_at, hysteretic_temperature};
 use crate::ec::{EcMailbox, PortIo};
 
 const MODEL: &str = "GZ302EA";
@@ -234,7 +234,7 @@ mod tests {
     use std::io;
 
     use super::*;
-    use crate::ec::{PortIo, Register, COMMAND_STATUS_PORT, DATA_PORT};
+    use crate::ec::{COMMAND_STATUS_PORT, DATA_PORT, PortIo, Register};
     use z13helper_core::curve::Curve;
 
     #[derive(Default)]
@@ -332,9 +332,11 @@ mod tests {
             .enable([curve(100), curve(100)], FanHysteresis::default(), 0)
             .unwrap();
         assert!(controller.direct_enabled());
-        assert!(controller
-            .sensor_failed("missing k10temp".into())
-            .contains("released"));
+        assert!(
+            controller
+                .sensor_failed("missing k10temp".into())
+                .contains("released")
+        );
         assert!(!controller.direct_enabled());
     }
 }

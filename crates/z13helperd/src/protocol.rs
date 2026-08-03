@@ -1,5 +1,5 @@
 use z13helper_core::error::{DaemonError, ErrorCode, WireError};
-use z13helper_core::protocol::{Command, WireRequest, WireResponse, PROTOCOL_VERSION};
+use z13helper_core::protocol::{Command, PROTOCOL_VERSION, WireRequest, WireResponse};
 
 use crate::backend::Backend;
 
@@ -13,7 +13,7 @@ pub fn handle_line(backend: &mut Backend, line: &str) -> Dispatch {
     let request: WireRequest = match serde_json::from_str(line) {
         Ok(request) => request,
         Err(error) => {
-            return Dispatch::Reply(Box::new(failure(ErrorCode::Protocol, error.to_string())))
+            return Dispatch::Reply(Box::new(failure(ErrorCode::Protocol, error.to_string())));
         }
     };
     if request.version != PROTOCOL_VERSION {

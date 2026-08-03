@@ -7,8 +7,8 @@ use std::time::Duration;
 use z13helper_core::curve::Curve;
 use z13helper_core::error::{DaemonError, ErrorCode};
 use z13helper_core::protocol::{
-    ApplyRequest, ApplyResponse, Command, DaemonEvent, DaemonState, LightingState, ProbeReply,
-    WireRequest, WireResponse, PROTOCOL_VERSION,
+    ApplyRequest, ApplyResponse, Command, DaemonEvent, DaemonState, LightingState,
+    PROTOCOL_VERSION, ProbeReply, WireRequest, WireResponse,
 };
 
 const DEFAULT_SOCKET: &str = "/run/z13helper/z13helperd.sock";
@@ -203,12 +203,11 @@ impl Client {
                 match reader.read_line(&mut line) {
                     Ok(0) => break,
                     Ok(_) => {
-                        if let Ok(response) = serde_json::from_str::<WireResponse>(line.trim()) {
-                            if let Some(event) = response.event {
-                                if tx.send(event).is_err() {
-                                    break;
-                                }
-                            }
+                        if let Ok(response) = serde_json::from_str::<WireResponse>(line.trim())
+                            && let Some(event) = response.event
+                            && tx.send(event).is_err()
+                        {
+                            break;
                         }
                     }
                     Err(error)

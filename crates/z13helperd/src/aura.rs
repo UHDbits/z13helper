@@ -54,10 +54,10 @@ impl AuraDevices {
         }
         self.devices.retain(|name, _| found.contains_key(name));
         for (name, path) in found {
-            if let std::collections::hash_map::Entry::Vacant(entry) = self.devices.entry(name) {
-                if let Ok(file) = OpenOptions::new().read(true).write(true).open(path) {
-                    entry.insert(file);
-                }
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.devices.entry(name)
+                && let Ok(file) = OpenOptions::new().read(true).write(true).open(path)
+            {
+                entry.insert(file);
             }
         }
         self.devices

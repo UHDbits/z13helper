@@ -9,9 +9,9 @@ pub mod label;
 pub mod profile;
 pub mod protocol;
 
-pub use apply::{apply_request, Daemon};
+pub use apply::{Daemon, apply_request};
 pub use config::Config;
 pub use curve::HIGH_POWER_THRESHOLD_W;
 pub use error::DaemonError;
-pub use profile::{stock_fan_curves, stock_ppt, FanControlMode, Profile};
+pub use profile::{FanControlMode, Profile, stock_fan_curves, stock_ppt};
 pub use protocol::*;

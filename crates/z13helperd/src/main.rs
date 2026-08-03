@@ -9,16 +9,16 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 use z13helper_core::protocol::{
-    ControllerAction, DaemonEvent, DaemonEventKind, WireResponse, PROTOCOL_VERSION,
+    ControllerAction, DaemonEvent, DaemonEventKind, PROTOCOL_VERSION, WireResponse,
 };
 use z13helperd::backend::Backend;
 use z13helperd::ec::{EcMailbox, LinuxPortIo};
 use z13helperd::input::{spawn_button_watcher, spawn_controller_watcher};
-use z13helperd::protocol::{handle_line, Dispatch};
-use z13helperd::resume::{spawn_resume_watcher, SleepEvent};
+use z13helperd::protocol::{Dispatch, handle_line};
+use z13helperd::resume::{SleepEvent, spawn_resume_watcher};
 use z13helperd::service::{Controller, DIRECT_TICK_INTERVAL};
 use z13helperd::steam::SteamBlocker;
 
@@ -306,8 +306,10 @@ mod tests {
         assert!(unit.contains("DeviceAllow=char-hidraw rw"));
         assert!(unit.contains("LimitMEMLOCK=infinity"));
         assert!(unit.contains("MemoryDenyWriteExecute=no"));
-        assert!(!unit
-            .lines()
-            .any(|line| line.starts_with("ProtectProc=") || line.starts_with("ProcSubset=")));
+        assert!(
+            !unit
+                .lines()
+                .any(|line| line.starts_with("ProtectProc=") || line.starts_with("ProcSubset="))
+        );
     }
 }

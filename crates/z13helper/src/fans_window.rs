@@ -7,7 +7,7 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use z13helper_core::{
-    stock_fan_curves, stock_ppt, ApplyRequest, FanControlMode, Profile, HIGH_POWER_THRESHOLD_W,
+    ApplyRequest, FanControlMode, HIGH_POWER_THRESHOLD_W, Profile, stock_fan_curves, stock_ppt,
 };
 
 use crate::app::AppState;
@@ -383,10 +383,10 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                 }
                 profile.fan_curves[0]
             });
-        if let Some(curve) = curve {
-            if unified {
-                editor2_unified.set_curve(curve);
-            }
+        if let Some(curve) = curve
+            && unified
+        {
+            editor2_unified.set_curve(curve);
         }
         editor2_unified.widget().set_visible(!unified);
         editor2_unified.set_editable(fan_toggle_unified.is_active() && !unified);

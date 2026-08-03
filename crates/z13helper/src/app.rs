@@ -330,15 +330,16 @@ impl AppState {
             ControllerAction::Down => focus_direction(&window, gtk4::DirectionType::Down),
             ControllerAction::Left => focus_direction(&window, gtk4::DirectionType::Left),
             ControllerAction::Right => focus_direction(&window, gtk4::DirectionType::Right),
-            ControllerAction::Accept => {
-                if window_focus(&window).is_none() {
+            ControllerAction::Accept => match window_focus(&window) {
+                None => {
                     window.child_focus(gtk4::DirectionType::TabForward);
-                } else if let Some(focused) = window_focus(&window) {
+                }
+                Some(focused) => {
                     if !self.activate_controller_override(&focused) {
                         focused.activate();
                     }
                 }
-            }
+            },
             ControllerAction::Back => self.controller_back(&window),
         }
     }
@@ -383,11 +384,10 @@ impl AppState {
 
         if let Some(stack) = find_named_descendant(window, "gamescope-main-pages")
             .and_then(|widget| widget.downcast::<gtk4::Stack>().ok())
+            && stack.visible_child_name().as_deref() != Some("main")
         {
-            if stack.visible_child_name().as_deref() != Some("main") {
-                stack.set_visible_child_name("main");
-                return;
-            }
+            stack.set_visible_child_name("main");
+            return;
         }
         self.hide_window();
     }

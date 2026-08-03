@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use z13helper_core::apply::{apply_request, Daemon};
-use z13helper_core::curve::{high_power_curve, Curve, HIGH_POWER_THRESHOLD_W};
+use z13helper_core::apply::{Daemon, apply_request};
+use z13helper_core::curve::{Curve, HIGH_POWER_THRESHOLD_W, high_power_curve};
 use z13helper_core::error::DaemonError;
 use z13helper_core::protocol::{
     ApplyRequest, ApplyResponse, Capabilities, DaemonState, FanHysteresis, Health, LightingState,
@@ -618,12 +618,12 @@ impl Backend {
             power_source_changed(self.suspended_on_battery, resumed_on_battery);
         self.suspended_on_battery = None;
 
-        if let Some(desired) = self.persisted.desired.clone() {
-            if let Err(error) = self.apply(desired) {
-                tracing::error!(%error, "failed to restore volatile hardware state");
-                self.note_restore_failure("resume restore failed", &error.to_string());
-                let _ = self.hardware.release_direct();
-            }
+        if let Some(desired) = self.persisted.desired.clone()
+            && let Err(error) = self.apply(desired)
+        {
+            tracing::error!(%error, "failed to restore volatile hardware state");
+            self.note_restore_failure("resume restore failed", &error.to_string());
+            let _ = self.hardware.release_direct();
         }
         self.restore_battery_policy();
         self.restore_panel_overdrive();
@@ -645,10 +645,10 @@ impl Backend {
                 .as_ref()
                 .and_then(|devices| devices.get(&device))
                 .cloned();
-            if let Some(state) = state {
-                if let Err(error) = self.hardware.apply_lighting(&device, &state) {
-                    tracing::warn!(%error, %device, "failed to relight hotplugged device");
-                }
+            if let Some(state) = state
+                && let Err(error) = self.hardware.apply_lighting(&device, &state)
+            {
+                tracing::warn!(%error, %device, "failed to relight hotplugged device");
             }
         }
     }
@@ -659,10 +659,10 @@ impl Backend {
         if let Ok(tdp) = self.hardware.sysfs.read_tdp() {
             self.persisted.state.tdp = Some(tdp);
         }
-        if !self.persisted.state.battery_one_time_charge {
-            if let Ok(limit) = self.hardware.sysfs.battery_limit() {
-                self.persisted.state.battery_limit = Some(limit);
-            }
+        if !self.persisted.state.battery_one_time_charge
+            && let Ok(limit) = self.hardware.sysfs.battery_limit()
+        {
+            self.persisted.state.battery_limit = Some(limit);
         }
         if let Ok(battery) = self.hardware.sysfs.battery_telemetry() {
             self.persisted.state.battery = battery;
@@ -723,11 +723,11 @@ impl Backend {
             self.persisted.state.battery_one_time_charge,
             self.persisted.state.battery_limit,
         );
-        if let Some(target) = target {
-            if let Err(error) = self.hardware.sysfs.set_battery_limit(target) {
-                tracing::warn!(%error, target, "failed to restore battery charge policy");
-                self.note_restore_failure("battery policy restore failed", &error);
-            }
+        if let Some(target) = target
+            && let Err(error) = self.hardware.sysfs.set_battery_limit(target)
+        {
+            tracing::warn!(%error, target, "failed to restore battery charge policy");
+            self.note_restore_failure("battery policy restore failed", &error);
         }
     }
 
@@ -791,18 +791,17 @@ impl Backend {
 
     fn prevalidate(&self, request: &ApplyRequest) -> Result<(), DaemonError> {
         request.validate().map_err(DaemonError::Rejected)?;
-        if let Some(profile) = request.ppd_profile.as_deref() {
-            if !self.hardware.ppd_profiles.is_empty()
-                && !self
-                    .hardware
-                    .ppd_profiles
-                    .iter()
-                    .any(|known| known == profile)
-            {
-                return Err(DaemonError::Rejected(format!(
-                    "unknown power-profiles-daemon profile {profile:?}"
-                )));
-            }
+        if let Some(profile) = request.ppd_profile.as_deref()
+            && !self.hardware.ppd_profiles.is_empty()
+            && !self
+                .hardware
+                .ppd_profiles
+                .iter()
+                .any(|known| known == profile)
+        {
+            return Err(DaemonError::Rejected(format!(
+                "unknown power-profiles-daemon profile {profile:?}"
+            )));
         }
         Ok(())
     }
