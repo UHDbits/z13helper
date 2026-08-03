@@ -1008,10 +1008,6 @@ fn build_advanced_page(
 
     let group = adw::PreferencesGroup::builder()
         .title("CPU Undervolt (Curve Optimizer)")
-        .description(
-            "Auto Apply persists this offset with the profile. Apply tests it once without \
-             restoring it after a daemon restart. Range 0 to −40.",
-        )
         .build();
 
     let apply_uv = gtk::CheckButton::with_label("Auto Apply");
@@ -1068,21 +1064,25 @@ fn build_advanced_page(
 
     let temperature_group = adw::PreferencesGroup::builder()
         .title("APU Temperature Limit")
-        .description("Sets the paired Strix Halo Tctl and cHTC thermal limits for this profile.")
         .build();
-    let cpu_temp_limit = slider_row(
-        "Temperature limit (°C)",
+    let cpu_temp_limit = gtk::Scale::with_range(gtk::Orientation::Horizontal, 80.0, 99.0, 1.0);
+    cpu_temp_limit.set_value(
         state
             .config
             .borrow()
             .active()
-            .map(|profile| u32::from(profile.cpu_temp_limit))
-            .unwrap_or(95),
-        80,
-        99,
+            .map(|profile| f64::from(profile.cpu_temp_limit))
+            .unwrap_or(95.0),
     );
-    temperature_group.add(&cpu_temp_limit.0);
+    cpu_temp_limit.set_draw_value(true);
+    cpu_temp_limit.set_value_pos(gtk::PositionType::Right);
+    cpu_temp_limit.set_digits(0);
+    cpu_temp_limit.add_css_class("undervolt-scale");
+    cpu_temp_limit.set_hexpand(true);
+    cpu_temp_limit.set_margin_start(0);
+    cpu_temp_limit.set_margin_end(0);
     page.append(&temperature_group);
+    page.append(&cpu_temp_limit);
 
     let protection_group = adw::PreferencesGroup::builder()
         .title("High-Power Fan Protection")
@@ -1155,7 +1155,7 @@ fn build_advanced_page(
         uv.set_sensitive(available);
         apply_uv.set_sensitive(available);
         manual_apply.set_sensitive(available);
-        cpu_temp_limit.1.set_sensitive(available);
+        cpu_temp_limit.set_sensitive(available);
         note.set_visible(!available);
     }
 
@@ -1163,7 +1163,7 @@ fn build_advanced_page(
     let editing_temperature = editing_id.clone();
     let loading_temperature = loading.clone();
     let apply_schedule_temperature = apply_schedule.clone();
-    cpu_temp_limit.1.connect_value_changed(move |scale| {
+    cpu_temp_limit.connect_value_changed(move |scale| {
         if loading_temperature.active() {
             return;
         }
@@ -1240,7 +1240,7 @@ fn build_advanced_page(
         );
     });
 
-    (page, uv, apply_uv, manual_apply, note, cpu_temp_limit.1)
+    (page, uv, apply_uv, manual_apply, note, cpu_temp_limit)
 }
 
 fn schedule_apply(state: &Rc<AppState>, schedule: &ApplySchedule) {
