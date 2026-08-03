@@ -23,6 +23,7 @@ pub struct AppState {
     pub on_battery: Cell<bool>,
     pub undervolt_available: Cell<Option<bool>>,
     pub main_window: RefCell<Option<adw::ApplicationWindow>>,
+    main_window_visible: Cell<bool>,
     pub persistent_banner: RefCell<Option<adw::Banner>>,
     toast_overlays: RefCell<Vec<glib::WeakRef<adw::ToastOverlay>>>,
     pending_persistent_error: RefCell<Option<String>>,
@@ -56,6 +57,7 @@ impl AppState {
             on_battery: Cell::new(false),
             undervolt_available: Cell::new(None),
             main_window: RefCell::new(None),
+            main_window_visible: Cell::new(false),
             persistent_banner: RefCell::new(None),
             toast_overlays: RefCell::new(Vec::new()),
             pending_persistent_error: RefCell::new(pending_error),
@@ -213,9 +215,11 @@ impl AppState {
         }
     }
 
-    pub fn activate(self: &Rc<Self>) {
-        if let Some(window) = self.main_window.borrow().as_ref() {
-            window.present();
+    pub fn activate(self: &Rc<Self>, show: bool) {
+        if self.main_window.borrow().is_some() {
+            if show {
+                self.show_window();
+            }
             return;
         }
         let window = main_window::build(self);
@@ -224,19 +228,35 @@ impl AppState {
         }
         *self.main_window.borrow_mut() = Some(window.clone());
         subscribe::start(self);
-        window.present();
+        if show {
+            self.show_window();
+        } else {
+            self.hide_window();
+        }
         self.seed_factory_fan_curves();
     }
 
-    pub fn toggle_window(&self) {
-        let windows = self.main_window.borrow();
-        let Some(window) = windows.as_ref() else {
+    pub fn show_window(&self) {
+        let Some(window) = self.main_window.borrow().clone() else {
             return;
         };
-        if window.is_visible() {
-            window.set_visible(false);
+        self.main_window_visible.set(true);
+        present_from_hardware_button(&window);
+    }
+
+    pub fn hide_window(&self) {
+        let Some(window) = self.main_window.borrow().clone() else {
+            return;
+        };
+        self.main_window_visible.set(false);
+        window.set_visible(false);
+    }
+
+    pub fn toggle_window(&self) {
+        if self.main_window_visible.get() {
+            self.hide_window();
         } else {
-            present_from_hardware_button(window);
+            self.show_window();
         }
     }
 }

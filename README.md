@@ -40,9 +40,15 @@ make build
 make test
 make lint
 make install
+make install-user-service
 sudo make install-service
 sudo usermod -aG z13helper "$USER"
 ```
+
+`make install-user-service` installs the GUI as a user systemd service bound to
+`graphical-session.target`. It starts hidden so the hardware GUI button can
+open it. The privileged `z13helperd` service remains separate and must still be
+installed and enabled as root.
 
 Log out and back in after changing group membership. The system service creates
 `/run/z13helper/z13helperd.sock` and stores flattened machine state atomically

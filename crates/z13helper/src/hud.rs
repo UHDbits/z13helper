@@ -1,7 +1,6 @@
 //! G-Helper-style HUD toast for power-source / profile switches.
 //!
 //! Prefer gtk4-layer-shell on Wayland (click-through via empty input region).
-//! Under gamescope (GDK_BACKEND=x11), set GAMESCOPE_EXTERNAL_OVERLAY.
 //! Fall back to org.freedesktop.Notifications.
 
 use gtk::prelude::*;
@@ -55,7 +54,6 @@ fn try_popup(app: &adw::Application, message: &str) -> bool {
             // Empty input region = click-through.
             let region = gtk::cairo::Region::create();
             surface.set_input_region(Some(&region));
-            maybe_set_gamescope_overlay(&surface);
         }
     });
 
@@ -64,39 +62,6 @@ fn try_popup(app: &adw::Application, message: &str) -> bool {
         window.close();
     });
     true
-}
-
-fn maybe_set_gamescope_overlay(surface: &gtk::gdk::Surface) {
-    // Only meaningful under X11 (gamescope path).
-    let Ok(x11) = surface.clone().downcast::<gdk4_x11::X11Surface>() else {
-        return;
-    };
-    let xid = x11.xid();
-    if let Err(e) = set_external_overlay_atom(xid) {
-        tracing::warn!(%e, "could not set gamescope overlay atom");
-    }
-}
-
-fn set_external_overlay_atom(xid: u64) -> Result<(), Box<dyn std::error::Error>> {
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
-    use x11rb::wrapper::ConnectionExt as _;
-
-    let (conn, _screen_num) = x11rb::connect(None)?;
-    let atom = conn
-        .intern_atom(false, b"GAMESCOPE_EXTERNAL_OVERLAY")?
-        .reply()?
-        .atom;
-    let value: [u32; 1] = [1];
-    conn.change_property32(
-        PropMode::REPLACE,
-        xid as u32,
-        atom,
-        AtomEnum::CARDINAL,
-        &value,
-    )?;
-    conn.flush()?;
-    Ok(())
 }
 
 fn notify_fallback(message: &str) {

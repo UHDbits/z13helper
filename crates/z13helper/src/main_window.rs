@@ -26,8 +26,9 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
 
     // Keep the UI process resident for the hardware toggle button. Closing the
     // main window only hides it; AppState retains it for the next presentation.
-    window.connect_close_request(|window| {
-        window.set_visible(false);
+    let state_close = state.clone();
+    window.connect_close_request(move |_| {
+        state_close.hide_window();
         glib::Propagation::Stop
     });
 
@@ -284,8 +285,8 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     version.set_xalign(0.0);
     let hide = gtk::Button::with_label("Hide");
     hide.set_tooltip_text(Some("Hide z13helper"));
-    let window_hide = window.clone();
-    hide.connect_clicked(move |_| window_hide.set_visible(false));
+    let state_hide = state.clone();
+    hide.connect_clicked(move |_| state_hide.hide_window());
     footer.append(&version);
     footer.append(&hide);
     content.append(&footer);

@@ -7,21 +7,12 @@ mod ui;
 
 use gtk4::prelude::*;
 use libadwaita as adw;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 const APPLICATION_ID: &str = "com.ashtonantila.z13helper";
 
 fn main() {
-    // Gamescope's Wayland bridge cannot host this GTK surface reliably; its
-    // Xwayland server can, but only when the advertised socket exists.
-    if let Some(display) = std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY") {
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| "/tmp".into());
-        if std::path::Path::new(&runtime).join(&display).exists() {
-            unsafe { std::env::set_var("GDK_BACKEND", "x11") };
-        }
-    }
-
     let prefer_dark = consume_legacy_dark_preference();
     let app = adw::Application::new(Some(APPLICATION_ID), gio::ApplicationFlags::empty());
     if prefer_dark {
@@ -33,6 +24,8 @@ fn main() {
     });
     install_standard_actions(&app);
     let state = Rc::new(RefCell::new(None));
+    let first_activation = Rc::new(Cell::new(true));
+    let start_hidden = std::env::var_os("Z13HELPER_START_HIDDEN").is_some();
     app.connect_activate(move |app| {
         let state = state
             .borrow_mut()
@@ -42,7 +35,8 @@ fn main() {
                 state
             })
             .clone();
-        state.activate();
+        let show = !start_hidden || !first_activation.replace(false);
+        state.activate(show);
     });
     app.run();
 }

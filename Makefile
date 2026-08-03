@@ -17,7 +17,7 @@ LIBEXECDIR ?= /usr/libexec
 SYSTEMDUNITDIR ?= /usr/lib/systemd/system
 SYSUSERSDIR ?= /usr/lib/sysusers.d
 
-.PHONY: build run test lint fmt install install-service clean
+.PHONY: build run test lint fmt install install-user-service install-service clean
 
 build:
 	$(CARGO) build --release -p z13helper -p z13helperd -p z13helperctl
@@ -40,6 +40,13 @@ install: build
 	install -Dm755 $(RELEASE_DIR)/z13helperctl $(BINDIR)/z13helperctl
 	install -Dm644 contrib/com.ashtonantila.z13helper.desktop $(DESKTOPDIR)/com.ashtonantila.z13helper.desktop
 	install -Dm644 assets/z13helper.svg $(ICONDIR)/z13helper.svg
+
+# Per-user GUI service. This follows graphical-session.target so it also works
+# in SteamOS-style sessions where desktop autostart entries are not used.
+install-user-service: install
+	install -Dm644 contrib/z13helper.service $(HOME)/.config/systemd/user/z13helper.service
+	systemctl --user daemon-reload
+	systemctl --user enable --now z13helper.service
 
 # Privileged machine backend. Invoke this target as root.
 install-service: build
