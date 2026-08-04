@@ -1,4 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
-  <rect width="128" height="128" rx="24" fill="#1a1a1a"/>
-  <text x="64" y="78" text-anchor="middle" font-family="sans-serif" font-weight="700" font-size="48" fill="#3AAEEF">Z13</text>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" fill="none"><rect width="123" height="123" x="2.5" y="2.5" fill="url(#a)" rx="61.5"/><rect width="123" height="123" x="2.5" y="2.5" stroke="#ff2020" stroke-width="5" rx="61.5"/><path fill="#ff2020" d="M29 91V80.2L80.2 47H29V37h70v10.8L47.8 81H99v10z"/><defs><linearGradient id="a" x1="64" x2="64" y1="0" y2="128" gradientUnits="userSpaceOnUse"><stop stop-color="#5e2224"/><stop offset=".6" stop-color="#382225"/><stop offset="1" stop-color="#382225"/></linearGradient></defs></svg>
