@@ -1,13 +1,14 @@
 //! G-Helper-style HUD toast for power-source / profile switches.
 //!
-//! Prefer gtk4-layer-shell on Wayland (click-through via empty input region).
+//! Uses gtk4-layer-shell on Wayland (click-through via empty input region).
 //! Under gamescope, use its non-interactive external-overlay plane.
-//! Fall back to org.freedesktop.Notifications.
+//! Fall back to org.freedesktop.Notifications when neither overlay path works.
 
 use std::rc::Rc;
 
 use gtk::prelude::*;
 use gtk4 as gtk;
+use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
 use crate::app::AppState;
 
@@ -22,6 +23,12 @@ pub fn show(state: &Rc<AppState>, profile_name: &str, on_battery: bool) {
 }
 
 fn try_popup(state: &Rc<AppState>, message: &str) -> bool {
+    let gamescope = state.gamescope.as_ref();
+    let layer_shell = gtk4_layer_shell::is_supported();
+    if gamescope.is_none() && !layer_shell {
+        return false;
+    }
+
     let window = gtk::Window::builder()
         .application(state.app.upcast_ref::<gtk::Application>())
         .title("z13helper HUD")
@@ -40,21 +47,17 @@ fn try_popup(state: &Rc<AppState>, message: &str) -> bool {
     label.set_margin_end(24);
     window.set_child(Some(&label));
 
-    if let Some(gamescope) = state.gamescope.as_ref() {
+    if let Some(gamescope) = gamescope {
         gamescope.prepare_hud(&window);
     }
 
-    #[cfg(feature = "layer-shell")]
-    {
-        use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-        if gtk4_layer_shell::is_supported() {
-            window.init_layer_shell();
-            window.set_layer(Layer::Overlay);
-            window.set_anchor(Edge::Bottom, true);
-            window.set_margin(Edge::Bottom, 80);
-            window.set_keyboard_mode(KeyboardMode::None);
-            window.set_exclusive_zone(-1);
-        }
+    if layer_shell {
+        window.init_layer_shell();
+        window.set_layer(Layer::Overlay);
+        window.set_anchor(Edge::Bottom, true);
+        window.set_margin(Edge::Bottom, 80);
+        window.set_keyboard_mode(KeyboardMode::None);
+        window.set_exclusive_zone(-1);
     }
 
     window.connect_realize(|window| {

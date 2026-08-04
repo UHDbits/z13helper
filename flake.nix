@@ -18,9 +18,6 @@
         z13helper-debug = final.callPackage ./nix/package.nix {
           buildType = "debug";
         };
-        z13helper-layer-shell = final.callPackage ./nix/package.nix {
-          withLayerShell = true;
-        };
       };
 
       mkPkgs =
@@ -40,7 +37,6 @@
           default = pkgs.z13helper;
           z13helper = pkgs.z13helper;
           z13helper-debug = pkgs.z13helper-debug;
-          z13helper-layer-shell = pkgs.z13helper-layer-shell;
         };
 
         apps = {

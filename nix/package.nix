@@ -18,7 +18,6 @@
   libxi,
   wrapGAppsHook4,
   gsettings-desktop-schemas,
-  withLayerShell ? false,
   buildType ? "release",
 }:
 
@@ -68,9 +67,9 @@ rustPlatform.buildRustPackage {
     libxcursor
     libxrandr
     libxi
+    gtk4-layer-shell
     gsettings-desktop-schemas
-  ]
-  ++ lib.optional withLayerShell gtk4-layer-shell;
+  ];
 
   # Match `make build`: ship GUI, daemon, and CLI only.
   cargoBuildFlags = [
@@ -80,10 +79,6 @@ rustPlatform.buildRustPackage {
     "z13helperd"
     "-p"
     "z13helperctl"
-  ]
-  ++ lib.optionals withLayerShell [
-    "--features"
-    "layer-shell"
   ];
 
   # Tests run as flake checks instead of during every package build.
