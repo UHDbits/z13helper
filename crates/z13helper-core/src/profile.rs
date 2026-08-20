@@ -154,6 +154,47 @@ pub fn stock_fan_curves(ppd_profile: Option<&str>) -> [FanCurve; 2] {
 }
 
 impl Profile {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("profile name must not be empty".into());
+        }
+        if let Some(ppd_profile) = &self.ppd_profile
+            && ppd_profile.trim().is_empty()
+        {
+            return Err("PPD profile must not be empty".into());
+        }
+        for (name, value, maximum) in [
+            ("PL1", self.pl1_spl, 93),
+            ("PL2", self.pl2_sppt, 93),
+            ("FPPT", self.fppt, 120),
+        ] {
+            if !(5..=maximum).contains(&value) {
+                return Err(format!("{name} must be between 5 and {maximum} watts"));
+            }
+        }
+        if self.apply_power_limits && (self.pl2_sppt < self.pl1_spl || self.fppt < self.pl2_sppt) {
+            return Err("power limits must satisfy PL1 <= PL2 <= FPPT".into());
+        }
+        if !(1..=5).contains(&self.fan_hysteresis_up)
+            || !(1..=5).contains(&self.fan_hysteresis_down)
+        {
+            return Err("fan hysteresis values must be between 1 and 5".into());
+        }
+        if self.fan_temperature_average_seconds > 15 {
+            return Err("fan temperature averaging must be between 0 and 15 seconds".into());
+        }
+        if !(-40..=0).contains(&self.cpu_co) {
+            return Err("Curve Optimizer offset must be between -40 and 0".into());
+        }
+        if !(80..=99).contains(&self.cpu_temp_limit) {
+            return Err("APU temperature limit must be between 80 and 99°C".into());
+        }
+        for curve in &self.fan_curves {
+            crate::curve::validate(curve).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn builtin(id: &str, name: &str) -> Self {
         let ppd_profile = builtin_ppd(id);
         let (pl1, pl2, pl3) = stock_ppt(Some(ppd_profile));

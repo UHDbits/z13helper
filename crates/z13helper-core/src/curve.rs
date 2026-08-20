@@ -146,15 +146,6 @@ pub fn percent_to_pwm(pct: i32) -> i32 {
     (pct.clamp(0, 100) * 255) / 100
 }
 
-/// Format a curve for the daemon wire protocol.
-pub fn to_wire(curve: &Curve) -> String {
-    curve
-        .iter()
-        .map(|p| format!("{}:{}", p[0], p[1]))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,13 +226,5 @@ mod tests {
         assert_eq!(pwm_to_percent(255), 100);
         assert_eq!(pwm_to_percent(204), 80);
         assert_eq!(percent_to_pwm(80), 204);
-    }
-
-    #[test]
-    fn to_wire_format() {
-        let c = default_fan_curve();
-        let s = to_wire(&c);
-        assert!(s.starts_with("58:20,61:43"));
-        assert_eq!(s.split(',').count(), 8);
     }
 }

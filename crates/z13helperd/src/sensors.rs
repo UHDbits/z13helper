@@ -5,16 +5,6 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 const HWMON_ROOT: &str = "/sys/class/hwmon";
-const ASUS_NB_WMI_ROOT: &str = "/sys/devices/platform/asus-nb-wmi";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SensorSnapshot {
-    /// Native hwmon unit (one thousandth of a degree C). Keep this precision
-    /// until after fan-curve interpolation.
-    pub apu_temperature_millic: i32,
-    pub rpm: [u32; 2],
-    pub pl1_w: Option<u32>,
-}
 
 #[derive(Debug, Error)]
 pub enum SensorError {
@@ -34,14 +24,6 @@ pub enum SensorError {
     Invalid(PathBuf),
     #[error("APU temperature {0} millidegrees C is outside the credible range")]
     TemperatureRange(i32),
-}
-
-pub fn read_snapshot() -> Result<SensorSnapshot, SensorError> {
-    let mut snapshot = read_snapshot_from(Path::new(HWMON_ROOT))?;
-    if snapshot.pl1_w.is_none() {
-        snapshot.pl1_w = read_platform_pl1(Path::new(ASUS_NB_WMI_ROOT))?;
-    }
-    Ok(snapshot)
 }
 
 /// Lightweight direct-control sensor read. This deliberately does not require
@@ -68,20 +50,6 @@ fn read_i64(path: &Path) -> Result<i64, SensorError> {
     read_trimmed(path)?
         .parse()
         .map_err(|_| SensorError::Invalid(path.to_owned()))
-}
-
-fn read_platform_pl1(directory: &Path) -> Result<Option<u32>, SensorError> {
-    let path = directory.join("ppt_pl1_spl");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let value = read_i64(&path)?;
-    if value < 0 {
-        return Err(SensorError::Invalid(path));
-    }
-    u32::try_from(value)
-        .map(Some)
-        .map_err(|_| SensorError::Invalid(path))
 }
 
 fn indexed_inputs(directory: &Path, prefix: &str) -> Result<Vec<PathBuf>, SensorError> {
@@ -188,94 +156,6 @@ pub fn read_fan_rpms_from(root: &Path) -> Result<[u32; 2], SensorError> {
     ])
 }
 
-pub fn read_snapshot_from(root: &Path) -> Result<SensorSnapshot, SensorError> {
-    let mut entries = fs::read_dir(root)
-        .map_err(SensorError::Enumerate)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(SensorError::Enumerate)?;
-    entries.sort_by_key(|entry| entry.file_name());
-
-    let mut temperature = None;
-    let mut fallback_temperature = None;
-    let mut preferred_rpms = Vec::new();
-    let mut fallback_rpms = Vec::new();
-    let mut pl1_w = None;
-
-    for entry in entries {
-        let directory = entry.path();
-        let name_path = directory.join("name");
-        let Ok(name) = read_trimmed(&name_path) else {
-            continue;
-        };
-
-        for input in indexed_inputs(&directory, "temp")? {
-            let stem = input
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("hwmon filename is valid UTF-8")
-                .trim_end_matches("_input");
-            let label = fs::read_to_string(directory.join(format!("{stem}_label")))
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase();
-            if fallback_temperature.is_none() && name == "k10temp" {
-                fallback_temperature = Some(input.clone());
-            }
-            if name == "k10temp" && matches!(label.as_str(), "tctl" | "tdie") {
-                temperature = Some(input);
-            }
-        }
-
-        let fans = indexed_inputs(&directory, "fan")?;
-        if name == "asus" {
-            preferred_rpms.extend(fans);
-        } else {
-            fallback_rpms.extend(fans);
-        }
-
-        if name == "asus-nb-wmi" {
-            for (attribute, divisor) in [("ppt_pl1_spl", 1_i64), ("power1_cap", 1_000_000)] {
-                let path = directory.join(attribute);
-                if path.exists() {
-                    let raw = read_i64(&path)?;
-                    if raw >= 0 {
-                        pl1_w = u32::try_from(raw / divisor).ok();
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    let temperature_path = temperature
-        .or(fallback_temperature)
-        .ok_or(SensorError::TemperatureMissing)?;
-    let temperature_millic = i32::try_from(read_i64(&temperature_path)?)
-        .map_err(|_| SensorError::Invalid(temperature_path.clone()))?;
-    let temperature_millic = credible_temperature(temperature_millic)?;
-
-    preferred_rpms.sort();
-    fallback_rpms.sort();
-    let rpms = if preferred_rpms.len() >= 2 {
-        preferred_rpms
-    } else {
-        fallback_rpms
-    };
-    if rpms.len() < 2 {
-        return Err(SensorError::FansMissing);
-    }
-    let rpm = [
-        u32::try_from(read_i64(&rpms[0])?).map_err(|_| SensorError::Invalid(rpms[0].clone()))?,
-        u32::try_from(read_i64(&rpms[1])?).map_err(|_| SensorError::Invalid(rpms[1].clone()))?,
-    ];
-
-    Ok(SensorSnapshot {
-        apu_temperature_millic: temperature_millic,
-        rpm,
-        pl1_w,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -310,29 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamically_discovers_temperature_fans_and_pl1() {
-        let tree = TempTree::new();
-        tree.write("hwmon0/name", "k10temp\n");
-        tree.write("hwmon0/temp1_label", "Tctl\n");
-        tree.write("hwmon0/temp1_input", "67500\n");
-        tree.write("hwmon1/name", "asus\n");
-        tree.write("hwmon1/fan1_input", "3100\n");
-        tree.write("hwmon1/fan2_input", "2900\n");
-        tree.write("hwmon2/name", "asus-nb-wmi\n");
-        tree.write("hwmon2/power1_cap", "80000000\n");
-
-        assert_eq!(
-            read_snapshot_from(&tree.0).unwrap(),
-            SensorSnapshot {
-                apu_temperature_millic: 67_500,
-                rpm: [3100, 2900],
-                pl1_w: Some(80),
-            }
-        );
-    }
-
-    #[test]
-    fn prefers_asus_hwmon_fans_over_other_devices() {
+    fn reads_asus_hwmon_fans_before_other_devices() {
         let tree = TempTree::new();
         tree.write("hwmon0/name", "k10temp\n");
         tree.write("hwmon0/temp1_label", "Tctl\n");
@@ -344,7 +202,7 @@ mod tests {
         tree.write("hwmon2/fan1_input", "2400\n");
         tree.write("hwmon2/fan2_input", "2800\n");
 
-        assert_eq!(read_snapshot_from(&tree.0).unwrap().rpm, [2400, 2800]);
+        assert_eq!(read_fan_rpms_from(&tree.0).unwrap(), [2400, 2800]);
     }
 
     #[test]
@@ -354,12 +212,5 @@ mod tests {
         tree.write("hwmon0/temp1_label", "Tctl\n");
         tree.write("hwmon0/temp1_input", "67500\n");
         assert_eq!(read_temperature_millic_from(&tree.0).unwrap(), 67_500);
-    }
-
-    #[test]
-    fn reads_pl1_from_asus_nb_wmi_platform_attribute() {
-        let tree = TempTree::new();
-        tree.write("ppt_pl1_spl", "76\n");
-        assert_eq!(read_platform_pl1(&tree.0).unwrap(), Some(76));
     }
 }

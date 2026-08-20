@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use z13helper_core::apply::{Daemon, apply_request};
 use z13helper_core::curve::{Curve, HIGH_POWER_THRESHOLD_W, high_power_curve};
@@ -12,8 +12,35 @@ use crate::aura::AuraDevices;
 use crate::ec::{EcMailbox, LinuxPortIo};
 use crate::sensors;
 use crate::service::Controller;
-use crate::state::{PersistedState, StateStore};
+use crate::state::{PersistedState, StateLoadError, StateStore};
 use crate::sysfs::Sysfs;
+
+const MAX_WARNINGS: usize = 32;
+const MAX_WARNING_CHARS: usize = 1024;
+const MAX_FACTORY_CURVE_PROFILES: usize = 8;
+
+fn push_warning(warnings: &mut Vec<String>, warning: impl Into<String>) {
+    let warning = warning
+        .into()
+        .chars()
+        .take(MAX_WARNING_CHARS)
+        .collect::<String>();
+    if warning.is_empty() || warnings.iter().any(|existing| existing == &warning) {
+        return;
+    }
+    if warnings.len() == MAX_WARNINGS {
+        warnings.remove(0);
+    }
+    warnings.push(warning);
+}
+
+fn bounded_warnings(warnings: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut bounded = Vec::new();
+    for warning in warnings {
+        push_warning(&mut bounded, warning);
+    }
+    bounded
+}
 
 pub struct PlatformHardware {
     sysfs: Sysfs,
@@ -26,6 +53,8 @@ pub struct PlatformHardware {
     undervolt_available: bool,
     ppd_profiles: Vec<String>,
     ppd_profile: Option<String>,
+    direct_release_failure: Option<String>,
+    direct_release_pending: bool,
 }
 
 impl PlatformHardware {
@@ -51,6 +80,8 @@ impl PlatformHardware {
                 undervolt_available,
                 ppd_profiles,
                 ppd_profile,
+                direct_release_failure: None,
+                direct_release_pending: false,
             },
             probe,
         ))
@@ -68,6 +99,9 @@ impl PlatformHardware {
     }
 
     pub fn tick(&mut self) -> Result<(), String> {
+        if self.direct_release_pending {
+            return self.release_direct();
+        }
         self.sample_direct_temperature(|direct, now, temperature| direct.tick(now, temperature))
     }
 
@@ -90,15 +124,19 @@ impl PlatformHardware {
             Ok(temperature) => temperature,
             Err(error) => {
                 self.latest_temperature_millic = None;
-                return Err(self.direct.sensor_failed(error.to_string()));
+                let result = Err(self.direct.sensor_failed(error.to_string()));
+                self.sync_direct_release_failure();
+                return result;
             }
         };
         self.latest_temperature_millic = Some(temperature_millic);
-        control(
+        let result = control(
             &mut self.direct,
             std::time::Instant::now(),
             temperature_millic,
-        )
+        );
+        self.sync_direct_release_failure();
+        result
     }
 
     fn observed_temperature_c(&mut self) -> Option<i32> {
@@ -119,7 +157,25 @@ impl PlatformHardware {
     }
 
     pub fn release_direct(&mut self) -> Result<(), String> {
-        self.direct.release()
+        let result = self.direct.release();
+        self.direct_release_pending = result.is_err();
+        self.sync_direct_release_failure();
+        if let Err(error) = &result {
+            self.direct_release_failure = Some(error.clone());
+        }
+        result
+    }
+
+    fn sync_direct_release_failure(&mut self) {
+        if let Some(error) = self.direct.take_release_failure() {
+            self.direct_release_failure = Some(error);
+            self.direct_release_pending = true;
+        }
+    }
+
+    fn take_direct_release_failure(&mut self) -> Option<String> {
+        self.sync_direct_release_failure();
+        self.direct_release_failure.take()
     }
 
     pub fn apply_lighting(&mut self, device: &str, state: &LightingState) -> Result<(), String> {
@@ -213,7 +269,7 @@ impl Daemon for PlatformHardware {
         self.sysfs
             .set_firmware_curves(&written)
             .map_err(DaemonError::Rejected)?;
-        self.direct.release().map_err(DaemonError::Rejected)
+        self.release_direct().map_err(DaemonError::Rejected)
     }
 
     fn direct_fans_set(
@@ -227,22 +283,34 @@ impl Daemon for PlatformHardware {
             } else {
                 *curves
             };
-        self.direct
-            .enable(
-                written,
-                self.fan_hysteresis,
-                self.fan_temperature_average_seconds,
-            )
-            .map_err(DaemonError::Rejected)?;
+        if let Err(error) = self.direct.enable(
+            written,
+            self.fan_hysteresis,
+            self.fan_temperature_average_seconds,
+        ) {
+            self.sync_direct_release_failure();
+            let release = self.release_direct().err();
+            return Err(DaemonError::Rejected(match release {
+                Some(release) => format!("{error}; direct EC release failed: {release}"),
+                None => error,
+            }));
+        }
         // A fresh direct-mode install has no trustworthy previous commanded
         // duty to ramp from. Establish the authored curve target immediately;
         // subsequent thermal changes use the asymmetric output ramp. This is
         // also the proof of fan protection required before high-power PPT rises.
-        self.prime_direct().map_err(DaemonError::Rejected)
+        if let Err(error) = self.prime_direct() {
+            let release = self.release_direct().err();
+            return Err(DaemonError::Rejected(match release {
+                Some(release) => format!("{error}; direct EC release failed: {release}"),
+                None => error,
+            }));
+        }
+        Ok(())
     }
 
     fn fans_release(&mut self) -> Result<(), DaemonError> {
-        self.direct.release().map_err(DaemonError::Rejected)?;
+        self.release_direct().map_err(DaemonError::Rejected)?;
         self.sysfs
             .release_firmware_fans()
             .map_err(DaemonError::Rejected)
@@ -277,12 +345,26 @@ impl Backend {
     pub fn start() -> Result<Self, String> {
         let (hardware, probe) = PlatformHardware::acquire()?;
         let store = StateStore::default();
+        let mut preserve_loaded_state = false;
         let persisted = match store.load() {
             Ok(state) => state,
+            Err(StateLoadError::Unsupported(version)) => {
+                preserve_loaded_state = true;
+                tracing::warn!(
+                    version,
+                    "unsupported daemon state; starting without overwriting it"
+                );
+                let mut state = PersistedState::default();
+                push_warning(
+                    &mut state.state.warnings,
+                    format!("unsupported state version {version}; expected 1"),
+                );
+                state
+            }
             Err(error) => {
                 tracing::warn!(%error, "starting from fresh daemon state");
                 let mut state = PersistedState::default();
-                state.state.warnings.push(error);
+                push_warning(&mut state.state.warnings, error.to_string());
                 state
             }
         };
@@ -298,17 +380,18 @@ impl Backend {
         if let Some(desired) = backend.persisted.desired.clone() {
             if let Err(error) = backend.apply(desired) {
                 backend.persisted.state.degraded = true;
-                backend
-                    .persisted
-                    .state
-                    .warnings
-                    .push(format!("startup restore failed: {error}"));
+                push_warning(
+                    &mut backend.persisted.state.warnings,
+                    format!("startup restore failed: {error}"),
+                );
             }
         } else {
             backend.persisted.state.fan_curves = Some(z13helper_core::stock_fan_curves(
                 backend.persisted.state.ppd_profile.as_deref(),
             ));
-            let _ = backend.save();
+            if !preserve_loaded_state {
+                let _ = backend.save();
+            }
         }
         backend.restore_battery_policy();
         backend.restore_lighting();
@@ -328,12 +411,14 @@ impl Backend {
         if let Err(error) = self.hardware.tick() {
             tracing::warn!(%error, "direct fan tick failed");
             self.persisted.state.degraded = true;
-            self.persisted.state.warnings.push(error);
+            push_warning(&mut self.persisted.state.warnings, error);
         }
+        self.record_direct_release_failure("direct fan tick");
     }
 
     pub fn apply(&mut self, request: ApplyRequest) -> Result<ApplyResponse, DaemonError> {
         self.prevalidate(&request)?;
+        let previous_persisted = self.persisted.clone();
         let previous = self.persisted.desired.clone();
         self.hardware.set_fan_policy(
             request.fan_hysteresis,
@@ -341,8 +426,9 @@ impl Backend {
             request.disable_high_power_fan_protection,
         );
         let warnings = match apply_request(&mut self.hardware, &request) {
-            Ok(warnings) => warnings,
+            Ok(warnings) => bounded_warnings(warnings),
             Err(error) => {
+                self.record_direct_release_failure("apply");
                 match previous {
                     Some(previous) => {
                         self.hardware.set_fan_policy(
@@ -352,18 +438,25 @@ impl Backend {
                         );
                         if let Err(rollback) = apply_request(&mut self.hardware, &previous) {
                             self.persisted.state.degraded = true;
-                            self.persisted.state.warnings.push(format!(
-                                "apply failed ({error}); rollback also failed ({rollback})"
-                            ));
+                            push_warning(
+                                &mut self.persisted.state.warnings,
+                                format!(
+                                    "apply failed ({error}); rollback also failed ({rollback})"
+                                ),
+                            );
                         }
                     }
                     None => {
                         self.persisted.state.degraded = true;
-                        self.persisted.state.warnings.push(format!(
-                            "apply failed before any known-good daemon state existed: {error}"
-                        ));
+                        push_warning(
+                            &mut self.persisted.state.warnings,
+                            format!(
+                                "apply failed before any known-good daemon state existed: {error}"
+                            ),
+                        );
                     }
                 }
+                self.record_direct_release_failure("apply");
                 self.observe();
                 let _ = self.save();
                 return Err(error);
@@ -407,8 +500,36 @@ impl Backend {
         });
         self.persisted.state.warnings = warnings.clone();
         self.persisted.state.degraded = false;
+        self.record_direct_release_failure("apply");
         self.observe();
-        self.save().map_err(DaemonError::Protocol)?;
+        if let Err(error) = self.save() {
+            let rollback = if let Some(previous) = previous_persisted.desired.clone() {
+                self.hardware.set_fan_policy(
+                    previous.fan_hysteresis,
+                    previous.fan_temperature_average_seconds,
+                    previous.disable_high_power_fan_protection,
+                );
+                apply_request(&mut self.hardware, &previous).map(|_| ())
+            } else {
+                Err(DaemonError::Rejected(
+                    "no known-good hardware state; retained current fan protection".into(),
+                ))
+            };
+            self.persisted = previous_persisted;
+            self.persisted.state.degraded = true;
+            push_warning(
+                &mut self.persisted.state.warnings,
+                match rollback {
+                    Ok(()) => format!("apply persistence failed ({error}); hardware rolled back"),
+                    Err(rollback) => format!(
+                        "apply persistence failed ({error}); rollback also failed ({rollback})"
+                    ),
+                },
+            );
+            self.record_direct_release_failure("apply persistence rollback");
+            self.observe();
+            return Err(DaemonError::Protocol(error));
+        }
         Ok(ApplyResponse {
             generation: self.persisted.state.generation,
             warnings,
@@ -429,6 +550,7 @@ impl Backend {
         &mut self,
         ppd_profiles: Vec<String>,
     ) -> Result<HashMap<String, [Curve; 2]>, DaemonError> {
+        let ppd_profiles = normalize_factory_curve_profiles(ppd_profiles)?;
         if ppd_profiles.is_empty() {
             return Err(DaemonError::Rejected(
                 "at least one PPD profile is required".into(),
@@ -499,7 +621,7 @@ impl Backend {
             let message =
                 format!("{query_error}factory fan-curve restoration failed ({restore_error})");
             self.persisted.state.degraded = true;
-            self.persisted.state.warnings.push(message.clone());
+            push_warning(&mut self.persisted.state.warnings, message.clone());
             let _ = self.save();
             return Err(DaemonError::Rejected(message));
         }
@@ -606,6 +728,10 @@ impl Backend {
         if let Err(error) = self.hardware.release_direct() {
             tracing::error!(%error, "failed to release EC control during shutdown");
         }
+        if self.record_direct_release_failure("shutdown") {
+            self.observe();
+            let _ = self.save();
+        }
     }
 
     /// Reapply every state that firmware may lose across suspend. Returns the
@@ -624,6 +750,7 @@ impl Backend {
             tracing::error!(%error, "failed to restore volatile hardware state");
             self.note_restore_failure("resume restore failed", &error.to_string());
             let _ = self.hardware.release_direct();
+            self.record_direct_release_failure("resume restore");
         }
         self.restore_battery_policy();
         self.restore_panel_overdrive();
@@ -649,6 +776,7 @@ impl Backend {
                 && let Err(error) = self.hardware.apply_lighting(&device, &state)
             {
                 tracing::warn!(%error, %device, "failed to relight hotplugged device");
+                self.note_restore_failure(&format!("{device} lighting restore failed"), &error);
             }
         }
     }
@@ -783,10 +911,18 @@ impl Backend {
 
     fn note_restore_failure(&mut self, context: &str, error: &str) {
         self.persisted.state.degraded = true;
-        self.persisted
-            .state
-            .warnings
-            .push(format!("{context}: {error}"));
+        push_warning(
+            &mut self.persisted.state.warnings,
+            format!("{context}: {error}"),
+        );
+    }
+
+    fn record_direct_release_failure(&mut self, context: &str) -> bool {
+        let Some(error) = self.hardware.take_direct_release_failure() else {
+            return false;
+        };
+        self.note_restore_failure(&format!("{context}: direct EC release failed"), &error);
+        true
     }
 
     fn prevalidate(&self, request: &ApplyRequest) -> Result<(), DaemonError> {
@@ -829,6 +965,29 @@ fn validate_factory_curve_query_power(tdp: Option<TdpState>) -> Result<(), Daemo
     Ok(())
 }
 
+fn normalize_factory_curve_profiles(profiles: Vec<String>) -> Result<Vec<String>, DaemonError> {
+    if profiles.len() > MAX_FACTORY_CURVE_PROFILES * 4 {
+        return Err(DaemonError::Rejected(format!(
+            "at most {} factory fan-curve profiles may be requested",
+            MAX_FACTORY_CURVE_PROFILES * 4
+        )));
+    }
+    let mut unique = Vec::with_capacity(profiles.len().min(MAX_FACTORY_CURVE_PROFILES));
+    let mut seen = HashSet::new();
+    for profile in profiles {
+        if !seen.insert(profile.clone()) {
+            continue;
+        }
+        if unique.len() == MAX_FACTORY_CURVE_PROFILES {
+            return Err(DaemonError::Rejected(format!(
+                "at most {MAX_FACTORY_CURVE_PROFILES} unique factory fan-curve profiles may be requested"
+            )));
+        }
+        unique.push(profile);
+    }
+    Ok(unique)
+}
+
 fn one_time_charge_is_complete(one_time_charge: bool, charge_percent: Option<u8>) -> bool {
     one_time_charge && charge_percent.is_some_and(|charge| charge >= 100)
 }
@@ -850,7 +1009,8 @@ fn validate_manual_undervolt(offset: i32, available: bool) -> Result<(), DaemonE
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_battery_limit, one_time_charge_is_complete, power_source_changed,
+        MAX_WARNINGS, bounded_warnings, effective_battery_limit, normalize_factory_curve_profiles,
+        one_time_charge_is_complete, power_source_changed, push_warning,
         validate_factory_curve_query_power, validate_manual_undervolt,
     };
     use z13helper_core::protocol::TdpState;
@@ -888,5 +1048,34 @@ mod tests {
         assert_eq!(power_source_changed(Some(false), Some(false)), None);
         assert_eq!(power_source_changed(Some(true), None), None);
         assert_eq!(power_source_changed(None, Some(false)), Some(false));
+    }
+
+    #[test]
+    fn warnings_are_deduplicated_and_bounded() {
+        let mut warnings = Vec::new();
+        for index in 0..(MAX_WARNINGS + 4) {
+            push_warning(&mut warnings, format!("warning {index}"));
+        }
+        push_warning(&mut warnings, "warning 99");
+        push_warning(&mut warnings, "warning 99");
+        assert_eq!(warnings.len(), MAX_WARNINGS);
+        assert_eq!(bounded_warnings(warnings.clone()), warnings);
+        push_warning(&mut warnings, "x".repeat(2_048));
+        assert_eq!(warnings.last().unwrap().chars().count(), 1_024);
+    }
+
+    #[test]
+    fn factory_curve_requests_are_deduplicated_and_bounded() {
+        assert_eq!(
+            normalize_factory_curve_profiles(vec![
+                "silent".into(),
+                "silent".into(),
+                "turbo".into(),
+            ])
+            .unwrap(),
+            vec!["silent".to_owned(), "turbo".to_owned()]
+        );
+        let profiles = (0..9).map(|index| index.to_string()).collect();
+        assert!(normalize_factory_curve_profiles(profiles).is_err());
     }
 }

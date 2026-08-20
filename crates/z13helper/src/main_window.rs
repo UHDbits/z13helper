@@ -369,7 +369,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         sync,
     };
     sync_once(state, &view);
-    install_telemetry(state, &window, view);
+    install_telemetry(state, view);
 
     window
 }
@@ -1002,7 +1002,7 @@ fn sync_once(state: &Rc<AppState>, view: &MainView) {
     );
 }
 
-fn install_telemetry(state: &Rc<AppState>, _window: &adw::ApplicationWindow, view: MainView) {
+fn install_telemetry(state: &Rc<AppState>, view: MainView) {
     let busy = Rc::new(Cell::new(false));
     let state = state.clone();
     glib::timeout_add_seconds_local(1, move || {
@@ -1047,7 +1047,7 @@ fn current_label(state: &AppState) -> String {
 
 fn select_profile(state: &Rc<AppState>, id: &str) {
     state.config.borrow_mut().active_profile = id.into();
-    state.apply_active(false);
+    state.apply_active();
 }
 
 #[cfg(test)]

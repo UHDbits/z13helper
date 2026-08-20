@@ -75,8 +75,7 @@ fn on_confirmed_transition(state: &Rc<AppState>, on_battery: bool) {
         .unwrap_or_else(|| id.clone());
     tracing::info!(%id, on_battery, "applying remembered power-source profile");
     state.config.borrow_mut().active_profile = id;
-    // notify=true: HUD should show (non-button path).
-    state.apply_active(true);
+    state.apply_active();
     if state.config.borrow().show_hud {
         hud::show(state, &name, on_battery);
     }
@@ -92,6 +91,21 @@ pub fn on_resume(state: &Rc<AppState>, on_battery: bool) {
 }
 
 fn upower_watch(tx: async_channel::Sender<bool>) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        match upower_session(&tx) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(%error, "UPower connection lost; polling sysfs while reconnecting");
+                if tx.send_blocking(sysfs_on_battery()).is_err() {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+fn upower_session(tx: &async_channel::Sender<bool>) -> Result<(), Box<dyn std::error::Error>> {
     let conn = zbus::blocking::Connection::system()?;
     // Initial read.
     let on_battery: bool = conn
@@ -114,21 +128,15 @@ fn upower_watch(tx: async_channel::Sender<bool>) -> Result<(), Box<dyn std::erro
     // (A full PropertiesChanged subscription is nicer but heavier to wire with zbus 5.)
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let Ok(reply) = conn.call_method(
+        let reply = conn.call_method(
             Some("org.freedesktop.UPower"),
             "/org/freedesktop/UPower",
             Some("org.freedesktop.DBus.Properties"),
             "Get",
             &("org.freedesktop.UPower", "OnBattery"),
-        ) else {
-            continue;
-        };
-        let Ok(value) = reply.body().deserialize::<zbus::zvariant::OwnedValue>() else {
-            continue;
-        };
-        let Ok(current) = bool::try_from(value) else {
-            continue;
-        };
+        )?;
+        let value = reply.body().deserialize::<zbus::zvariant::OwnedValue>()?;
+        let current = bool::try_from(value)?;
         // PowerDebouncer confirms stability from repeated samples, so publish
         // every successful read rather than changes alone.
         if tx.send_blocking(current).is_err() {

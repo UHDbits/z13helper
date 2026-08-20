@@ -1,8 +1,4 @@
-CARGO_HOME ?= $(CURDIR)/.cargo
-RUSTUP_HOME ?= $(CURDIR)/.rustup
-export CARGO_HOME RUSTUP_HOME
-PATH := $(CARGO_HOME)/bin:$(PATH)
-CARGO := $(CARGO_HOME)/bin/cargo
+CARGO ?= cargo
 # Honor an external CARGO_TARGET_DIR (Cursor sandboxes set this) so install
 # picks up the binary that `make build` actually produced.
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(CURDIR)/target)
@@ -44,20 +40,20 @@ install: build
 # Per-user GUI service. This follows graphical-session.target so it also works
 # in SteamOS-style sessions where desktop autostart entries are not used.
 install-user-service: install
-	install -Dm644 contrib/z13helper.service $(HOME)/.config/systemd/user/z13helper.service
+	sed 's|%h/.local/bin|$(BINDIR)|' contrib/z13helper.service | install -Dm644 /dev/stdin $(HOME)/.config/systemd/user/z13helper.service
 	systemctl --user daemon-reload
 	systemctl --user enable --now z13helper.service
 
 # Privileged machine backend. Invoke this target as root.
 install-service: build
 	install -Dm755 $(RELEASE_DIR)/z13helperd $(LIBEXECDIR)/z13helperd
-	install -Dm644 contrib/systemd/z13helperd.service $(SYSTEMDUNITDIR)/z13helperd.service
+	sed 's|/usr/libexec|$(LIBEXECDIR)|g' contrib/systemd/z13helperd.service | install -Dm644 /dev/stdin $(SYSTEMDUNITDIR)/z13helperd.service
 	install -Dm644 contrib/sysusers.d/z13helper.conf $(SYSUSERSDIR)/z13helper.conf
 	systemd-sysusers z13helper.conf
 	systemctl daemon-reload
 	systemctl reset-failed z13helperd.service || true
-	systemctl enable --now z13helperd.service
-	systemctl restart z13helperd.service
+	systemctl enable z13helperd.service
+	if systemctl is-active --quiet z13helperd.service; then systemctl restart z13helperd.service; else systemctl start z13helperd.service; fi
 	@echo "Add your user to the z13helper group, then re-login:"
 	@echo "  sudo usermod -aG z13helper \$$USER"
 

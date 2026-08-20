@@ -235,6 +235,31 @@ impl Gamescope {
         glib::idle_add_local_once(move || manager.sync_windows());
     }
 
+    pub fn show_auxiliary(self: &Rc<Self>, window: &gtk::Window) {
+        self.register(window);
+        *self.current.borrow_mut() = Some(window.downgrade());
+        window.present();
+        self.sync_windows();
+    }
+
+    pub fn hide_auxiliary(&self, window: &gtk::Window) {
+        window.set_visible(false);
+        if self
+            .current_window()
+            .is_some_and(|current| current == *window)
+        {
+            *self.current.borrow_mut() = self
+                .windows
+                .borrow()
+                .iter()
+                .rev()
+                .filter_map(glib::WeakRef::upgrade)
+                .find(|candidate| candidate != window)
+                .map(|candidate| candidate.downgrade());
+        }
+        self.sync_windows();
+    }
+
     pub fn prepare_hud(self: &Rc<Self>, window: &impl IsA<gtk::Window>) {
         let window = window.as_ref().clone();
         window.add_css_class("gamescope-ui");

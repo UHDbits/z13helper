@@ -12,7 +12,7 @@ const REPORT_ID: u8 = 0x5d;
 pub struct AuraDevices {
     sys_root: PathBuf,
     dev_root: PathBuf,
-    devices: HashMap<String, File>,
+    devices: HashMap<String, (PathBuf, File)>,
 }
 
 impl Default for AuraDevices {
@@ -31,7 +31,11 @@ impl AuraDevices {
     }
 
     pub fn refresh(&mut self) -> Vec<String> {
-        let previous: Vec<String> = self.devices.keys().cloned().collect();
+        let previous = self
+            .devices
+            .iter()
+            .map(|(name, (path, _))| (name.clone(), path.clone()))
+            .collect::<HashMap<_, _>>();
         let class = self.sys_root.join("class/hidraw");
         let mut found = HashMap::new();
         for entry in fs::read_dir(class).into_iter().flatten().flatten() {
@@ -54,15 +58,20 @@ impl AuraDevices {
         }
         self.devices.retain(|name, _| found.contains_key(name));
         for (name, path) in found {
-            if let std::collections::hash_map::Entry::Vacant(entry) = self.devices.entry(name)
-                && let Ok(file) = OpenOptions::new().read(true).write(true).open(path)
-            {
-                entry.insert(file);
+            let changed = self
+                .devices
+                .get(&name)
+                .is_none_or(|(previous_path, _)| previous_path != &path);
+            if changed {
+                self.devices.remove(&name);
+                if let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) {
+                    self.devices.insert(name, (path, file));
+                }
             }
         }
         self.devices
             .keys()
-            .filter(|name| !previous.contains(name))
+            .filter(|name| previous.get(*name) != self.devices.get(*name).map(|(path, _)| path))
             .cloned()
             .collect()
     }
@@ -77,7 +86,7 @@ impl AuraDevices {
             .devices
             .get_mut(device)
             .ok_or_else(|| format!("Aura {device} device is not connected"))?;
-        apply_to_writer(file, state)
+        apply_to_writer(&mut file.1, state)
     }
 }
 
@@ -231,5 +240,37 @@ mod tests {
         assert_eq!(mode_reports.len(), 2);
         assert_eq!(mode_reports[0][2..8], [0, 0, 0xF6, 0xD3, 0x2D, 0xEB]);
         assert_eq!(mode_reports[1][2..8], [1, 0, 0xF6, 0xD3, 0x2D, 0xEB]);
+    }
+
+    #[test]
+    fn refresh_reopens_aura_handles_when_hidraw_path_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "z13helper-aura-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sys_root = root.join("sys");
+        let dev_root = root.join("dev");
+        let make_device = |name: &str| {
+            let device = sys_root.join("class/hidraw").join(name).join("device");
+            fs::create_dir_all(&device).unwrap();
+            fs::write(device.join("uevent"), KEYBOARD_ID).unwrap();
+            fs::write(device.join("report_descriptor"), [0x85, REPORT_ID]).unwrap();
+            fs::create_dir_all(&dev_root).unwrap();
+            fs::write(dev_root.join(name), []).unwrap();
+        };
+
+        make_device("hidraw0");
+        let mut devices = AuraDevices::new(&sys_root, &dev_root);
+        assert_eq!(devices.refresh(), ["keyboard"]);
+        fs::remove_dir_all(sys_root.join("class/hidraw/hidraw0")).unwrap();
+        fs::remove_file(dev_root.join("hidraw0")).unwrap();
+        make_device("hidraw1");
+        assert_eq!(devices.refresh(), ["keyboard"]);
+        assert_eq!(devices.devices["keyboard"].0, dev_root.join("hidraw1"));
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -148,19 +148,75 @@ impl HidrawBlocker {
 
     pub fn set_blocked_pids(&mut self, pids: impl IntoIterator<Item = u32>) -> Result<(), String> {
         let target: BTreeSet<u32> = pids.into_iter().filter(|pid| *pid != 0).take(64).collect();
-        for pid in self.blocked.difference(&target) {
+        let original = self.blocked.clone();
+        let enabled = 1_u8;
+        let additions: BTreeSet<_> = target.difference(&self.blocked).copied().collect();
+        let removals: BTreeSet<_> = self.blocked.difference(&target).copied().collect();
+        let mut added = BTreeSet::new();
+        for pid in &additions {
+            let result = unsafe {
+                bpf_map_update_elem(
+                    self.blocked_pids_fd,
+                    (pid as *const u32).cast::<c_void>(),
+                    (&enabled as *const u8).cast::<c_void>(),
+                    0,
+                )
+            };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                added.insert(*pid);
+                return self.rollback_or_error(
+                    &original,
+                    &added,
+                    &BTreeSet::new(),
+                    format!("block hidraw PID {pid}: {error}"),
+                );
+            }
+            added.insert(*pid);
+        }
+        let mut removed = BTreeSet::new();
+        for pid in &removals {
             let result = unsafe {
                 bpf_map_delete_elem(self.blocked_pids_fd, (pid as *const u32).cast::<c_void>())
             };
-            if result != 0 {
-                return Err(format!(
-                    "unblock hidraw PID {pid}: {}",
-                    std::io::Error::last_os_error()
-                ));
+            let error = std::io::Error::last_os_error();
+            if result != 0 && error.raw_os_error() != Some(libc::ENOENT) {
+                return self.rollback_or_error(
+                    &original,
+                    &added,
+                    &removed,
+                    format!("unblock hidraw PID {pid}: {error}"),
+                );
+            }
+            removed.insert(*pid);
+        }
+        self.blocked = target;
+        Ok(())
+    }
+
+    fn rollback_or_error(
+        &mut self,
+        original: &BTreeSet<u32>,
+        added: &BTreeSet<u32>,
+        removed: &BTreeSet<u32>,
+        error: String,
+    ) -> Result<(), String> {
+        match self.rollback(added, removed) {
+            Ok(()) => Err(error),
+            Err(rollback) => {
+                self.blocked = original
+                    .union(added)
+                    .copied()
+                    .chain(removed.iter().copied())
+                    .collect();
+                Err(format!("{error}; BPF PID-map rollback failed: {rollback}"))
             }
         }
+    }
+
+    fn rollback(&self, added: &BTreeSet<u32>, removed: &BTreeSet<u32>) -> Result<(), String> {
         let enabled = 1_u8;
-        for pid in target.difference(&self.blocked) {
+        for pid in removed {
             let result = unsafe {
                 bpf_map_update_elem(
                     self.blocked_pids_fd,
@@ -171,12 +227,20 @@ impl HidrawBlocker {
             };
             if result != 0 {
                 return Err(format!(
-                    "block hidraw PID {pid}: {}",
+                    "restore hidraw PID {pid}: {}",
                     std::io::Error::last_os_error()
                 ));
             }
         }
-        self.blocked = target;
+        for pid in added {
+            let result = unsafe {
+                bpf_map_delete_elem(self.blocked_pids_fd, (pid as *const u32).cast::<c_void>())
+            };
+            let error = std::io::Error::last_os_error();
+            if result != 0 && error.raw_os_error() != Some(libc::ENOENT) {
+                return Err(format!("remove partially-added hidraw PID {pid}: {error}"));
+            }
+        }
         Ok(())
     }
 }

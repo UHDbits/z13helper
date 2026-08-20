@@ -35,14 +35,16 @@ impl PowerDebouncer {
         }
 
         match self.pending {
-            Some((value, deadline)) if value == on_battery && now_ms >= deadline => {
+            Some((value, started_at))
+                if value == on_battery && now_ms >= started_at.saturating_add(self.delay_ms) =>
+            {
                 self.pending = None;
                 self.confirmed = Some(value);
                 Some(value)
             }
             Some((value, _)) if value == on_battery => None,
             _ => {
-                self.pending = Some((on_battery, now_ms.saturating_add(self.delay_ms)));
+                self.pending = Some((on_battery, now_ms));
                 None
             }
         }
@@ -69,5 +71,14 @@ mod tests {
         assert_eq!(d.on_signal(false, 50), None);
         assert_eq!(d.on_signal(false, 149), None);
         assert_eq!(d.on_signal(false, 150), Some(false));
+    }
+
+    #[test]
+    fn changing_delay_updates_pending_transition() {
+        let mut d = PowerDebouncer::new(100);
+        assert_eq!(d.on_signal(true, 0), None);
+        d.set_delay(200);
+        assert_eq!(d.on_signal(true, 199), None);
+        assert_eq!(d.on_signal(true, 200), Some(true));
     }
 }

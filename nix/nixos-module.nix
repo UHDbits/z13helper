@@ -23,7 +23,8 @@ let
   applySettingsScript =
     pkgs.writeShellScript "z13helperd-apply-settings" (
       let
-        ctl = "${cfg.package}/bin/z13helperctl";
+        quote = lib.escapeShellArg;
+        ctl = quote "${cfg.package}/bin/z13helperctl";
         s = cfg.settings;
         battery =
           lib.optionalString (s ? batteryLimit)
@@ -42,7 +43,7 @@ let
             if k == null || (k ? enabled && !k.enabled) || (k ? mode && k.mode == "off") then
               "${ctl} lighting keyboard off\n"
             else
-              "${ctl} lighting keyboard ${k.mode or "static"} ${k.color or "FFFFFF"} ${toString (k.brightness or 3)}\n"
+              "${ctl} lighting keyboard ${quote (k.mode or "static")} ${quote (k.color or "FFFFFF")} ${toString (k.brightness or 3)}\n"
           else
             "";
         lightingLightbar =
@@ -53,7 +54,7 @@ let
             if k == null || (k ? enabled && !k.enabled) || (k ? mode && k.mode == "off") then
               "${ctl} lighting lightbar off\n"
             else
-              "${ctl} lighting lightbar ${k.mode or "static"} ${k.color or "FFFFFF"} ${toString (k.brightness or 3)}\n"
+              "${ctl} lighting lightbar ${quote (k.mode or "static")} ${quote (k.color or "FFFFFF")} ${toString (k.brightness or 3)}\n"
           else
             "";
       in
@@ -172,7 +173,7 @@ in
           RuntimeDirectoryMode = "0750";
           StateDirectory = "z13helper";
           StateDirectoryMode = "0750";
-          UMask = "0007";
+          UMask = "0077";
           Restart = "on-failure";
           RestartSec = "1s";
           TimeoutStopSec = "5s";
@@ -191,6 +192,7 @@ in
           PrivateTmp = true;
           ProtectSystem = "strict";
           ProtectHome = true;
+          ProtectHostname = true;
           ProtectClock = true;
           ProtectControlGroups = true;
           ProtectKernelLogs = true;
@@ -226,6 +228,7 @@ in
           RestrictAddressFamilies = [ "AF_UNIX" ];
           RestrictNamespaces = true;
           RestrictRealtime = true;
+          RestrictSUIDSGID = true;
           LockPersonality = true;
           MemoryDenyWriteExecute = false;
           LimitMEMLOCK = "infinity";

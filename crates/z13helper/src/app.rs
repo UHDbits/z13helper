@@ -28,6 +28,7 @@ pub struct AppState {
     pub on_battery: Cell<bool>,
     pub undervolt_available: Cell<Option<bool>>,
     pub main_window: RefCell<Option<adw::ApplicationWindow>>,
+    fans_window: RefCell<Option<gtk4::Window>>,
     main_window_visible: Cell<bool>,
     pub gamescope: Option<Rc<Gamescope>>,
     controller_capture: Option<ControllerCapture>,
@@ -73,6 +74,7 @@ impl AppState {
             on_battery: Cell::new(false),
             undervolt_available: Cell::new(None),
             main_window: RefCell::new(None),
+            fans_window: RefCell::new(None),
             main_window_visible: Cell::new(false),
             gamescope,
             controller_capture,
@@ -84,16 +86,24 @@ impl AppState {
         })
     }
 
-    pub fn save_config(&self) {
+    pub fn save_config(self: &Rc<Self>) {
         if !self.config_writable.get() {
             self.report_persistent_error(
                 "Configuration changes cannot be saved until the unsupported file is moved away",
             );
             return;
         }
-        if let Err(error) = self.config.borrow().save(&self.config_path) {
-            self.report_error(&format!("Could not save config: {error}"));
-        }
+        let config = self.config.borrow().clone();
+        let path = self.config_path.clone();
+        let feedback = self.clone();
+        worker::blocking(
+            move || config.save(&path),
+            move |result| {
+                if let Err(error) = result {
+                    feedback.report_error(&format!("Could not save config: {error}"));
+                }
+            },
+        );
     }
 
     pub fn apply_panel_overdrive_policy(self: &Rc<Self>) {
@@ -164,14 +174,15 @@ impl AppState {
         );
     }
 
-    /// Apply the active profile. `notify` is reserved for HUD callers; button
-    /// clicks pass `false` (G-Helper convention — the highlight is enough).
-    pub fn apply_active(self: &Rc<Self>, _notify: bool) {
+    /// Apply the active profile. Requests are serialized and the latest one is
+    /// queued while an apply is in flight.
+    pub fn apply_active(self: &Rc<Self>) {
         if self.applying.replace(true) {
             self.apply_pending.set(true);
             return;
         }
         let profile = self.config.borrow().active().cloned();
+        let requested_profile = profile.as_ref().map(|profile| profile.id.clone());
         let disable_high_power = self.config.borrow().disable_high_power_fan_protection;
         let client = self.client.clone();
         let done = self.clone();
@@ -186,10 +197,18 @@ impl AppState {
                 done.applying.set(false);
                 match result {
                     Some(Ok(response)) => {
-                        let id = done.config.borrow().active_profile.clone();
-                        done.config
-                            .borrow_mut()
-                            .set_active_for_power_source(&id, on_battery);
+                        if let Some(id) = requested_profile.as_deref()
+                            && apply_result_is_current(
+                                &done.config.borrow().active_profile,
+                                id,
+                                done.on_battery.get(),
+                                on_battery,
+                            )
+                        {
+                            done.config
+                                .borrow_mut()
+                                .set_active_for_power_source(id, on_battery);
+                        }
                         done.save_config();
                         if !response.warnings.is_empty() {
                             done.report_error(&response.warnings.join(" · "));
@@ -199,7 +218,7 @@ impl AppState {
                     None => {}
                 }
                 if done.apply_pending.replace(false) {
-                    done.apply_active(false);
+                    done.apply_active();
                 }
             },
         );
@@ -207,10 +226,7 @@ impl AppState {
 
     pub fn report_error(&self, message: &str) {
         tracing::error!(%message, "z13helper error");
-        let mut overlays = self.toast_overlays.borrow_mut();
-        overlays.retain(|overlay| overlay.upgrade().is_some());
-        let target = overlays.iter().rev().find_map(glib::WeakRef::upgrade);
-        drop(overlays);
+        let target = self.visible_toast_overlay();
         if let Some(overlay) = target {
             overlay.add_toast(adw::Toast::new(message));
         } else {
@@ -229,7 +245,32 @@ impl AppState {
 
     pub fn register_toast_overlay(&self, overlay: &adw::ToastOverlay) {
         self.toast_overlays.borrow_mut().push(overlay.downgrade());
-        if let Some(message) = self.pending_toast.borrow_mut().take() {
+        self.flush_pending_toast();
+    }
+
+    fn visible_toast_overlay(&self) -> Option<adw::ToastOverlay> {
+        let main = self.main_window.borrow().clone();
+        let mut overlays = self.toast_overlays.borrow_mut();
+        overlays.retain(|overlay| overlay.upgrade().is_some());
+        overlays.iter().rev().find_map(|overlay| {
+            let overlay = overlay.upgrade()?;
+            let window = overlay.root()?.downcast::<gtk4::Window>().ok()?;
+            let visible = if main
+                .as_ref()
+                .is_some_and(|main| main.upcast_ref::<gtk4::Window>() == &window)
+            {
+                self.main_window_visible.get()
+            } else {
+                window.is_visible()
+            };
+            visible.then_some(overlay)
+        })
+    }
+
+    fn flush_pending_toast(&self) {
+        if let Some(overlay) = self.visible_toast_overlay()
+            && let Some(message) = self.pending_toast.borrow_mut().take()
+        {
             overlay.add_toast(adw::Toast::new(&message));
         }
     }
@@ -259,6 +300,7 @@ impl AppState {
             window.set_visible(false);
         }
         self.seed_factory_fan_curves();
+        self.flush_pending_toast();
     }
 
     pub fn show_window(&self) {
@@ -274,6 +316,7 @@ impl AppState {
         } else {
             present_from_hardware_button(&window);
         }
+        self.flush_pending_toast();
     }
 
     pub fn hide_window(&self) {
@@ -398,7 +441,42 @@ impl AppState {
         } else {
             window.present();
         }
+        self.flush_pending_toast();
     }
+
+    pub fn present_existing_auxiliary(&self, window: &gtk4::Window) {
+        if let Some(gamescope) = self.gamescope.as_ref() {
+            gamescope.show_auxiliary(window);
+        } else {
+            window.present();
+        }
+        self.flush_pending_toast();
+    }
+
+    pub fn hide_auxiliary(&self, window: &gtk4::Window) {
+        if let Some(gamescope) = self.gamescope.as_ref() {
+            gamescope.hide_auxiliary(window);
+        } else {
+            window.set_visible(false);
+        }
+    }
+
+    pub fn fans_window(&self) -> Option<gtk4::Window> {
+        self.fans_window.borrow().clone()
+    }
+
+    pub fn set_fans_window(&self, window: &gtk4::Window) {
+        *self.fans_window.borrow_mut() = Some(window.clone());
+    }
+}
+
+fn apply_result_is_current(
+    active_profile: &str,
+    requested_profile: &str,
+    on_battery: bool,
+    requested_on_battery: bool,
+) -> bool {
+    active_profile == requested_profile && on_battery == requested_on_battery
 }
 
 fn focus_direction(window: &gtk4::Window, direction: gtk4::DirectionType) {
@@ -447,4 +525,20 @@ fn present_from_hardware_button(window: &adw::ApplicationWindow) {
         };
         toplevel.focus(gdk4::CURRENT_TIME);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_result_is_current;
+
+    #[test]
+    fn apply_completion_only_updates_the_state_it_requested() {
+        assert!(apply_result_is_current(
+            "balanced", "balanced", false, false
+        ));
+        assert!(!apply_result_is_current("turbo", "balanced", false, false));
+        assert!(!apply_result_is_current(
+            "balanced", "balanced", true, false
+        ));
+    }
 }

@@ -21,7 +21,7 @@ Some of the features include:
 - **Profiles** — Silent, Balanced, and Turbo built-ins, plus custom profiles
 - **Power** — power-profiles-daemon sync and five-value PPT / TDP limits
 - **Fans** — firmware-based or direct EC curves (similar to the experimental fan control in G-Helper)
-- **Thermals** — per-profile APU temperature limit (up to 99°C)and optional undervolt
+- **Thermals** — per-profile APU temperature limit (up to 99°C) and optional undervolt
 - **Battery** — charge limit (40–100%) and one-time full-charge override
 - **Display** — panel overdrive policy (always on, or plugged-in only)
 - **Lighting** — keyboard and lightbar
@@ -115,7 +115,7 @@ binaries; they are not separate services.
 |---|---|
 | `$XDG_CONFIG_HOME/z13helper/config.json` | User profiles and UI preferences (schema v1) |
 | `/run/z13helper/z13helperd.sock` | Daemon socket (`root:z13helper`) |
-| `/var/lib/z13helper/state.json` | Flattened machine state restored across reboot/resume |
+| `/var/lib/z13helper/state.json` | Desired request and flattened machine state restored across reboot/resume |
 
 Unsupported config schema versions are left untouched. Corrupt files are
 preserved as `config.json.corrupt` and replaced with defaults. The installer

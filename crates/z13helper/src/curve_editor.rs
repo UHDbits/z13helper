@@ -53,12 +53,7 @@ impl CurveEditor {
     }
 
     pub fn curve(&self) -> Curve {
-        let curve = *self.curve.borrow();
-        if self.high_power_protection.get() {
-            curve::high_power_curve(&curve)
-        } else {
-            curve
-        }
+        *self.curve.borrow()
     }
 
     pub fn set_curve(&self, curve: Curve) {
@@ -94,6 +89,10 @@ impl CurveEditor {
         self.area.queue_draw();
     }
 
+    fn display_curve(&self) -> Curve {
+        curve_for_display(&self.curve(), self.high_power_protection.get())
+    }
+
     fn font_size(area: &gtk::DrawingArea) -> f64 {
         area.pango_context()
             .font_description()
@@ -117,7 +116,7 @@ impl CurveEditor {
 
     fn update_accessibility(&self) {
         let index = self.selected.get();
-        let point = self.curve()[index];
+        let point = self.display_curve()[index];
         let value = format!(
             "Point {} of {POINT_COUNT}: {} degrees Celsius, {} percent fan speed",
             index + 1,
@@ -175,7 +174,11 @@ impl CurveEditor {
                 .as_ref()
                 .and_then(gtk::pango::FontDescription::family)
                 .unwrap_or_else(|| "Sans".into());
-            cr.select_font_face(&family, cairo::FontSlant::Normal, cairo::FontWeight::Normal);
+            cr.select_font_face(
+                &family,
+                gtk::cairo::FontSlant::Normal,
+                gtk::cairo::FontWeight::Normal,
+            );
             cr.set_font_size(font_size);
             for t in (CHART_TEMP_MIN..=CHART_TEMP_MAX).step_by(10) {
                 let label = format!("{t}");
@@ -202,11 +205,7 @@ impl CurveEditor {
             let _ = cr.show_text("°C");
 
             let authored = *curve.borrow();
-            let points = if high_power_protection.get() {
-                curve::high_power_curve(&authored)
-            } else {
-                authored
-            };
+            let points = curve_for_display(&authored, high_power_protection.get());
             if muted.get() {
                 set_color(&foreground, 0.45);
             } else {
@@ -287,16 +286,7 @@ impl CurveEditor {
                 _ => return glib::Propagation::Proceed,
             };
             let mut curve = editor.curve.borrow_mut();
-            if editor.high_power_protection.get() && idx == 7 {
-                return glib::Propagation::Stop;
-            }
-            if editor.high_power_protection.get() && idx == 6 {
-                curve[idx][0] = curve::HIGH_POWER_POINT_TEMP_C;
-                let pwm_step = curve::percent_to_pwm(dp) - curve::percent_to_pwm(0);
-                curve[idx][1] =
-                    (curve[idx][1] + pwm_step).clamp(curve::HIGH_POWER_POINT_PWM, curve::PWM_MAX);
-                drop(curve);
-                editor.emit_changed();
+            if editor.high_power_protection.get() && idx >= 6 {
                 return glib::Propagation::Stop;
             }
             curve[idx][0] += dt;
@@ -315,7 +305,7 @@ impl CurveEditor {
         let (left, top, cw, ch) = Self::chart_geom(w, h, Self::font_size(&self.area));
         let x = |t: i32| left + (t - CHART_TEMP_MIN) as f64 / CHART_TEMP_RANGE * cw;
         let y = |p: i32| top + (1.0 - p as f64 / 255.0) * ch;
-        let curve = self.curve();
+        let curve = self.display_curve();
         curve
             .iter()
             .enumerate()
@@ -337,14 +327,7 @@ impl CurveEditor {
             .clamp(CHART_TEMP_MIN as f64, CHART_TEMP_MAX as f64) as i32;
         let pwm = ((1.0 - (py - top) / ch) * 255.0).round() as i32;
         let mut curve = self.curve.borrow_mut();
-        if self.high_power_protection.get() && idx == 7 {
-            return;
-        }
-        if self.high_power_protection.get() && idx == 6 {
-            curve[idx][0] = curve::HIGH_POWER_POINT_TEMP_C;
-            curve[idx][1] = pwm.clamp(curve::HIGH_POWER_POINT_PWM, curve::PWM_MAX);
-            drop(curve);
-            self.emit_changed();
+        if self.high_power_protection.get() && idx >= 6 {
             return;
         }
         if vertical_only {
@@ -357,5 +340,33 @@ impl CurveEditor {
         }
         drop(curve);
         self.emit_changed();
+    }
+}
+
+fn curve_for_display(authored: &Curve, protection: bool) -> Curve {
+    if protection {
+        curve::high_power_curve(authored)
+    } else {
+        *authored
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::curve_for_display;
+    use z13helper_core::curve::{self, Curve};
+
+    #[test]
+    fn protection_only_changes_the_display_copy() {
+        let mut authored = Curve::default();
+        authored[6] = [95, 10];
+        authored[7] = [100, 20];
+        assert_eq!(curve_for_display(&authored, false), authored);
+        assert_eq!(
+            curve_for_display(&authored, true),
+            curve::high_power_curve(&authored)
+        );
+        assert_eq!(authored[6], [95, 10]);
+        assert_eq!(authored[7], [100, 20]);
     }
 }

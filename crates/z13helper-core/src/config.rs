@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::profile::{Profile, stock_fan_curves, stock_ppt};
+use crate::profile::Profile;
 
 pub const CONFIG_VERSION: u32 = 1;
 
@@ -21,6 +21,10 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid v1 config: {0}")]
+    Invalid(String),
+    #[error("could not preserve corrupt config: {0}")]
+    Preservation(#[source] std::io::Error),
     #[error("unsupported config version {0}")]
     UnsupportedVersion(u32),
 }
@@ -89,9 +93,17 @@ impl Config {
         match Self::load(path) {
             Ok(cfg) => Ok(cfg),
             Err(ConfigError::Json(_)) => {
-                // Corrupt file: keep a .corrupt copy and reseeds.
+                // Syntax corruption: preserve the original before replacing it.
                 let corrupt = path.with_extension("json.corrupt");
-                let _ = fs::rename(path, &corrupt);
+                if corrupt.exists() {
+                    return Err(ConfigError::Preservation(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("{} already exists", corrupt.display()),
+                    )));
+                }
+                if let Err(error) = fs::rename(path, &corrupt) {
+                    return Err(ConfigError::Preservation(error));
+                }
                 let cfg = Self::default();
                 cfg.save(path)?;
                 Ok(cfg)
@@ -107,8 +119,9 @@ impl Config {
         if version != CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion(version));
         }
-        let mut cfg: Config = serde_json::from_value(value)?;
-        cfg.ensure_builtins();
+        let cfg: Config = serde_json::from_value(value)
+            .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -117,9 +130,10 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        self.validate()?;
         if path.exists() {
             let bak = path.with_extension("json.bak");
-            let _ = fs::copy(path, &bak);
+            fs::copy(path, &bak)?;
         }
         let tmp = path.with_extension("json.tmp");
         {
@@ -131,33 +145,6 @@ impl Config {
         }
         fs::rename(&tmp, path)?;
         Ok(())
-    }
-
-    /// Ensure the three built-ins exist (re-seed if a user deleted them).
-    /// Keep inactive built-in controls on their per-PPD stock values.
-    pub fn ensure_builtins(&mut self) {
-        for builtin in builtin_profiles() {
-            if !self.profiles.iter().any(|p| p.id == builtin.id) {
-                self.profiles.insert(0, builtin);
-            }
-        }
-        for p in &mut self.profiles {
-            if p.builtin && !p.apply_fan_curve && !p.factory_fan_curves_loaded {
-                p.fan_curves = stock_fan_curves(p.ppd_profile.as_deref());
-            }
-            if p.builtin && !p.apply_power_limits {
-                let (pl1, pl2, fppt) = stock_ppt(p.ppd_profile.as_deref());
-                p.pl1_spl = pl1;
-                p.pl2_sppt = pl2;
-                p.fppt = fppt;
-            }
-        }
-        self.profiles.sort_by_key(|p| match p.id.as_str() {
-            "silent" => 0,
-            "balanced" => 1,
-            "turbo" => 2,
-            _ => 100,
-        });
     }
 
     pub fn find(&self, id: &str) -> Option<&Profile> {
@@ -174,7 +161,12 @@ impl Config {
 
     /// Create a custom profile by copying the currently active one.
     pub fn add_custom(&mut self) -> &Profile {
-        let next_n = self.profiles.iter().filter(|p| !p.builtin).count() + 1;
+        let next_n = (1..)
+            .find(|n| {
+                let id = format!("custom-{n}");
+                !self.profiles.iter().any(|profile| profile.id == id)
+            })
+            .unwrap();
         let source = self
             .active()
             .cloned()
@@ -211,7 +203,61 @@ impl Config {
         if self.active_profile == id {
             self.active_profile = "balanced".into();
         }
+        if self.last_profile_on_ac == id {
+            self.last_profile_on_ac = "balanced".into();
+        }
+        if self.last_profile_on_battery == id {
+            self.last_profile_on_battery = "balanced".into();
+        }
         true
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.version != CONFIG_VERSION {
+            return Err(ConfigError::UnsupportedVersion(self.version));
+        }
+
+        let mut ids = std::collections::HashSet::new();
+        for profile in &self.profiles {
+            if profile.id.trim().is_empty() {
+                return Err(ConfigError::Invalid("profile id must not be empty".into()));
+            }
+            if !ids.insert(profile.id.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate profile id {:?}",
+                    profile.id
+                )));
+            }
+            let expected_builtin = matches!(profile.id.as_str(), "silent" | "balanced" | "turbo");
+            if profile.builtin != expected_builtin {
+                return Err(ConfigError::Invalid(format!(
+                    "profile {:?} has an invalid builtin flag",
+                    profile.id
+                )));
+            }
+            profile.validate().map_err(ConfigError::Invalid)?;
+        }
+
+        for id in [
+            &self.active_profile,
+            &self.last_profile_on_ac,
+            &self.last_profile_on_battery,
+        ] {
+            if !ids.contains(id.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "profile reference {:?} does not exist",
+                    id
+                )));
+            }
+        }
+        for id in ["silent", "balanced", "turbo"] {
+            if !ids.contains(id) {
+                return Err(ConfigError::Invalid(format!(
+                    "missing built-in profile {id:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn set_active_for_power_source(&mut self, id: &str, on_battery: bool) {
@@ -305,6 +351,51 @@ mod tests {
     }
 
     #[test]
+    fn failed_corrupt_preservation_does_not_overwrite_config() {
+        let path = tmp_path("corrupt-preservation-failure");
+        let original = b"{not json!!!";
+        fs::write(&path, original).unwrap();
+        fs::create_dir(path.with_extension("json.corrupt")).unwrap();
+        assert!(matches!(
+            Config::load_or_default(&path),
+            Err(ConfigError::Preservation(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let _ = fs::remove_dir(path.with_extension("json.corrupt"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_v1_reference_is_preserved_and_rejected() {
+        let path = tmp_path("invalid-v1");
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value["active_profile"] = serde_json::Value::String("missing".into());
+        let original = serde_json::to_string(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(matches!(
+            Config::load_or_default(&path),
+            Err(ConfigError::Invalid(_))
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_v1_profile_value_is_preserved_and_rejected() {
+        let path = tmp_path("invalid-v1-profile");
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value["profiles"][0]["pl1_spl"] = serde_json::Value::from(94);
+        let original = serde_json::to_string(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(matches!(
+            Config::load_or_default(&path),
+            Err(ConfigError::Invalid(_))
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn missing_version_is_not_migrated() {
         let path = tmp_path("no-migration");
         fs::write(&path, r#"{"profiles":[]}"#).unwrap();
@@ -328,6 +419,27 @@ mod tests {
         assert!(cfg.remove(&id));
         assert!(!cfg.remove("silent"));
         assert_eq!(cfg.active_profile, "balanced");
+    }
+
+    #[test]
+    fn custom_ids_stay_unique_after_deletion() {
+        let mut cfg = Config::default();
+        let first = cfg.add_custom().id.clone();
+        let second = cfg.add_custom().id.clone();
+        cfg.remove(&first);
+        assert_eq!(cfg.add_custom().id, first);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn removing_profile_repairs_remembered_references() {
+        let mut cfg = Config::default();
+        let id = cfg.add_custom().id.clone();
+        cfg.last_profile_on_ac = id.clone();
+        cfg.last_profile_on_battery = id.clone();
+        assert!(cfg.remove(&id));
+        assert_eq!(cfg.last_profile_on_ac, "balanced");
+        assert_eq!(cfg.last_profile_on_battery, "balanced");
     }
 
     #[test]

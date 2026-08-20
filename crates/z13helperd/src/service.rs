@@ -23,6 +23,7 @@ pub struct Controller<P> {
     last_duty: [u8; 2],
     last_ramp_at: Option<Instant>,
     consecutive_ec_errors: u32,
+    release_failure: Option<String>,
 }
 
 impl<P: PortIo> Controller<P> {
@@ -38,20 +39,12 @@ impl<P: PortIo> Controller<P> {
             last_duty: [0; 2],
             last_ramp_at: None,
             consecutive_ec_errors: 0,
+            release_failure: None,
         }
     }
 
     pub fn startup_release_and_probe(&mut self) -> Result<ProbeReply, String> {
         self.release()?;
-        let probe = self.ec.probe().map_err(|error| error.to_string())?;
-        Ok(ProbeReply {
-            model: MODEL.into(),
-            ec_version: probe.version,
-            fan_count: probe.fan_count,
-        })
-    }
-
-    pub fn probe(&mut self) -> Result<ProbeReply, String> {
         let probe = self.ec.probe().map_err(|error| error.to_string())?;
         Ok(ProbeReply {
             model: MODEL.into(),
@@ -84,10 +77,10 @@ impl<P: PortIo> Controller<P> {
         self.curves = None;
         self.temperature_average.clear();
         self.hysteresis_state = HysteresisState::default();
+        self.last_duty = [0; 2];
         self.last_ramp_at = None;
         match self.ec.set_global_mode(false) {
             Ok(()) => {
-                self.last_duty = [0; 2];
                 self.consecutive_ec_errors = 0;
                 Ok(())
             }
@@ -165,8 +158,12 @@ impl<P: PortIo> Controller<P> {
     }
 
     pub fn sensor_failed(&mut self, error: String) -> String {
-        self.release_best_effort();
-        format!("sensor failure; EC control released: {error}")
+        match self.release_best_effort() {
+            Some(release_error) => {
+                format!("sensor failure; EC control release failed ({release_error}): {error}")
+            }
+            None => format!("sensor failure; EC control released: {error}"),
+        }
     }
 
     pub fn direct_enabled(&self) -> bool {
@@ -177,24 +174,38 @@ impl<P: PortIo> Controller<P> {
         self.last_duty
     }
 
+    pub fn take_release_failure(&mut self) -> Option<String> {
+        self.release_failure.take()
+    }
+
     fn note_ec_error(&mut self, error: String) -> String {
         self.consecutive_ec_errors = self.consecutive_ec_errors.saturating_add(1);
         if self.consecutive_ec_errors >= MAX_CONSECUTIVE_EC_ERRORS {
-            self.release_best_effort();
-            format!("repeated EC failure; control released: {error}")
+            match self.release_best_effort() {
+                Some(release_error) => format!(
+                    "repeated EC failure; control release failed ({release_error}): {error}"
+                ),
+                None => format!("repeated EC failure; control released: {error}"),
+            }
         } else {
             format!("EC failure: {error}")
         }
     }
 
-    fn release_best_effort(&mut self) {
+    fn release_best_effort(&mut self) -> Option<String> {
         self.curves = None;
         self.temperature_average.clear();
         self.hysteresis_state = HysteresisState::default();
         self.last_duty = [0; 2];
         self.last_ramp_at = None;
-        if let Err(error) = self.ec.set_global_mode(false) {
-            tracing::error!(%error, "failed to release EC automatic mode");
+        match self.ec.set_global_mode(false) {
+            Ok(()) => None,
+            Err(error) => {
+                let error = error.to_string();
+                self.release_failure = Some(error.clone());
+                tracing::error!(%error, "failed to release EC automatic mode");
+                Some(error)
+            }
         }
     }
 
@@ -231,7 +242,9 @@ pub fn ramp_duty(current: u8, target: u8, elapsed: Duration) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::io;
+    use std::rc::Rc;
 
     use super::*;
     use crate::ec::{COMMAND_STATUS_PORT, DATA_PORT, PortIo, Register};
@@ -249,6 +262,24 @@ mod tests {
 
         fn write_u8(&mut self, port: u16, value: u8) -> io::Result<()> {
             self.writes.push((port, value));
+            Ok(())
+        }
+    }
+
+    struct SwitchIo {
+        fail_writes: Rc<Cell<bool>>,
+    }
+
+    impl PortIo for SwitchIo {
+        fn read_u8(&mut self, _port: u16) -> io::Result<u8> {
+            Ok(0)
+        }
+
+        fn write_u8(&mut self, port: u16, value: u8) -> io::Result<()> {
+            if self.fail_writes.get() {
+                return Err(io::Error::other("write failed"));
+            }
+            let _ = (port, value);
             Ok(())
         }
     }
@@ -338,5 +369,21 @@ mod tests {
                 .contains("released")
         );
         assert!(!controller.direct_enabled());
+    }
+
+    #[test]
+    fn failed_best_effort_release_is_reported() {
+        let fail_writes = Rc::new(Cell::new(false));
+        let mut controller = Controller::new(EcMailbox::new(SwitchIo {
+            fail_writes: fail_writes.clone(),
+        }));
+        controller
+            .enable([curve(100), curve(100)], FanHysteresis::default(), 0)
+            .unwrap();
+        fail_writes.set(true);
+        controller.sensor_failed("missing k10temp".into());
+        assert!(controller.take_release_failure().is_some());
+        fail_writes.set(false);
+        assert!(controller.release().is_ok());
     }
 }

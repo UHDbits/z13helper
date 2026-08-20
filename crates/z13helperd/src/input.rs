@@ -53,14 +53,21 @@ fn find_button_device() -> Option<PathBuf> {
     None
 }
 
-pub fn spawn_button_watcher(sender: Sender<DaemonEventKind>, terminate: Arc<AtomicBool>) {
+pub fn spawn_button_watcher(
+    sender: Sender<DaemonEventKind>,
+    terminate: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         while !terminate.load(Ordering::Relaxed) {
             let Some(path) = find_button_device() else {
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             };
-            let Ok(mut device) = File::open(&path) else {
+            let Ok(mut device) = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&path)
+            else {
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             };
@@ -68,7 +75,7 @@ pub fn spawn_button_watcher(sender: Sender<DaemonEventKind>, terminate: Arc<Atom
                 tracing::warn!(%error, path = %path.display(), "button watcher reconnecting");
             }
         }
-    });
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,11 +123,28 @@ struct ControllerDevice {
 
 pub struct ControllerCaptureHandle {
     control: UnixDatagram,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ControllerCaptureHandle {
     pub fn set_enabled(&self, enabled: bool) -> io::Result<()> {
-        self.control.send(&[u8::from(enabled)]).map(|_| ())
+        self.control.send(&[u8::from(enabled)]).map(|_| ())?;
+        let mut acknowledgement = [0_u8; 1];
+        self.control.recv(&mut acknowledgement)?;
+        if acknowledgement[0] == 0x81 {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "controller capture request was not acknowledged",
+            ))
+        }
+    }
+
+    pub fn stop(mut self) {
+        drop(self.control);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -135,8 +159,13 @@ pub fn spawn_controller_watcher(
     let (control, receiver) = UnixDatagram::pair()?;
     control.set_nonblocking(true)?;
     receiver.set_nonblocking(true)?;
-    std::thread::spawn(move || controller_loop(sender, receiver, terminate));
-    Ok(ControllerCaptureHandle { control })
+    control.set_nonblocking(false)?;
+    control.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let thread = std::thread::spawn(move || controller_loop(sender, receiver, terminate));
+    Ok(ControllerCaptureHandle {
+        control,
+        thread: Some(thread),
+    })
 }
 
 fn controller_loop(
@@ -186,17 +215,21 @@ fn controller_loop(
 
         if poll_fds[0].revents & libc::POLLIN != 0
             && let Some(requested) = receive_capture_state(&control)
-            && requested != capturing
         {
-            for device in &mut devices {
-                if requested {
-                    drain_device(device);
+            if requested != capturing {
+                for device in &mut devices {
+                    if requested {
+                        drain_device(device);
+                    }
+                    set_grabbed(device, requested);
+                    device.held.clear();
+                    device.stick = StickState::default();
                 }
-                set_grabbed(device, requested);
-                device.held.clear();
-                device.stick = StickState::default();
+                capturing = requested;
             }
-            capturing = requested;
+            let acknowledged = devices.iter().all(|device| device.grabbed == requested);
+            let byte = [if acknowledged { 0x81 } else { 0x80 }];
+            let _ = control.send(&byte);
         }
 
         let ready: HashSet<_> = poll_fds
@@ -348,9 +381,9 @@ fn read_hex_u16(path: PathBuf) -> Option<u16> {
     u16::from_str_radix(&read_trimmed(path), 16).ok()
 }
 
-fn set_grabbed(device: &mut ControllerDevice, grabbed: bool) {
+fn set_grabbed(device: &mut ControllerDevice, grabbed: bool) -> bool {
     if device.grabbed == grabbed {
-        return;
+        return true;
     }
     // SAFETY: EVIOCGRAB accepts an integer value and the fd remains owned by
     // `device.file` for the duration of this call.
@@ -362,6 +395,7 @@ fn set_grabbed(device: &mut ControllerDevice, grabbed: bool) {
             grabbed,
             "controller exclusive capture changed"
         );
+        true
     } else {
         tracing::warn!(
             path = %device.path.display(),
@@ -369,6 +403,7 @@ fn set_grabbed(device: &mut ControllerDevice, grabbed: bool) {
             error = %io::Error::last_os_error(),
             "controller exclusive capture failed"
         );
+        false
     }
 }
 
@@ -593,9 +628,31 @@ fn read_events(
     let event_size = std::mem::size_of::<libc::timeval>() + 8;
     let mut event = vec![0u8; event_size];
     while !terminate.load(Ordering::Relaxed) {
-        device
-            .read_exact(&mut event)
-            .map_err(|error| error.to_string())?;
+        let mut poll = libc::pollfd {
+            fd: device.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll` receives a pointer to the live local descriptor.
+        let ready = unsafe { libc::poll(&mut poll, 1, 500) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.to_string());
+        }
+        if ready == 0 {
+            continue;
+        }
+        if poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err("button input device disconnected".into());
+        }
+        match device.read_exact(&mut event) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error.to_string()),
+        }
         let offset = std::mem::size_of::<libc::timeval>();
         let event_type = u16::from_ne_bytes(event[offset..offset + 2].try_into().unwrap());
         let code = u16::from_ne_bytes(event[offset + 2..offset + 4].try_into().unwrap());

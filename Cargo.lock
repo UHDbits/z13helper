@@ -1376,7 +1376,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
- "cairo-rs",
  "gdk4",
  "gdk4-x11",
  "gio",

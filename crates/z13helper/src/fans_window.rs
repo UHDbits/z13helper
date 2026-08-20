@@ -18,6 +18,10 @@ use crate::ui::sync::SyncGuard;
 type ApplySchedule = Rc<RefCell<Option<glib::SourceId>>>;
 
 pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
+    if let Some(window) = state.fans_window() {
+        state.present_existing_auxiliary(&window);
+        return;
+    }
     let (window_width, window_height) = state
         .gamescope
         .as_ref()
@@ -104,6 +108,15 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let editing_id = Rc::new(RefCell::new(profile.id.clone()));
     let loading = SyncGuard::default();
     let apply_schedule: ApplySchedule = Rc::new(RefCell::new(None));
+    let state_close = state.clone();
+    let schedule_close = apply_schedule.clone();
+    window.connect_close_request(move |window| {
+        if let Some(source) = schedule_close.borrow_mut().take() {
+            source.remove();
+        }
+        state_close.hide_auxiliary(window.upcast_ref());
+        glib::Propagation::Stop
+    });
 
     let cpu = build_cpu_page(
         state,
@@ -355,7 +368,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         if let Some(p) = state_fan.config.borrow_mut().find_mut(&id) {
             p.apply_fan_curve = t.is_active();
         }
-        schedule_apply(&state_fan, &apply_schedule_fan);
+        schedule_apply(&state_fan, &apply_schedule_fan, id);
     });
 
     let state_unified = state.clone();
@@ -396,7 +409,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             "Fan 1 Curve — % vs °C"
         });
         chart2_label_unified.set_visible(!unified);
-        schedule_apply(&state_unified, &apply_schedule_unified);
+        schedule_apply(&state_unified, &apply_schedule_unified, id);
     });
 
     let state_direct = state.clone();
@@ -423,7 +436,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                 FanControlMode::Firmware
             };
         }
-        schedule_apply(&state_direct, &apply_schedule_direct);
+        schedule_apply(&state_direct, &apply_schedule_direct, id);
     });
 
     for (scale, upwards) in [(&hysteresis_up.1, true), (&hysteresis_down.1, false)] {
@@ -443,7 +456,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                     profile.fan_hysteresis_down = scale.value() as u8;
                 }
             }
-            schedule_apply(&state, &apply_schedule);
+            schedule_apply(&state, &apply_schedule, id);
         });
     }
 
@@ -459,7 +472,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         if let Some(profile) = state_average.config.borrow_mut().find_mut(&id) {
             profile.fan_temperature_average_seconds = scale.value() as u8;
         }
-        schedule_apply(&state_average, &apply_schedule_average);
+        schedule_apply(&state_average, &apply_schedule_average, id);
     });
 
     // Persist curve edits into the profile currently selected in this window.
@@ -480,7 +493,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                 editor2_curve.set_curve(curve);
             }
         }
-        schedule_apply(&state_curve, &apply_schedule_curve);
+        schedule_apply(&state_curve, &apply_schedule_curve, id);
     });
     let state_curve = state.clone();
     let editing_curve = editing_id.clone();
@@ -497,7 +510,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             }
             profile.fan_curves[1] = curve;
         }
-        schedule_apply(&state_curve, &apply_schedule_curve);
+        schedule_apply(&state_curve, &apply_schedule_curve, id);
     });
 
     let spl = cpu.1.clone();
@@ -576,7 +589,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             state_sel.config.borrow().disable_high_power_fan_protection,
         );
         set_profile_action_sensitivity(&state_sel, &next.id, &rename_sel, &remove_sel);
-        state_sel.apply_active(false);
+        state_sel.apply_active();
     });
 
     let state_def = state.clone();
@@ -723,7 +736,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             });
             set_profile_action_sensitivity(&state_rm, &active, &rename_rm, &remove_rm);
             state_rm.save_config();
-            state_rm.apply_active(false);
+            state_rm.apply_active();
             removed_toast.add_toast(adw::Toast::new("Profile removed"));
         }
     });
@@ -855,6 +868,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     } else {
         window.set_content(Some(&toolbar));
     }
+    state.set_fans_window(window.upcast_ref());
     state.present_auxiliary(&window);
 }
 
@@ -1007,7 +1021,7 @@ fn build_cpu_page(
                     && !high_power_disabled;
                 first_editor.set_high_power_protection(protection);
                 second_editor.set_high_power_protection(protection);
-                schedule_apply(&state, &apply_schedule);
+                schedule_apply(&state, &apply_schedule, id);
             }
         })
     };
@@ -1183,7 +1197,8 @@ fn build_advanced_page(
                 loading.run(|| toggle.set_active(true));
                 first.set_high_power_protection(false);
                 second.set_high_power_protection(false);
-                schedule_apply(&state, &schedule);
+                let profile_id = state.config.borrow().active_profile.clone();
+                schedule_apply(&state, &schedule, profile_id);
             });
             dialog.present(Some(&parent_protection));
         } else {
@@ -1200,7 +1215,8 @@ fn build_advanced_page(
                 });
             first_protection.set_high_power_protection(active);
             second_protection.set_high_power_protection(active);
-            schedule_apply(&state_protection, &apply_schedule_protection);
+            let profile_id = state_protection.config.borrow().active_profile.clone();
+            schedule_apply(&state_protection, &apply_schedule_protection, profile_id);
         }
     });
 
@@ -1224,7 +1240,7 @@ fn build_advanced_page(
         if let Some(profile) = state_temperature.config.borrow_mut().find_mut(&id) {
             profile.cpu_temp_limit = scale.value() as u8;
         }
-        schedule_apply(&state_temperature, &apply_schedule_temperature);
+        schedule_apply(&state_temperature, &apply_schedule_temperature, id);
     });
 
     let state_uv = state.clone();
@@ -1242,7 +1258,7 @@ fn build_advanced_page(
             p.apply_undervolt = apply_uv_c.is_active();
         }
         if apply_uv_c.is_active() {
-            schedule_apply(&state_uv, &apply_schedule_uv);
+            schedule_apply(&state_uv, &apply_schedule_uv, id);
         } else {
             state_uv.save_config();
         }
@@ -1259,7 +1275,7 @@ fn build_advanced_page(
         if let Some(p) = state_chk.config.borrow_mut().find_mut(&id) {
             p.apply_undervolt = chk.is_active();
         }
-        schedule_apply(&state_chk, &apply_schedule_uv);
+        schedule_apply(&state_chk, &apply_schedule_uv, id);
     });
 
     let state_manual = state.clone();
@@ -1296,7 +1312,7 @@ fn build_advanced_page(
     (page, uv, apply_uv, manual_apply, note, cpu_temp_limit)
 }
 
-fn schedule_apply(state: &Rc<AppState>, schedule: &ApplySchedule) {
+fn schedule_apply(state: &Rc<AppState>, schedule: &ApplySchedule, edited_profile: String) {
     if let Some(source) = schedule.borrow_mut().take() {
         source.remove();
     }
@@ -1307,9 +1323,15 @@ fn schedule_apply(state: &Rc<AppState>, schedule: &ApplySchedule) {
         move || {
             schedule_done.borrow_mut().take();
             state.save_config();
-            state.apply_active(false);
+            if profile_is_active(&state.config.borrow().active_profile, &edited_profile) {
+                state.apply_active();
+            }
         },
     ));
+}
+
+fn profile_is_active(active_profile: &str, edited_profile: &str) -> bool {
+    active_profile == edited_profile
 }
 
 struct ProfileEditorView {
@@ -1674,7 +1696,7 @@ fn profile_actions_are_editable(config: &z13helper_core::Config, profile_id: &st
 
 #[cfg(test)]
 mod tests {
-    use super::profile_actions_are_editable;
+    use super::{profile_actions_are_editable, profile_is_active};
 
     #[test]
     fn builtins_cannot_be_renamed_or_removed() {
@@ -1682,5 +1704,11 @@ mod tests {
         assert!(!profile_actions_are_editable(&config, "silent"));
         let custom = config.add_custom().id.clone();
         assert!(profile_actions_are_editable(&config, &custom));
+    }
+
+    #[test]
+    fn delayed_edits_do_not_apply_a_different_active_profile() {
+        assert!(profile_is_active("balanced", "balanced"));
+        assert!(!profile_is_active("turbo", "balanced"));
     }
 }

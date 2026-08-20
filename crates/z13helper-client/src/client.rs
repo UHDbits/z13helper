@@ -13,6 +13,8 @@ use z13helper_core::protocol::{
 
 const DEFAULT_SOCKET: &str = "/run/z13helper/z13helperd.sock";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_FRAME_BYTES: usize = 64 * 1024;
+const EVENT_BUFFER_CAPACITY: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -36,10 +38,6 @@ impl Client {
         }
     }
 
-    pub fn socket_path() -> &'static str {
-        DEFAULT_SOCKET
-    }
-
     fn dial(&self) -> Result<UnixStream, DaemonError> {
         let stream = UnixStream::connect(&self.socket_path).map_err(classify_dial_error)?;
         stream
@@ -55,17 +53,10 @@ impl Client {
             version: PROTOCOL_VERSION,
             command,
         };
-        let body = serde_json::to_vec(&request)
-            .map_err(|error| DaemonError::Protocol(error.to_string()))?;
-        stream.write_all(&body).map_err(map_io_error)?;
-        stream.write_all(b"\n").map_err(map_io_error)?;
-        let mut line = String::new();
-        match BufReader::new(stream).read_line(&mut line) {
-            Ok(0) => return Err(DaemonError::Protocol("no response from daemon".into())),
-            Ok(_) => {}
-            Err(error) => return Err(map_io_error(error)),
-        }
-        let response: WireResponse = serde_json::from_str(line.trim())
+        write_frame(&mut stream, &request)?;
+        let mut reader = BufReader::new(stream);
+        let line = read_frame(&mut reader)?;
+        let response: WireResponse = serde_json::from_str(&line)
             .map_err(|error| DaemonError::Protocol(format!("invalid response JSON: {error}")))?;
         if response.ok {
             Ok(response)
@@ -178,43 +169,36 @@ impl Client {
                 events: events.iter().map(|event| (*event).into()).collect(),
             },
         };
-        let body = serde_json::to_vec(&request)
-            .map_err(|error| DaemonError::Protocol(error.to_string()))?;
-        stream.write_all(&body).map_err(map_io_error)?;
-        stream.write_all(b"\n").map_err(map_io_error)?;
-        let ack = read_line_raw(&mut stream)?;
-        let response: WireResponse = serde_json::from_str(ack.trim())
-            .map_err(|error| DaemonError::Protocol(error.to_string()))?;
+        write_frame(&mut stream, &request)?;
+        let mut reader = BufReader::new(stream);
+        let ack = read_frame(&mut reader)?;
+        let response: WireResponse =
+            serde_json::from_str(&ack).map_err(|error| DaemonError::Protocol(error.to_string()))?;
         if !response.ok {
             return Err(map_wire_error(response));
         }
-        stream
+        reader
+            .get_mut()
             .set_read_timeout(Some(Duration::from_millis(500)))
             .map_err(map_io_error)?;
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(EVENT_BUFFER_CAPACITY);
         let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut reader = BufReader::new(stream);
             loop {
                 if cancel_rx.try_recv().is_ok() {
                     break;
                 }
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if let Ok(response) = serde_json::from_str::<WireResponse>(line.trim())
+                match read_frame(&mut reader) {
+                    Ok(line) => {
+                        if let Ok(response) = serde_json::from_str::<WireResponse>(&line)
                             && let Some(event) = response.event
-                            && tx.send(event).is_err()
+                            && let Err(error) = tx.try_send(event)
+                            && matches!(error, std::sync::mpsc::TrySendError::Disconnected(_))
                         {
                             break;
                         }
                     }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
+                    Err(DaemonError::Timeout) => {}
                     Err(_) => break,
                 }
             }
@@ -233,17 +217,39 @@ impl SubscribeCancel {
     }
 }
 
-fn read_line_raw(stream: &mut UnixStream) -> Result<String, DaemonError> {
-    let mut bytes = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match stream.read(&mut byte) {
-            Ok(0) => return Err(DaemonError::Protocol("no response from daemon".into())),
-            Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => bytes.push(byte[0]),
-            Err(error) => return Err(map_io_error(error)),
-        }
+impl Drop for SubscribeCancel {
+    fn drop(&mut self) {
+        let _ = self.tx.send(());
     }
+}
+
+fn write_frame(stream: &mut impl Write, value: &WireRequest) -> Result<(), DaemonError> {
+    let body =
+        serde_json::to_vec(value).map_err(|error| DaemonError::Protocol(error.to_string()))?;
+    if body.len() + 1 > MAX_FRAME_BYTES {
+        return Err(DaemonError::Protocol(
+            "outgoing frame exceeds 64 KiB".into(),
+        ));
+    }
+    stream.write_all(&body).map_err(map_io_error)?;
+    stream.write_all(b"\n").map_err(map_io_error)
+}
+
+fn read_frame(reader: &mut impl BufRead) -> Result<String, DaemonError> {
+    let mut bytes = Vec::new();
+    let read = reader
+        .take((MAX_FRAME_BYTES + 1) as u64)
+        .read_until(b'\n', &mut bytes)
+        .map_err(map_io_error)?;
+    if read == 0 {
+        return Err(DaemonError::Protocol("no response from daemon".into()));
+    }
+    if bytes.last() != Some(&b'\n') || bytes.len() > MAX_FRAME_BYTES {
+        return Err(DaemonError::Protocol(
+            "incoming frame exceeds 64 KiB".into(),
+        ));
+    }
+    bytes.pop();
     String::from_utf8(bytes).map_err(|error| DaemonError::Protocol(error.to_string()))
 }
 
@@ -285,12 +291,33 @@ fn map_io_error(error: std::io::Error) -> DaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufReader, Cursor};
     use std::os::unix::net::UnixListener;
 
     #[test]
     fn missing_socket_error_is_not_running() {
         let error = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert_eq!(classify_dial_error(error), DaemonError::NotRunning);
+    }
+
+    #[test]
+    fn frames_are_bounded_in_both_directions() {
+        let mut reader = BufReader::new(Cursor::new(vec![b'x'; MAX_FRAME_BYTES + 1]));
+        assert!(matches!(
+            read_frame(&mut reader),
+            Err(DaemonError::Protocol(message)) if message.contains("exceeds")
+        ));
+
+        let request = WireRequest {
+            version: PROTOCOL_VERSION,
+            command: Command::Subscribe {
+                events: vec!["x".repeat(MAX_FRAME_BYTES)],
+            },
+        };
+        assert!(matches!(
+            write_frame(&mut Vec::new(), &request),
+            Err(DaemonError::Protocol(message)) if message.contains("exceeds")
+        ));
     }
 
     #[test]

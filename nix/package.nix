@@ -88,13 +88,13 @@ rustPlatform.buildRustPackage {
   dontWrapGApps = true;
 
   postInstall = ''
-    mkdir -p $out/libexec
-    mv $out/bin/z13helperd $out/libexec/z13helperd
+    mkdir -p "$out/libexec"
+    mv "$out/bin/z13helperd" "$out/libexec/z13helperd"
 
     install -Dm644 contrib/com.ashtonantila.z13helper.desktop \
-      $out/share/applications/com.ashtonantila.z13helper.desktop
+      "$out/share/applications/com.ashtonantila.z13helper.desktop"
     install -Dm644 assets/z13helper.svg \
-      $out/share/icons/hicolor/scalable/apps/z13helper.svg
+      "$out/share/icons/hicolor/scalable/apps/z13helper.svg"
   '';
 
   postFixup = ''

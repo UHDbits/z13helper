@@ -35,8 +35,6 @@ pub enum Register {
     Count = 0x30,
     GlobalMode = 0x31,
     FanSelect = 0x32,
-    RpmLow = 0x33,
-    RpmHigh = 0x34,
     Duty = 0x35,
 }
 
@@ -191,13 +189,6 @@ impl<P: PortIo> EcMailbox<P> {
 
     pub fn set_global_mode(&mut self, enabled: bool) -> Result<(), EcError> {
         self.write(Register::GlobalMode, u8::from(enabled))
-    }
-
-    pub fn rpm(&mut self, fan: u8) -> Result<u16, EcError> {
-        self.write(Register::FanSelect, fan)?;
-        let low = self.read(Register::RpmLow)?;
-        let high = self.read(Register::RpmHigh)?;
-        Ok(u16::from_le_bytes([low, high]))
     }
 
     pub fn set_duty(&mut self, fan: u8, duty: u8) -> Result<(), EcError> {

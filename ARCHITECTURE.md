@@ -31,8 +31,9 @@ flowchart LR
 Only `z13helperd` writes hardware or opens hidraw, input, SMU, or raw I/O;
 the GTK process additionally reads `/sys/class/power_supply` read-only as a
 UPower fallback. The socket is `/run/z13helper/z13helperd.sock`, owned by
-`root:z13helper`. Requests carry a protocol version, stable wire error codes,
-and a command deadline; the daemon enforces a bounded request line size.
+`root:z13helper`. Requests carry a protocol version and stable wire error codes;
+the client and daemon use bounded socket I/O timeouts, and the daemon enforces a
+bounded request line size.
 Complete applies are serialized so the last successful request wins.
 
 ## State ownership
@@ -41,9 +42,10 @@ User-facing profile names and UI preferences live in the fresh schema-version-1
 file `$XDG_CONFIG_HOME/z13helper/config.json`. There are no schema migrations.
 Unknown schema versions are preserved and rejected.
 
-The daemon atomically persists only flattened desired machine state at
-`/var/lib/z13helper/state.json`. On first boot without that file, it observes
-the PPD-selected policy and leaves direct EC mode released. Startup and resume
+The daemon atomically persists the last desired `ApplyRequest` alongside its
+flattened machine state at `/var/lib/z13helper/state.json`. On first boot
+without that file, it observes the PPD-selected policy and leaves direct EC
+mode released. Startup and resume
 restore fan protection before high power, followed by undervolt, the persistent
 battery policy, panel overdrive, and lighting. Around suspend the daemon records
 the pre-sleep power source, reapplies the complete request on resume, and

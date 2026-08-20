@@ -9,7 +9,3 @@ description = "Typed NDJSON client for z13helperd"
 [dependencies]
 serde_json = { workspace = true }
 z13helper-core = { path = "../z13helper-core" }
-
-[[bin]]
-name = "z13helper-smoke"
-path = "src/bin/smoke.rs"

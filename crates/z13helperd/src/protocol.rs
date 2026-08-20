@@ -3,6 +3,8 @@ use z13helper_core::protocol::{Command, PROTOCOL_VERSION, WireRequest, WireRespo
 
 use crate::backend::Backend;
 
+pub const MAX_SUBSCRIPTION_EVENTS: usize = 4;
+
 pub enum Dispatch {
     Reply(Box<WireResponse>),
     Subscribe(Vec<String>),
@@ -26,7 +28,10 @@ pub fn handle_line(backend: &mut Backend, line: &str) -> Dispatch {
         )));
     }
     if let Command::Subscribe { events } = request.command {
-        return Dispatch::Subscribe(events);
+        return match validate_subscription_events(&events) {
+            Ok(()) => Dispatch::Subscribe(events),
+            Err(message) => Dispatch::Reply(Box::new(failure(ErrorCode::Rejected, message))),
+        };
     }
     if let Command::SetControllerCapture { enabled } = request.command {
         return Dispatch::ControllerCapture(enabled);
@@ -35,6 +40,26 @@ pub fn handle_line(backend: &mut Backend, line: &str) -> Dispatch {
         Ok(response) => response,
         Err(error) => from_error(error),
     }))
+}
+
+fn validate_subscription_events(events: &[String]) -> Result<(), String> {
+    if events.is_empty() {
+        return Err("at least one subscription event is required".into());
+    }
+    if events.len() > MAX_SUBSCRIPTION_EVENTS {
+        return Err(format!(
+            "at most {MAX_SUBSCRIPTION_EVENTS} subscription events are allowed"
+        ));
+    }
+    if let Some(event) = events.iter().find(|event| {
+        !matches!(
+            event.as_str(),
+            "state-changed" | "gui-toggle" | "controller-action" | "power-source-changed"
+        )
+    }) {
+        return Err(format!("unknown subscription event {event:?}"));
+    }
+    Ok(())
 }
 
 fn dispatch(backend: &mut Backend, command: Command) -> Result<WireResponse, DaemonError> {
@@ -88,6 +113,21 @@ pub fn failure(code: ErrorCode, message: impl Into<String>) -> WireResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_events_are_known_and_bounded() {
+        assert!(validate_subscription_events(&[]).is_err());
+        assert!(validate_subscription_events(&["state-changed".into()]).is_ok());
+        assert!(validate_subscription_events(&["not-an-event".into()]).is_err());
+        assert!(
+            validate_subscription_events(
+                &(0..=MAX_SUBSCRIPTION_EVENTS)
+                    .map(|_| "state-changed".to_owned())
+                    .collect::<Vec<_>>()
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn malformed_request_returns_protocol_error() {
