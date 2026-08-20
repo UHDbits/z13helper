@@ -1,42 +1,43 @@
 # z13helper
 
-`z13helper` is a self-contained Linux control platform for the ASUS ROG Flow
-Z13 (2025, GZ302EA). It ships a GTK4/libadwaita desktop application, one
-privileged hardware daemon, and a diagnostic CLI. The GTK process never writes
-hardware or opens hidraw, input devices, the SMU, or raw I/O ports; it may read
-`/sys/class/power_supply` read-only as a UPower fallback.
+**G-Helper alternative for the ASUS ROG Flow Z13 (2025 / GZ302) on Linux.**
 
-The shipped components are:
+![z13helper](docs/images/readme-header.webp)
 
-| Component | Purpose |
-|---|---|
-| `z13helper` | Desktop UI and named user profiles |
-| `z13helperd` | Root hardware daemon and sole hardware writer |
-| `z13helperctl` | JSON-friendly diagnostics and scripting CLI |
-| `z13helper-core` | Pure shared domain types, validation, and apply planning |
-| `z13helper-client` | Shared Unix-socket transport for the UI and CLI |
+## AI usage disclaimer
 
-The two libraries compile into the binaries; they are not separate services.
-Keeping them separate prevents transport/I/O concerns from entering the pure,
-unit-tested profile and safety model.
+Parts of this project were written with assistance from AI coding tools. The
+behavior that matters — power limits, fan curves, undervolt, and restore after
+sleep — is still meant to be reviewed, tested, and owned by humans. Treat
+hardware controls as safety-critical: verify changes on your device, keep
+sensible limits, and do not assume generated code is correct by default.
 
-## Configuration boundary
+## About / Features
 
-The configuration starts at schema version 1 and lives at:
+`z13helper` is a lightweight, Rust-based Armoury Crate/G-Helper alternative for the 2025 ROG Flow Z13 running Linux.
 
-```text
-$XDG_CONFIG_HOME/z13helper/config.json
-```
+Some of the features include:
 
-An unsupported schema version at that path is left untouched and reported. A
-corrupt or unparseable file is preserved alongside as `config.json.corrupt` and
-fresh defaults are written at the original path. The application does not
-discover, import, convert, alias, move, or delete data from other paths, and the
-installer manages only current `z13helper` identifiers.
+- **Profiles** — Silent, Balanced, and Turbo built-ins, plus custom profiles
+- **Power** — power-profiles-daemon sync and five-value PPT / TDP limits
+- **Fans** — firmware-based or direct EC curves (similar to the experimental fan control in G-Helper)
+- **Thermals** — per-profile APU temperature limit (up to 99°C)and optional undervolt
+- **Battery** — charge limit (40–100%) and one-time full-charge override
+- **Display** — panel overdrive policy (always on, or plugged-in only)
+- **Lighting** — keyboard and lightbar
+- **Gamescope** — resident overlay with gamepad navigation in Gaming Mode
 
-## Build and install
+## Getting Started / Installation
 
-Rust 1.92+ (edition 2024), GTK 4.14+, and libadwaita 1.5+ are required.
+### Requirements
+
+- ASUS ROG Flow Z13 **GZ302EA** (2025)
+- Linux with systemd
+- Rust **1.92+** (edition 2024)
+- GTK **4.14+**, libadwaita **1.5+**, and `gtk4-layer-shell`
+- Optional: `power-profiles-daemon`, `ryzen_smu` (for undervolt)
+
+### Build and install
 
 ```sh
 make build
@@ -48,40 +49,30 @@ sudo make install-service
 sudo usermod -aG z13helper "$USER"
 ```
 
-`make install-user-service` installs the GUI as a user systemd service bound to
-`graphical-session.target`. It starts hidden so the hardware GUI button can
-open it. The unit optionally loads `%t/gamescope-environment`, allowing the
-resident process to connect to gamescope's Xwayland display when Gaming Mode
-starts. The privileged `z13helperd` service remains separate and must still be
-installed and enabled as root.
+Then log out and back in so group membership takes effect.
 
-Log out and back in after changing group membership. The system service creates
-`/run/z13helper/z13helperd.sock` and stores flattened machine state atomically
-at `/var/lib/z13helper/state.json`.
+| Step | What it does |
+|---|---|
+| `make install` | Installs `z13helper`, `z13helperctl`, desktop entry, and icon under `~/.local` by default |
+| `make install-user-service` | Starts the GUI as a user service (hidden until opened by the hardware button or launcher) |
+| `sudo make install-service` | Installs and enables the privileged `z13helperd` system service |
 
-Optional GTK layer-shell support can be built with:
+After install, launch **z13helper** from your app menu, or run `z13helper`.
+For scripting, try `z13helperctl status` and `z13helperctl probe`.
 
-```sh
-cargo build -p z13helper --features layer-shell
-```
+### Nix
 
-## Nix
-
-A flake provides packages, a development shell, a NixOS module, and a Home
-Manager module.
+A flake provides packages, a dev shell, a NixOS module, and a Home Manager
+module:
 
 ```sh
-nix develop          # Rust ≥1.92, GTK4, libadwaita, libbpf, clippy/rustfmt
-nix build            # release package (GUI, daemon, CLI)
+nix develop
+nix build                 # release package
 nix build .#z13helper-debug
-nix build .#z13helper-layer-shell
 nix flake check
 ```
 
-The package installs `z13helper` and `z13helperctl` under `$out/bin`,
-`z13helperd` under `$out/libexec`, plus the desktop entry and icon.
-
-### NixOS
+NixOS example:
 
 ```nix
 {
@@ -94,11 +85,6 @@ The package installs `z13helper` and `z13helperctl` under `$out/bin`,
         {
           services.z13helperd.enable = true;
           services.z13helperd.users = [ "alice" ];
-          # Optional machine knobs applied via z13helperctl after the daemon starts:
-          # services.z13helperd.settings = {
-          #   batteryLimit = 80;
-          #   lighting.keyboard = { mode = "static"; color = "FF0000"; brightness = 3; };
-          # };
           programs.z13helper.enable = true;
         }
       ];
@@ -107,127 +93,89 @@ The package installs `z13helper` and `z13helperctl` under `$out/bin`,
 }
 ```
 
-### Home Manager
+Home Manager can also own `$XDG_CONFIG_HOME/z13helper/config.json` via
+`programs.z13helper.settings` (see `ARCHITECTURE.md` and `nix/home-manager.nix`).
 
-Declarative user config serializes to schema-v1
-`$XDG_CONFIG_HOME/z13helper/config.json`. When `settings` is set, Home Manager
-owns that file (GUI edits may be overwritten on the next activation).
+## Additional Details
 
-```nix
-{
-  imports = [ inputs.z13helper.homeModules.default ];
-  # Also exported as homeManagerModules.default
+### Components
 
-  programs.z13helper = {
-    enable = true;
-    systemd.enable = true; # optional resident GUI user service
-    settings = {
-      active_profile = "balanced";
-      auto_switch_on_power_source = true;
-      # profiles = [ ... ];  # full schema-v1 profile objects when desired
-    };
-  };
-}
+| Component | Role |
+|---|---|
+| `z13helper` | Desktop UI and named user profiles |
+| `z13helperd` | Root hardware daemon and sole hardware writer |
+| `z13helperctl` | JSON-friendly diagnostics and scripting CLI |
+
+Shared libraries (`z13helper-core`, `z13helper-client`) ship inside those
+binaries; they are not separate services.
+
+### Paths
+
+| Path | Purpose |
+|---|---|
+| `$XDG_CONFIG_HOME/z13helper/config.json` | User profiles and UI preferences (schema v1) |
+| `/run/z13helper/z13helperd.sock` | Daemon socket (`root:z13helper`) |
+| `/var/lib/z13helper/state.json` | Flattened machine state restored across reboot/resume |
+
+Unsupported config schema versions are left untouched. Corrupt files are
+preserved as `config.json.corrupt` and replaced with defaults. The installer
+only manages current `z13helper` identifiers — no predecessor-path discovery
+or unrelated cleanup.
+
+### Safety highlights
+
+- Applies are validated end-to-end and serialized; the last successful request
+  wins.
+- Raising PL1 to **80 W or above** requires fan protection first; if that
+  preparation fails, the power increase is abandoned.
+- At 80 W+, hardware fan endpoints are locked unless you confirm the Advanced
+  override.
+- Undervolt is applied last. On failure, safety fan protection is retained and
+  incomplete rollback is reported as degraded state.
+- There is no temperature-only “panic to 100%” fan override; CPU/firmware
+  throttling stays authoritative.
+
+### Gamescope
+
+When a real gamescope Wayland socket is present and X11 is available, the app
+uses gamescope’s overlay path. The resident UI can stay mapped while hidden,
+open Fans + Power as a separate overlay surface, and accept D-pad / stick / A /
+B navigation while a short capture lease is active. PlayStation and Nintendo
+controllers can also get narrow hidraw suppression for Steam’s process tree
+when BPF LSM support is available.
+
+### CLI quick reference
+
+```text
+z13helperctl status
+z13helperctl probe
+z13helperctl watch [event]
+z13helperctl apply <json-file|->
+z13helperctl ppd <profile|off>
+z13helperctl tdp <pl1> <pl2> <fppt> [apu-sppt platform-sppt]
+z13helperctl undervolt <-40..0|off>
+z13helperctl fans <firmware|direct|off> [curves-json-file]
+z13helperctl lighting <keyboard|lightbar> <off|mode> [color] [brightness]
+z13helperctl battery-limit <40..100>
+z13helperctl battery-charge-once <on|off>
+z13helperctl panel-overdrive <on|off>
+z13helperctl release-fans
 ```
 
-### CI / Cachix / Releases
+### Development
 
-GitHub Actions builds with Nix on push/PR and pushes to the `z13helper` Cachix
-cache when `CACHIX_AUTH_TOKEN` is set. Tag pushes matching `v*` also attach
-x86_64-linux binaries to a GitHub Release.
+```sh
+make build
+make run
+make test
+make lint
+make fmt
+```
 
-Required repository secret:
+Deeper design notes — apply order, fan policy, threading, and packaging —
+live in [`ARCHITECTURE.md`](ARCHITECTURE.md). Agent/contributor constraints are
+in [`AGENTS.md`](AGENTS.md).
 
-- `CACHIX_AUTH_TOKEN` — write token for the `z13helper` Cachix cache
+### License
 
-Create the cache at https://app.cachix.org/ and add the token before relying on
-CI pushes. Pull-through still works for public caches without a token.
-
-## Gamescope
-
-When `GAMESCOPE_WAYLAND_DISPLAY` names a real socket inside
-`XDG_RUNTIME_DIR` and `DISPLAY` is available, z13helper uses gamescope's
-Xwayland overlay path. The resident main surface stays mapped while hidden;
-the app clears input focus before setting its opacity to zero so an invisible
-window cannot consume game input. Opening Fans + Power transfers overlay input
-and visibility to that window, then restores the main window when it closes.
-The Gamescope color chooser is an inline page, and selectors use in-surface
-controls instead of popup surfaces that Gamescope cannot reliably composite.
-
-The main Gamescope drawer starts at 320 logical pixels wide. Gamescope scaling
-is derived from the X11 output width; on the Z13's native 2560-pixel-wide panel
-this is approximately 1.5x. Set
-`Z13HELPER_GAMESCOPE_SCALE` to a positive value to override detection; values
-are clamped to 1.0–3.0 so an accidental setting cannot make the interface
-unusable.
-
-While the Gamescope overlay is visible, `z13helperd` exclusively captures
-connected gamepads: the D-pad and left stick move GTK focus, A activates the
-focused control, and B goes back or closes the active window. Capture is released just after the
-dismiss-button release when the overlay hides. A short renewable lease also
-releases it automatically if the GUI exits unexpectedly, so a crashed overlay
-cannot keep input from a game.
-Touchscreen and touchpad nodes without gamepad buttons are explicitly excluded
-from controller capture.
-
-For PlayStation and Nintendo controllers, the daemon attaches a narrow BPF LSM
-program while the Gamescope overlay capture lease is active. It returns
-`EAGAIN` only for Steam's process tree reading hidraw devices, preventing Steam
-Input from also receiving the same controller presses. The installed system unit
-grants only the required `CAP_BPF` and `CAP_PERFMON` capabilities in addition to
-its existing raw-I/O capability; z13helper never pauses Steam as a fallback. If
-the kernel does not provide BPF LSM support, ordinary evdev capture still works
-and the daemon records that hidraw suppression is unavailable.
-
-## Profiles and safety
-
-Silent, Balanced, and Turbo are fresh version-1 defaults. Named profiles live
-only in the user configuration. PPD is independently selectable when
-power-profiles-daemon is available. On first use, the GUI asks the daemon to
-load each built-in profile's factory CPU and GPU curve tables from firmware;
-the bundled G-Helper-derived curves remain the fallback when that query fails.
-ASUS PPT attributes retain the last values written and have no factory-read
-mode, so untouched profiles restore their measured per-PPD five-value table.
-
-Each apply is validated and serialized by `z13helperd`. PPD selects the firmware
-power policy, after which the daemon applies optional PPT, two eight-point fan
-curves, an 80–99°C per-profile APU thermal limit, and undervolt state in a
-fail-closed order. The thermal limit sets both Strix Halo Tctl (MP1 `0x19`) and
-cHTC (MP1 `0x63`), then verifies the effective Tctl value from the PM table. A PL1
-at 80 W or above is permitted only after fan protection has been prepared; lowering
-power happens before relaxing that protection.
-
-At 80 W and above, the hardware copy locks point 7 to 80°C and at least 80% PWM and
-point 8 to 90°C and 100%. An Advanced override can disable this protection only
-after confirmation. Direct mode samples the native-resolution temperature every
-250 ms, shares that sample with telemetry, and averages recent values before
-interpolating the curve into raw 0–255 EC PWM duty. The per-profile averaging
-window defaults to 6 seconds and can be set from 0–15 seconds; 0 disables it. Its
-per-profile 1–5 speed-up and slow-down hysteresis applies only when temperature
-direction reverses, defaulting to 3/3 like G-Helper. New direct control establishes
-the curve target immediately; later PWM changes ramp up within one second and
-down over roughly 2.5 seconds. RPM is read separately for telemetry.
-There is intentionally no 96°C panic override: CPU and firmware throttling
-remain authoritative.
-
-## CLI
-
-`z13helperctl status` and `z13helperctl probe` print JSON. `watch` streams daemon
-events, while `apply -` accepts a complete apply request on stdin over the v2
-wire protocol.
-Focused commands cover PPD, PPT, fans, undervolt, lighting, battery,
-panel overdrive, and direct-fan release. The CLI never owns named GUI profiles.
-
-The battery slider stores the normal 40–100% charge limit. A separate one-time
-100% override is persisted by `z13helperd`, remains active without the GUI, and
-automatically restores the normal limit when battery telemetry reaches 100%.
-`battery-charge-once on|off` exposes the same toggle to scripts.
-
-The Display section stores panel overdrive as a user policy: either always on,
-or on while plugged in and off on battery. Confirmed power-source transitions
-apply the effective value through `z13helperd`; the GUI never writes the
-firmware attribute directly.
-
-## License
-
-MIT. ASUS and ROG are trademarks of their respective owner.
+MIT. ASUS and ROG are trademarks of their respective owners.
