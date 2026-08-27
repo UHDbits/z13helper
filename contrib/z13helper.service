@@ -6,7 +6,6 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/z13helper
-Environment=GTK_A11Y=none
 Environment=Z13HELPER_START_HIDDEN=1
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # gamescope-session exports DISPLAY, WAYLAND_DISPLAY, and

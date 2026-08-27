@@ -17,7 +17,83 @@ let
   cfg = config.services.z13helperd;
   prog = config.programs.z13helper;
 
-  settingsNonEmpty = cfg.settings != { };
+  lightingDeviceType = types.submodule {
+    options = {
+      enabled = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Whether this Aura device is enabled.";
+      };
+
+      mode = mkOption {
+        type = types.enum [
+          "static"
+          "breathe"
+          "breathing"
+          "cycle"
+          "color-cycle"
+          "rainbow"
+          "strobe"
+          "off"
+        ];
+        default = "static";
+        description = "Supported Aura animation mode.";
+      };
+
+      color = mkOption {
+        type = types.strMatching "^[0-9A-Fa-f]{6}$";
+        default = "FFFFFF";
+        description = "Six hexadecimal RGB digits.";
+      };
+
+      brightness = mkOption {
+        type = types.ints.between 0 3;
+        default = 3;
+        description = "Aura brightness level from 0 through 3.";
+      };
+    };
+  };
+
+  lightingType = types.submodule {
+    options = {
+      keyboard = mkOption {
+        type = types.nullOr lightingDeviceType;
+        default = null;
+      };
+
+      lightbar = mkOption {
+        type = types.nullOr lightingDeviceType;
+        default = null;
+      };
+    };
+  };
+
+  settingsType = types.submodule {
+    options = {
+      batteryLimit = mkOption {
+        type = types.nullOr (types.ints.between 40 100);
+        default = null;
+        description = "Battery charge threshold from 40 through 100 percent.";
+      };
+
+      batteryChargeOnce = mkOption {
+        type = types.nullOr types.bool;
+        default = null;
+      };
+
+      panelOverdrive = mkOption {
+        type = types.nullOr types.bool;
+        default = null;
+      };
+
+      lighting = mkOption {
+        type = types.nullOr lightingType;
+        default = null;
+      };
+    };
+  };
+
+  settingsNonEmpty = cfg.settings != null;
 
   # Render supported daemon knobs as z13helperctl invocations.
   applySettingsScript =
@@ -27,46 +103,42 @@ let
         ctl = quote "${cfg.package}/bin/z13helperctl";
         s = cfg.settings;
         battery =
-          lib.optionalString (s ? batteryLimit)
+          lib.optionalString (s != null && s.batteryLimit != null)
             "${ctl} battery-limit ${toString s.batteryLimit}\n";
         chargeOnce =
-          lib.optionalString (s ? batteryChargeOnce)
+          lib.optionalString (s != null && s.batteryChargeOnce != null)
             "${ctl} battery-charge-once ${if s.batteryChargeOnce then "on" else "off"}\n";
         panel =
-          lib.optionalString (s ? panelOverdrive)
+          lib.optionalString (s != null && s.panelOverdrive != null)
             "${ctl} panel-overdrive ${if s.panelOverdrive then "on" else "off"}\n";
+        renderLighting = device: value:
+          if !value.enabled || value.mode == "off" then
+            "${ctl} lighting ${device} off\n"
+          else
+            "${ctl} lighting ${device} ${quote value.mode} ${quote value.color} ${toString value.brightness}\n";
         lightingKeyboard =
-          if s ? lighting && s.lighting ? keyboard then
-            let
-              k = s.lighting.keyboard;
-            in
-            if k == null || (k ? enabled && !k.enabled) || (k ? mode && k.mode == "off") then
-              "${ctl} lighting keyboard off\n"
-            else
-              "${ctl} lighting keyboard ${quote (k.mode or "static")} ${quote (k.color or "FFFFFF")} ${toString (k.brightness or 3)}\n"
-          else
-            "";
+          lib.optionalString (s != null && s.lighting != null && s.lighting.keyboard != null)
+            (renderLighting "keyboard" s.lighting.keyboard);
         lightingLightbar =
-          if s ? lighting && s.lighting ? lightbar then
-            let
-              k = s.lighting.lightbar;
-            in
-            if k == null || (k ? enabled && !k.enabled) || (k ? mode && k.mode == "off") then
-              "${ctl} lighting lightbar off\n"
-            else
-              "${ctl} lighting lightbar ${quote (k.mode or "static")} ${quote (k.color or "FFFFFF")} ${toString (k.brightness or 3)}\n"
-          else
-            "";
+          lib.optionalString (s != null && s.lighting != null && s.lighting.lightbar != null)
+            (renderLighting "lightbar" s.lighting.lightbar);
       in
       ''
         set -eu
-        # Wait briefly for the daemon socket to appear after z13helperd starts.
+        # Probe the client, not only the socket path, so the daemon is accepting
+        # requests before any declarative setting can reach hardware.
+        ready=0
         for _ in $(seq 1 50); do
-          if [ -S /run/z13helper/z13helperd.sock ]; then
+          if [ -S /run/z13helper/z13helperd.sock ] && ${ctl} status >/dev/null 2>&1; then
+            ready=1
             break
           fi
           sleep 0.1
         done
+        if [ "$ready" -ne 1 ]; then
+          echo "z13helperd socket did not become ready within 5 seconds" >&2
+          exit 1
+        fi
         ${battery}${chargeOnce}${panel}${lightingKeyboard}${lightingLightbar}
       ''
     );
@@ -89,8 +161,8 @@ in
       };
 
       settings = mkOption {
-        type = types.attrs;
-        default = { };
+        type = types.nullOr settingsType;
+        default = null;
         example = {
           batteryLimit = 80;
           batteryChargeOnce = false;
@@ -105,16 +177,17 @@ in
         };
         description = ''
           Optional machine-level settings applied once after `z13helperd`
-          starts via `z13helperctl`. Supported keys:
+          accepts socket requests via `z13helperctl`. Invalid values are
+          rejected during Nix evaluation. Supported keys:
 
           - `batteryLimit` (int 40–100)
           - `batteryChargeOnce` (bool)
           - `panelOverdrive` (bool)
-          - `lighting.keyboard` / `lighting.lightbar` — attrsets with
-            `mode`, `color`, `brightness`, or `mode = "off"` / `enabled = false`
+          - `lighting.keyboard` / `lighting.lightbar` — typed attrsets with
+            `mode`, six-digit `color`, `brightness` 0–3, or `enabled = false`
 
           Profile, PPT, fan, and undervolt configuration belongs in the user
-          `config.json` (see the Home Manager module `programs.z13helper.settings`).
+          `config.json`, which remains application-managed.
         '';
       };
     };
@@ -244,9 +317,31 @@ in
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
+          TimeoutStartSec = "10s";
           ExecStart = "${applySettingsScript}";
-          # Client must reach the group-owned socket.
+          # This unit needs only the same explicit full-control socket
+          # authorization as an interactive client; it never needs root or
+          # direct hardware access.
+          DynamicUser = true;
           SupplementaryGroups = [ "z13helper" ];
+          UMask = "0077";
+          NoNewPrivileges = true;
+          CapabilityBoundingSet = "";
+          PrivateDevices = true;
+          PrivateNetwork = true;
+          PrivateTmp = true;
+          ProtectSystem = "strict";
+          ProtectHome = true;
+          ProtectKernelTunables = true;
+          ProtectKernelModules = true;
+          ProtectKernelLogs = true;
+          ProtectControlGroups = true;
+          RestrictAddressFamilies = [ "AF_UNIX" ];
+          RestrictNamespaces = true;
+          RestrictRealtime = true;
+          RestrictSUIDSGID = true;
+          LockPersonality = true;
+          SystemCallArchitectures = "native";
         };
       };
     })

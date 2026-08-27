@@ -1,14 +1,122 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::curve::Curve;
 use crate::error::WireError;
 use crate::profile::{FanControlMode, Profile, stock_ppt};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// Maximum encoded size, including the terminating newline, of one v3 NDJSON
+/// frame in either direction.
+pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+
+/// A process-scoped, unpredictable client identity used to namespace request
+/// IDs in the daemon's bounded outcome cache. It is serialized as fixed-width
+/// hexadecimal so no JSON-number precision is involved for external tools.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ClientId(u128);
+
+impl ClientId {
+    pub const fn new(value: u128) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    pub const fn get(self) -> u128 {
+        self.0
+    }
+}
+
+impl fmt::Display for ClientId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
+}
+
+impl FromStr for ClientId {
+    type Err = &'static str;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text.len() != 32 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("client ID must be exactly 32 hexadecimal digits");
+        }
+        let value = u128::from_str_radix(text, 16).map_err(|_| "client ID is not hexadecimal")?;
+        Self::new(value).ok_or("client ID must be non-zero")
+    }
+}
+
+impl Serialize for ClientId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// A non-zero identifier for one client request. Request IDs are deliberately
+/// opaque to the daemon; clients may use the same ID when reconnecting to
+/// retrieve an already accepted request outcome.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct RequestId(u64);
+
+impl<'de> Deserialize<'de> for RequestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| serde::de::Error::custom("request ID must be non-zero"))
+    }
+}
+
+impl RequestId {
+    pub const fn new(value: u64) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for RequestId {
+    type Error = &'static str;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::new(value).ok_or("request ID must be non-zero")
+    }
+}
+
+/// Progress and terminal state of an accepted request. A queued request can
+/// expire or lose its peer before hardware starts; started work always reaches
+/// `Completed`, even if its response socket has gone away.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RequestOutcome {
+    Queued,
+    Started,
+    Completed,
+    Expired,
+    Disconnected,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FanHysteresis {
     pub up: u8,
     pub down: u8,
@@ -32,6 +140,7 @@ impl FanHysteresis {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LightingState {
     #[serde(default)]
     pub enabled: bool,
@@ -48,6 +157,7 @@ pub struct LightingState {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct TdpState {
     pub pl1_spl: i32,
     pub pl2_sppt: i32,
@@ -61,8 +171,10 @@ pub struct TdpState {
 /// factory-read operation, so selecting an unmodified profile rewrites this
 /// table explicitly.
 pub fn stock_tdp(ppd_profile: Option<&str>) -> Option<TdpState> {
-    let (pl1_spl, pl2_sppt, fppt) = stock_ppt(ppd_profile);
-    ppd_profile.map(|_| TdpState {
+    let ppd_profile =
+        ppd_profile.filter(|profile| crate::profile::is_known_ppd_profile(profile))?;
+    let (pl1_spl, pl2_sppt, fppt) = stock_ppt(Some(ppd_profile));
+    Some(TdpState {
         pl1_spl: pl1_spl as i32,
         pl2_sppt: pl2_sppt as i32,
         fppt: fppt as i32,
@@ -72,12 +184,14 @@ pub fn stock_tdp(ppd_profile: Option<&str>) -> Option<TdpState> {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct UndervoltState {
     pub cpu_co: i32,
     pub active: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OverrideState {
     pub power: bool,
     pub fans: bool,
@@ -85,6 +199,7 @@ pub struct OverrideState {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Capabilities {
     pub ppd_available: bool,
     pub ppd_profiles: Vec<String>,
@@ -96,12 +211,14 @@ pub struct Capabilities {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Telemetry {
     pub temperature_c: Option<i32>,
     pub fan_rpms: [u32; 2],
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct BatteryTelemetry {
     pub charge_percent: Option<u8>,
     pub status: Option<String>,
@@ -112,6 +229,7 @@ pub struct BatteryTelemetry {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Health {
     pub degraded: bool,
     pub warnings: Vec<String>,
@@ -176,6 +294,46 @@ pub struct DaemonState {
     pub degraded: bool,
 }
 
+/// The protocol-v3 status representation. This is deliberately separate from
+/// [`DaemonState`]: the latter is the schema-v1 persisted snapshot and retains
+/// its historical fields for on-disk compatibility, while this DTO is the
+/// single status contract exposed to clients.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireStatus {
+    pub generation: u64,
+    pub profile: Option<String>,
+    pub overrides: OverrideState,
+    pub ppd_profile: Option<String>,
+    pub devices: BTreeMap<String, LightingState>,
+    pub battery_limit: Option<i32>,
+    pub battery_one_time_charge: bool,
+    pub battery: BatteryTelemetry,
+    pub panel_overdrive: Option<bool>,
+    pub fan_curves: Option<[Curve; 2]>,
+    pub fan_control_mode: FanControlMode,
+    pub tdp: Option<TdpState>,
+    pub undervolt: Option<UndervoltState>,
+    pub cpu_temp_limit: Option<u8>,
+    pub fan_hysteresis: FanHysteresis,
+    pub fan_temperature_average_seconds: u8,
+    pub direct_fan_duties: [u8; 2],
+    pub disable_high_power_fan_protection: bool,
+    pub capabilities: WireCapabilities,
+    pub telemetry: Telemetry,
+    pub health: Health,
+}
+
+/// Capabilities that have an in-tree protocol consumer. Constant hardware
+/// facts and capabilities unused by the UI/CLI are intentionally not exposed.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireCapabilities {
+    pub ppd_profiles: Vec<String>,
+    pub direct_fans: bool,
+    pub undervolt: bool,
+}
+
 impl Default for DaemonState {
     fn default() -> Self {
         Self {
@@ -220,6 +378,7 @@ impl Default for DaemonState {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApplyRequest {
     pub ppd_profile: Option<String>,
     pub power_limits: Option<TdpState>,
@@ -284,6 +443,14 @@ impl ApplyRequest {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(profile) = self.ppd_profile.as_deref()
+            && !crate::profile::is_known_ppd_profile(profile)
+        {
+            return Err(format!("unknown PPD profile {profile:?}"));
+        }
+        if self.fan_mode == FanControlMode::Direct && self.fan_curves.is_none() {
+            return Err("direct fan mode requires complete CPU and GPU curves".into());
+        }
         self.fan_hysteresis.validate()?;
         if self.fan_temperature_average_seconds > MAX_FAN_TEMPERATURE_AVERAGE_SECONDS {
             return Err(format!(
@@ -332,6 +499,7 @@ pub struct ProbeReply {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum Command {
     GetState,
@@ -363,15 +531,84 @@ pub enum Command {
         enabled: bool,
     },
     Subscribe {
-        events: Vec<String>,
+        events: Vec<EventTopic>,
+    },
+    GetOutcome {
+        target_client_id: ClientId,
+        target_request_id: RequestId,
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct WireRequest {
     pub version: u32,
+    pub client_id: ClientId,
+    pub request_id: RequestId,
     #[serde(flatten)]
     pub command: Command,
+}
+
+impl<'de> Deserialize<'de> for WireRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("request envelope must be an object"))?;
+        let command_name = object
+            .get("cmd")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("request command must be a string"))?;
+        let mut allowed = vec!["version", "client_id", "request_id", "cmd"];
+        allowed.extend(match command_name {
+            "get-factory-fan-curves" => ["ppd_profiles"].as_slice(),
+            "apply" => ["request"].as_slice(),
+            "apply-undervolt-once" => ["offset"].as_slice(),
+            "set-battery-limit" => ["limit"].as_slice(),
+            "set-battery-one-time-charge" | "set-panel-overdrive" | "set-controller-capture" => {
+                ["enabled"].as_slice()
+            }
+            "set-lighting" => ["device", "state"].as_slice(),
+            "subscribe" => ["events"].as_slice(),
+            "get-outcome" => ["target_client_id", "target_request_id"].as_slice(),
+            "get-state" | "probe" | "release-fans" => [].as_slice(),
+            _ => [].as_slice(),
+        });
+        if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+            return Err(serde::de::Error::custom(format!(
+                "unknown request field {unknown:?}"
+            )));
+        }
+        let version = object
+            .get("version")
+            .cloned()
+            .ok_or_else(|| serde::de::Error::custom("missing request version"))
+            .and_then(|value| serde_json::from_value(value).map_err(serde::de::Error::custom))?;
+        let client_id = object
+            .get("client_id")
+            .cloned()
+            .ok_or_else(|| serde::de::Error::custom("missing client ID"))
+            .and_then(|value| serde_json::from_value(value).map_err(serde::de::Error::custom))?;
+        let request_id = object
+            .get("request_id")
+            .cloned()
+            .ok_or_else(|| serde::de::Error::custom("missing request ID"))
+            .and_then(|value| serde_json::from_value(value).map_err(serde::de::Error::custom))?;
+        let mut command_object = object.clone();
+        command_object.remove("version");
+        command_object.remove("client_id");
+        command_object.remove("request_id");
+        let command = serde_json::from_value(serde_json::Value::Object(command_object))
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            version,
+            client_id,
+            request_id,
+            command,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -392,6 +629,13 @@ pub enum DaemonEventKind {
 }
 
 impl DaemonEventKind {
+    pub const ALL: [Self; 4] = [
+        Self::StateChanged,
+        Self::GuiToggle,
+        Self::ControllerAction,
+        Self::PowerSourceChanged,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::StateChanged => "state-changed",
@@ -400,7 +644,15 @@ impl DaemonEventKind {
             Self::PowerSourceChanged => "power-source-changed",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == value)
+    }
 }
+
+/// The event topics accepted by the subscription command. This alias keeps
+/// the wire-facing event name while making daemon subscriptions typed.
+pub type EventTopic = DaemonEventKind;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -419,16 +671,27 @@ pub struct DaemonEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<ControllerAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_battery: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WireResponse {
+    pub version: u32,
+    /// The response correlation ID. It is absent only for a malformed frame
+    /// that did not contain a valid request envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<RequestId>,
+    pub outcome: RequestOutcome,
+    /// Set only by a GetOutcome response; regular responses describe their own
+    /// request identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_client_id: Option<ClientId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_request_id: Option<RequestId>,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state: Option<DaemonState>,
+    pub state: Option<WireStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apply: Option<ApplyResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -442,8 +705,30 @@ pub struct WireResponse {
 }
 
 impl WireResponse {
-    pub fn success() -> Self {
+    pub fn success(request_id: RequestId) -> Self {
         Self {
+            version: PROTOCOL_VERSION,
+            request_id: Some(request_id),
+            outcome: RequestOutcome::Completed,
+            outcome_client_id: None,
+            outcome_request_id: None,
+            ok: true,
+            state: None,
+            apply: None,
+            probe: None,
+            factory_fan_curves: None,
+            event: None,
+            error: None,
+        }
+    }
+
+    pub fn progress(request_id: RequestId, outcome: RequestOutcome) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            request_id: Some(request_id),
+            outcome,
+            outcome_client_id: None,
+            outcome_request_id: None,
             ok: true,
             state: None,
             apply: None,
@@ -493,17 +778,33 @@ mod tests {
     fn request_roundtrip_is_versioned() {
         let request = WireRequest {
             version: PROTOCOL_VERSION,
+            client_id: ClientId::new(1).unwrap(),
+            request_id: RequestId::new(1).unwrap(),
             command: Command::GetState,
         };
         let text = serde_json::to_string(&request).unwrap();
-        assert!(text.contains("\"version\":2"));
+        assert!(text.contains("\"version\":3"));
+        assert!(text.contains("\"request_id\":1"));
         assert!(text.contains("\"cmd\":\"get-state\""));
+    }
+
+    #[test]
+    fn frame_limit_is_one_shared_v3_boundary() {
+        assert_eq!(MAX_FRAME_BYTES, 64 * 1024);
+        assert_eq!(DaemonEventKind::ALL.len(), 4);
+        assert_eq!(
+            DaemonEventKind::parse("state-changed"),
+            Some(DaemonEventKind::StateChanged)
+        );
+        assert_eq!(DaemonEventKind::parse("unknown"), None);
     }
 
     #[test]
     fn controller_capture_and_action_roundtrip() {
         let request = WireRequest {
             version: PROTOCOL_VERSION,
+            client_id: ClientId::new(1).unwrap(),
+            request_id: RequestId::new(2).unwrap(),
             command: Command::SetControllerCapture { enabled: true },
         };
         let text = serde_json::to_string(&request).unwrap();
@@ -511,7 +812,6 @@ mod tests {
         let event = DaemonEvent {
             kind: DaemonEventKind::ControllerAction,
             action: Some(ControllerAction::Accept),
-            generation: None,
             on_battery: None,
         };
         assert_eq!(
@@ -525,7 +825,6 @@ mod tests {
         let event = DaemonEvent {
             kind: DaemonEventKind::PowerSourceChanged,
             action: None,
-            generation: None,
             on_battery: Some(true),
         };
         let decoded: DaemonEvent = serde_json::from_str(&serde_json::to_string(&event).unwrap())
@@ -538,6 +837,8 @@ mod tests {
     fn one_time_charge_command_roundtrips() {
         let request = WireRequest {
             version: PROTOCOL_VERSION,
+            client_id: ClientId::new(1).unwrap(),
+            request_id: RequestId::new(3).unwrap(),
             command: Command::SetBatteryOneTimeCharge { enabled: true },
         };
         let text = serde_json::to_string(&request).unwrap();
@@ -554,6 +855,8 @@ mod tests {
     fn factory_fan_curve_command_roundtrips() {
         let request = WireRequest {
             version: PROTOCOL_VERSION,
+            client_id: ClientId::new(1).unwrap(),
+            request_id: RequestId::new(4).unwrap(),
             command: Command::GetFactoryFanCurves {
                 ppd_profiles: vec!["power-saver".into(), "balanced".into()],
             },
@@ -571,6 +874,8 @@ mod tests {
     fn one_shot_undervolt_command_roundtrips() {
         let request = WireRequest {
             version: PROTOCOL_VERSION,
+            client_id: ClientId::new(1).unwrap(),
+            request_id: RequestId::new(5).unwrap(),
             command: Command::ApplyUndervoltOnce { offset: -20 },
         };
         let text = serde_json::to_string(&request).unwrap();
@@ -580,6 +885,93 @@ mod tests {
             decoded.command,
             Command::ApplyUndervoltOnce { offset: -20 }
         ));
+    }
+
+    #[test]
+    fn v3_request_golden_is_strict_and_correlated() {
+        let request: WireRequest =
+            serde_json::from_str(r#"{"version":3,"client_id":"00000000000000000000000000000001","request_id":42,"cmd":"get-state"}"#).unwrap();
+        assert_eq!(request.client_id, ClientId::new(1).unwrap());
+        assert_eq!(request.request_id.get(), 42);
+        assert!(matches!(request.command, Command::GetState));
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"version":3,"client_id":"00000000000000000000000000000001","request_id":42,"cmd":"get-state"}"#
+        );
+    }
+
+    #[test]
+    fn client_identity_is_fixed_width_nonzero_hex() {
+        let client_id = ClientId::new(0xabu128).unwrap();
+        assert_eq!(
+            serde_json::to_string(&client_id).unwrap(),
+            r#""000000000000000000000000000000ab""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ClientId>(r#""000000000000000000000000000000AB""#).unwrap(),
+            client_id
+        );
+        for invalid in [
+            r#""00000000000000000000000000000000""#,
+            r#""1""#,
+            r#""gggggggggggggggggggggggggggggggg""#,
+            "1",
+        ] {
+            assert!(serde_json::from_str::<ClientId>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn zero_and_unknown_request_fields_are_rejected() {
+        assert!(
+            serde_json::from_str::<WireRequest>(
+                r#"{"version":3,"client_id":"00000000000000000000000000000001","request_id":0,"cmd":"get-state"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<WireRequest>(
+                r#"{"version":3,"client_id":"00000000000000000000000000000001","request_id":1,"cmd":"get-state","future":true}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<WireRequest>(
+                r#"{"version":3,"client_id":"00000000000000000000000000000001","request_id":2,"cmd":"set-lighting","device":"keyboard","state":{"enabled":false,"future":true}}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<WireRequest>(
+                r#"{"version":3,"client_id":"00000000000000000000000000000001","request_id":3,"cmd":"apply","request":{"ppd_profile":null,"power_limits":null,"fan_mode":"firmware","fan_curves":null,"undervolt":null,"future":true}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn outcome_response_golden_is_versioned() {
+        let response = WireResponse::progress(RequestId::new(42).unwrap(), RequestOutcome::Started);
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"version":3,"request_id":42,"outcome":"started","ok":true}"#
+        );
+    }
+
+    #[test]
+    fn unknown_response_fields_and_outcomes_are_rejected() {
+        assert!(
+            serde_json::from_str::<WireResponse>(
+                r#"{"version":3,"request_id":1,"outcome":"future","ok":true}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<WireResponse>(
+                r#"{"version":3,"request_id":1,"outcome":"completed","ok":true,"future":true}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -599,6 +991,26 @@ mod tests {
         let mut request = request;
         request.cpu_temp_limit = 79;
         assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn unknown_ppd_profile_has_no_stock_table_and_is_rejected() {
+        assert!(stock_tdp(Some("future-mode")).is_none());
+        let mut request =
+            ApplyRequest::from_profile(&Profile::builtin("balanced", "Balanced"), false);
+        request.ppd_profile = Some("future-mode".into());
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn direct_fan_mode_requires_curves() {
+        let mut request =
+            ApplyRequest::from_profile(&Profile::builtin("balanced", "Balanced"), false);
+        request.fan_mode = FanControlMode::Direct;
+        request.fan_curves = None;
+        assert!(request.validate().is_err());
+        request.fan_curves = Some(crate::profile::stock_fan_curves(Some("balanced")));
+        assert!(request.validate().is_ok());
     }
 
     #[test]

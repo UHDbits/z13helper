@@ -1,7 +1,9 @@
 pub mod aura;
 pub mod backend;
 pub mod curve;
+pub mod direct_runtime;
 pub mod ec;
+pub mod executor;
 pub mod hidraw;
 pub mod input;
 pub mod protocol;

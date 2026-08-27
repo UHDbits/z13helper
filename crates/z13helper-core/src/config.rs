@@ -4,9 +4,12 @@
 //! `~/.config/z13helper/config.json`). Writes are atomic (temp + rename),
 //! keep a `.bak`, and intentionally implement no schema migrations.
 
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +17,7 @@ use thiserror::Error;
 use crate::profile::Profile;
 
 pub const CONFIG_VERSION: u32 = 1;
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -70,6 +74,229 @@ pub fn builtin_profiles() -> Vec<Profile> {
     ]
 }
 
+static SIBLING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailurePoint {
+    Write,
+    FileSync,
+    Rename,
+    ParentSync,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAILURE_POINT: std::cell::Cell<Option<FailurePoint>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn take_failure(point: FailurePoint) -> bool {
+    FAILURE_POINT.with(|slot| {
+        if slot.get() == Some(point) {
+            slot.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+struct FailureGuard;
+
+#[cfg(test)]
+impl Drop for FailureGuard {
+    fn drop(&mut self) {
+        FAILURE_POINT.with(|slot| slot.set(None));
+    }
+}
+
+#[cfg(test)]
+fn fail_once_at(point: FailurePoint) -> FailureGuard {
+    FAILURE_POINT.with(|slot| slot.set(Some(point)));
+    FailureGuard
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn open_regular(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        // Avoid blocking on a FIFO if another same-UID process swaps the
+        // pathname before metadata can reject the non-regular file.
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
+    let file = open_regular(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config {} exceeds {MAX_CONFIG_BYTES} bytes", path.display()),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config {} exceeds {MAX_CONFIG_BYTES} bytes", path.display()),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn write_all(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    if take_failure(FailurePoint::Write) {
+        return Err(io::Error::other("injected config write failure"));
+    }
+    file.write_all(bytes)
+}
+
+fn sync_file(file: &File) -> io::Result<()> {
+    #[cfg(test)]
+    if take_failure(FailurePoint::FileSync) {
+        return Err(io::Error::other("injected config file sync failure"));
+    }
+    file.sync_all()
+}
+
+fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if take_failure(FailurePoint::Rename) {
+        return Err(io::Error::other("injected config rename failure"));
+    }
+    fs::rename(from, to)
+}
+
+fn sibling_candidate(base: &Path, suffix: u64) -> io::Result<PathBuf> {
+    let name = base.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} has no file name", base.display()),
+        )
+    })?;
+    let name = name.to_string_lossy();
+    let candidate = if suffix == 0 {
+        name.into_owned()
+    } else {
+        format!("{name}.{suffix}")
+    };
+    Ok(base.with_file_name(candidate))
+}
+
+fn create_unique_sibling(base: &Path) -> io::Result<(PathBuf, File)> {
+    for suffix in 0..10_000_u64 {
+        let candidate = sibling_candidate(base, suffix)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&candidate);
+        match file {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no available sibling name for {}", base.display()),
+    ))
+}
+
+fn backup_destination(base: &Path) -> io::Result<PathBuf> {
+    for suffix in 0..10_000_u64 {
+        let candidate = sibling_candidate(base, suffix)?;
+        match fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => return Ok(candidate),
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("no safe backup name for {}", base.display()),
+    ))
+}
+
+fn write_unique_sibling(base: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    let (candidate, mut file) = create_unique_sibling(base)?;
+    let result = (|| {
+        write_all(&mut file, bytes)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        sync_file(&file)
+    })();
+    drop(file);
+    // Do not unlink by pathname after failure: a concurrent writer could have
+    // replaced that name before cleanup, turning cleanup into data loss.
+    result?;
+    Ok(candidate)
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if take_failure(FailurePoint::ParentSync) {
+        return Err(io::Error::other("injected config parent sync failure"));
+    }
+    File::open(parent_dir(path))?.sync_all()
+}
+
+fn temp_base(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config".into());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = SIBLING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        ".{name}.{}-{now}-{sequence}.tmp",
+        std::process::id()
+    ))
+}
+
+fn reject_unexpected_config_path(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("config path {} is a symlink", path.display()),
+        )),
+        Ok(metadata) if !metadata.is_file() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("config path {} is not a regular file", path.display()),
+        )),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 impl Config {
     /// Default config path under XDG_CONFIG_HOME.
     pub fn default_path() -> PathBuf {
@@ -85,25 +312,23 @@ impl Config {
     }
 
     pub fn load_or_default(path: &Path) -> Result<Self, ConfigError> {
-        if !path.exists() {
+        if !reject_unexpected_config_path(path)? {
             let cfg = Self::default();
             cfg.save(path)?;
             return Ok(cfg);
         }
-        match Self::load(path) {
+        let bytes = read_regular(path)?;
+        match Self::parse_bytes(&bytes) {
             Ok(cfg) => Ok(cfg),
             Err(ConfigError::Json(_)) => {
                 // Syntax corruption: preserve the original before replacing it.
-                let corrupt = path.with_extension("json.corrupt");
-                if corrupt.exists() {
-                    return Err(ConfigError::Preservation(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!("{} already exists", corrupt.display()),
-                    )));
-                }
-                if let Err(error) = fs::rename(path, &corrupt) {
-                    return Err(ConfigError::Preservation(error));
-                }
+                let corrupt_base = path.with_extension("json.corrupt");
+                let _corrupt = write_unique_sibling(&corrupt_base, &bytes)
+                    .and_then(|corrupt| {
+                        sync_parent(path)?;
+                        Ok(corrupt)
+                    })
+                    .map_err(ConfigError::Preservation)?;
                 let cfg = Self::default();
                 cfg.save(path)?;
                 Ok(cfg)
@@ -113,8 +338,12 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = fs::read_to_string(path)?;
-        let value: serde_json::Value = serde_json::from_str(&text)?;
+        let bytes = read_regular(path)?;
+        Self::parse_bytes(&bytes)
+    }
+
+    fn parse_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)?;
         let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         if version != CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion(version));
@@ -127,23 +356,38 @@ impl Config {
 
     /// Atomic write via temp-file + rename, with `.bak` of the previous file.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         self.validate()?;
-        if path.exists() {
-            let bak = path.with_extension("json.bak");
-            fs::copy(path, &bak)?;
+        let parent = parent_dir(path);
+        fs::create_dir_all(parent)?;
+        let had_existing = reject_unexpected_config_path(path)?;
+        if had_existing {
+            let current = read_regular(path)?;
+            let backup_base = path.with_extension("json.bak");
+            let backup_destination = backup_destination(&backup_base)?;
+            let backup_temporary = write_unique_sibling(&temp_base(&backup_destination), &current)?;
+            // Atomic replacement does not follow an attacker-selected
+            // destination symlink and rotates one safe backup slot.
+            rename(&backup_temporary, &backup_destination)?;
+            sync_parent(path)?;
         }
-        let tmp = path.with_extension("json.tmp");
-        {
-            let mut f = fs::File::create(&tmp)?;
-            let text = serde_json::to_string_pretty(self)?;
-            f.write_all(text.as_bytes())?;
-            f.write_all(b"\n")?;
-            f.sync_all()?;
+        let mut bytes = serde_json::to_vec_pretty(self)?;
+        bytes.push(b'\n');
+        let (temporary, mut file) = create_unique_sibling(&temp_base(path))?;
+        let result = (|| {
+            write_all(&mut file, &bytes)?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            sync_file(&file)
+        })();
+        drop(file);
+        // Failed unique candidates are intentionally left for diagnostics; a
+        // pathname unlink here would have a TOCTOU deletion race.
+        if let Err(error) = result {
+            return Err(ConfigError::Io(error));
         }
-        fs::rename(&tmp, path)?;
+        if let Err(error) = rename(&temporary, path) {
+            return Err(ConfigError::Io(error));
+        }
+        sync_parent(path)?;
         Ok(())
     }
 
@@ -284,7 +528,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("z13helper-cfg-{name}-{nanos}.json"))
+        let directory = std::env::temp_dir().join(format!(
+            "z13helper-cfg-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        directory.join("config.json")
     }
 
     #[test]
@@ -321,6 +570,10 @@ mod tests {
         cfg.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.active_profile, "turbo");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = fs::remove_file(&path);
     }
 
@@ -335,6 +588,14 @@ mod tests {
         };
         cfg2.save(&path).unwrap();
         assert!(path.with_extension("json.bak").exists());
+        assert_eq!(
+            fs::metadata(path.with_extension("json.bak"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("json.bak"));
     }
@@ -346,23 +607,40 @@ mod tests {
         let cfg = Config::load_or_default(&path).unwrap();
         assert_eq!(cfg.profiles.len(), 3);
         assert!(path.with_extension("json.corrupt").exists());
+        assert_eq!(
+            fs::metadata(path.with_extension("json.corrupt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("json.corrupt"));
     }
 
     #[test]
-    fn failed_corrupt_preservation_does_not_overwrite_config() {
+    fn corrupt_preservation_skips_existing_sibling_without_overwriting_bytes() {
         let path = tmp_path("corrupt-preservation-failure");
         let original = b"{not json!!!";
         fs::write(&path, original).unwrap();
-        fs::create_dir(path.with_extension("json.corrupt")).unwrap();
-        assert!(matches!(
-            Config::load_or_default(&path),
-            Err(ConfigError::Preservation(_))
-        ));
-        assert_eq!(fs::read(&path).unwrap(), original);
-        let _ = fs::remove_dir(path.with_extension("json.corrupt"));
-        let _ = fs::remove_file(path);
+        let existing = path.with_extension("json.corrupt");
+        fs::write(&existing, b"keep this old sample").unwrap();
+        Config::load_or_default(&path).unwrap();
+        assert_eq!(fs::read(existing).unwrap(), b"keep this old sample");
+        assert_eq!(
+            fs::read(path.with_extension("json.corrupt.1")).unwrap(),
+            original
+        );
+        assert_eq!(
+            fs::metadata(path.with_extension("json.corrupt.1"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(Config::load(&path).is_ok());
     }
 
     #[test]
@@ -453,5 +731,182 @@ mod tests {
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn fixed_temp_collision_is_not_reused_or_overwritten() {
+        let path = tmp_path("temp-collision");
+        let stale = path.with_extension("json.tmp");
+        fs::write(&stale, b"keep me").unwrap();
+        Config::default().save(&path).unwrap();
+        assert_eq!(fs::read(stale).unwrap(), b"keep me");
+        assert!(Config::load(&path).is_ok());
+    }
+
+    #[test]
+    fn backup_rotates_the_latest_previous_byte_sequence() {
+        let path = tmp_path("backup-collision");
+        let first = Config::default();
+        let second = Config {
+            active_profile: "silent".into(),
+            ..Config::default()
+        };
+        let third = Config {
+            active_profile: "turbo".into(),
+            ..Config::default()
+        };
+        first.save(&path).unwrap();
+        second.save(&path).unwrap();
+        let second_bytes = fs::read(&path).unwrap();
+        third.save(&path).unwrap();
+        assert_eq!(
+            fs::read(path.with_extension("json.bak")).unwrap(),
+            second_bytes
+        );
+        assert_eq!(
+            fs::metadata(path.with_extension("json.bak"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(!path.with_extension("json.bak.1").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_symlinks_are_rejected_without_following_or_replacing_them() {
+        let path = tmp_path("symlink");
+        let target = path.with_file_name("target.json");
+        fs::write(&target, b"target bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(matches!(Config::load(&path), Err(ConfigError::Io(_))));
+        assert!(matches!(
+            Config::default().save(&path),
+            Err(ConfigError::Io(_))
+        ));
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(target).unwrap(), b"target bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_fifo_is_rejected_without_blocking_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = tmp_path("fifo");
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path_c is a valid NUL-terminated path and mkfifo does not
+        // retain the pointer after returning.
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        assert!(matches!(Config::load(&path), Err(ConfigError::Io(_))));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_symlink_is_not_followed_or_overwritten() {
+        let path = tmp_path("backup-symlink");
+        Config::default().save(&path).unwrap();
+        let target = path.with_file_name("backup-target");
+        let backup = path.with_extension("json.bak");
+        fs::write(&target, b"backup target bytes").unwrap();
+        std::os::unix::fs::symlink(&target, &backup).unwrap();
+        Config {
+            active_profile: "silent".into(),
+            ..Config::default()
+        }
+        .save(&path)
+        .unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"backup target bytes");
+        assert!(backup.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(path.with_extension("json.bak.1").exists());
+    }
+
+    fn temp_files(path: &Path) -> Vec<PathBuf> {
+        let prefix = format!(".{}.", path.file_name().unwrap().to_string_lossy());
+        fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn save_failure_points_are_atomic_and_leave_private_temp_on_pre_rename_failure() {
+        for point in [
+            FailurePoint::Write,
+            FailurePoint::FileSync,
+            FailurePoint::Rename,
+            FailurePoint::ParentSync,
+        ] {
+            let path = tmp_path(&format!("fault-{point:?}"));
+            let replacement = Config {
+                active_profile: "turbo".into(),
+                ..Config::default()
+            };
+            let _failure = fail_once_at(point);
+            assert!(replacement.save(&path).is_err());
+
+            match point {
+                FailurePoint::ParentSync => {
+                    assert_eq!(Config::load(&path).unwrap(), replacement);
+                }
+                _ => assert!(!path.exists()),
+            }
+
+            let temporary = temp_files(&path);
+            if point == FailurePoint::ParentSync {
+                assert!(temporary.is_empty());
+            } else {
+                assert_eq!(temporary.len(), 1, "failure point {point:?}");
+                assert_eq!(
+                    fs::metadata(&temporary[0]).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_config_is_rejected_before_deserialization() {
+        let path = tmp_path("oversized");
+        fs::write(&path, vec![b' '; MAX_CONFIG_BYTES as usize + 1]).unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(ConfigError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn concurrent_config_writers_only_publish_complete_configs() {
+        let path = tmp_path("concurrent");
+        Config::default().save(&path).unwrap();
+        let mut writers = Vec::new();
+        for active_profile in ["silent", "balanced", "turbo", "silent", "turbo"] {
+            let path = path.clone();
+            let active_profile = active_profile.to_owned();
+            writers.push(std::thread::spawn(move || {
+                Config {
+                    active_profile,
+                    ..Config::default()
+                }
+                .save(&path)
+            }));
+        }
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let loaded = Config::load(&path).unwrap();
+        assert!(matches!(
+            loaded.active_profile.as_str(),
+            "silent" | "balanced" | "turbo"
+        ));
     }
 }

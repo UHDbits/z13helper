@@ -6,8 +6,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 use z13helper_core::{ControllerAction, DaemonEventKind};
 
@@ -28,6 +28,9 @@ const BTN_DPAD_RIGHT: u16 = 547;
 const STEAM_VENDOR: u16 = 0x28de;
 const STEAM_VIRTUAL_GAMEPAD: u16 = 0x11ff;
 const EVIOCGRAB: libc::c_ulong = 0x4004_4590;
+// EVIOCGABS(axis) is _IOR('E', 0x40 + axis, struct input_absinfo). The
+// struct is six i32 values on every Linux ABI supported by this daemon.
+const EVIOCGABS_BASE: libc::c_ulong = 0x8018_4540;
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const REPEAT_INITIAL: Duration = Duration::from_millis(400);
 const REPEAT_INTERVAL: Duration = Duration::from_millis(120);
@@ -35,6 +38,9 @@ const REPEAT_INTERVAL: Duration = Duration::from_millis(120);
 const STICK_ENGAGE: i32 = 13107;
 /// ~25% of signed 16-bit stick range; release with hysteresis below engage.
 const STICK_RELEASE: i32 = 8192;
+const CAPTURE_COMMAND: u8 = 0x01;
+const CAPTURE_STATUS: u8 = 0x02;
+const CAPTURE_PACKET_BYTES: usize = 15;
 
 const GAMEPAD_BUTTONS: &[usize] = &[
     304, 305, 307, 308, 310, 311, 312, 313, 314, 315, 316, 317, 318, 319,
@@ -54,7 +60,7 @@ fn find_button_device() -> Option<PathBuf> {
 }
 
 pub fn spawn_button_watcher(
-    sender: Sender<DaemonEventKind>,
+    sender: SyncSender<DaemonEventKind>,
     terminate: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -112,6 +118,68 @@ struct StickState {
     direction: Option<ControllerAction>,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct InputAbsInfo {
+    value: i32,
+    minimum: i32,
+    maximum: i32,
+    fuzz: i32,
+    flat: i32,
+    resolution: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AxisRange {
+    minimum: i32,
+    maximum: i32,
+}
+
+impl AxisRange {
+    fn new(minimum: i32, maximum: i32) -> Option<Self> {
+        (minimum < maximum).then_some(Self { minimum, maximum })
+    }
+
+    /// Normalize a reported ABS value to the signed stick domain used by the
+    /// dead-zone logic. The midpoint is zero even for asymmetric ranges and
+    /// values outside the ioctl-reported range are harmlessly clamped.
+    fn normalize(self, value: i32) -> i32 {
+        let minimum = i64::from(self.minimum);
+        let maximum = i64::from(self.maximum);
+        let value = i64::from(value).clamp(minimum, maximum);
+        let midpoint = minimum + (maximum - minimum) / 2;
+        if value <= midpoint {
+            let span = midpoint - minimum;
+            if span == 0 {
+                return 0;
+            }
+            (-32_768_i64 + (value - minimum) * 32_768 / span) as i32
+        } else {
+            let span = maximum - midpoint;
+            if span == 0 {
+                return 0;
+            }
+            ((value - midpoint) * 32_767 / span) as i32
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct StickCalibration {
+    x: Option<AxisRange>,
+    y: Option<AxisRange>,
+}
+
+impl StickCalibration {
+    fn normalize_x(self, value: i32) -> i32 {
+        self.x.map_or(0, |range| range.normalize(value))
+    }
+
+    fn normalize_y(self, value: i32) -> i32 {
+        self.y.map_or(0, |range| range.normalize(value))
+    }
+}
+
 struct ControllerDevice {
     path: PathBuf,
     file: File,
@@ -119,24 +187,121 @@ struct ControllerDevice {
     grabbed: bool,
     held: HashMap<ControllerAction, Instant>,
     stick: StickState,
+    calibration: StickCalibration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CaptureStatus {
+    Captured {
+        sequence: u64,
+        grabbed: usize,
+        total: usize,
+    },
+    Released {
+        sequence: u64,
+        grabbed: usize,
+        total: usize,
+    },
+    PartialGrab {
+        sequence: u64,
+        requested: bool,
+        grabbed: usize,
+        total: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CaptureCommand {
+    sequence: u64,
+    enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GrabSummary {
+    grabbed: usize,
+    total: usize,
+}
+
+trait GrabDevice {
+    fn is_grabbed(&self) -> bool;
+    fn try_set_grabbed(&mut self, grabbed: bool) -> bool;
+}
+
+impl GrabDevice for ControllerDevice {
+    fn is_grabbed(&self) -> bool {
+        self.grabbed
+    }
+
+    fn try_set_grabbed(&mut self, grabbed: bool) -> bool {
+        set_grabbed(self, grabbed)
+    }
+}
+
+fn reconcile_grabs<D: GrabDevice>(devices: &mut [D], requested: bool) -> GrabSummary {
+    for device in devices.iter_mut() {
+        if device.is_grabbed() != requested {
+            device.try_set_grabbed(requested);
+        }
+    }
+    GrabSummary {
+        grabbed: devices.iter().filter(|device| device.is_grabbed()).count(),
+        total: devices.len(),
+    }
+}
+
+fn capture_status(sequence: u64, requested: bool, summary: GrabSummary) -> CaptureStatus {
+    if requested && summary.total > 0 && summary.grabbed == summary.total {
+        CaptureStatus::Captured {
+            sequence,
+            grabbed: summary.grabbed,
+            total: summary.total,
+        }
+    } else if !requested && summary.grabbed == 0 {
+        CaptureStatus::Released {
+            sequence,
+            grabbed: summary.grabbed,
+            total: summary.total,
+        }
+    } else {
+        CaptureStatus::PartialGrab {
+            sequence,
+            requested,
+            grabbed: summary.grabbed,
+            total: summary.total,
+        }
+    }
 }
 
 pub struct ControllerCaptureHandle {
     control: UnixDatagram,
     thread: Option<std::thread::JoinHandle<()>>,
+    next_sequence: AtomicU64,
 }
 
 impl ControllerCaptureHandle {
-    pub fn set_enabled(&self, enabled: bool) -> io::Result<()> {
-        self.control.send(&[u8::from(enabled)]).map(|_| ())?;
-        let mut acknowledgement = [0_u8; 1];
-        self.control.recv(&mut acknowledgement)?;
-        if acknowledgement[0] == 0x81 {
-            Ok(())
-        } else {
-            Err(io::Error::other(
-                "controller capture request was not acknowledged",
-            ))
+    pub fn request_capture(&self, enabled: bool) -> io::Result<u64> {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut packet = [0_u8; 10];
+        packet[0] = CAPTURE_COMMAND;
+        packet[1..9].copy_from_slice(&sequence.to_le_bytes());
+        packet[9] = u8::from(enabled);
+        self.control.send(&packet)?;
+        Ok(sequence)
+    }
+
+    pub fn poll_status(&self) -> io::Result<Option<CaptureStatus>> {
+        let mut packet = [0_u8; CAPTURE_PACKET_BYTES];
+        loop {
+            match self.control.recv(&mut packet) {
+                Ok(count) => {
+                    if let Some(status) = decode_capture_status(&packet[..count]) {
+                        return Ok(Some(status));
+                    }
+                    tracing::warn!("discarding malformed controller capture status");
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -153,33 +318,51 @@ impl ControllerCaptureHandle {
 /// `capture` is a short-lived lease maintained by the GUI, so a crashed GUI
 /// cannot leave controllers exclusively grabbed from games.
 pub fn spawn_controller_watcher(
-    sender: Sender<ControllerAction>,
+    sender: SyncSender<ControllerAction>,
     terminate: Arc<AtomicBool>,
 ) -> io::Result<ControllerCaptureHandle> {
     let (control, receiver) = UnixDatagram::pair()?;
     control.set_nonblocking(true)?;
     receiver.set_nonblocking(true)?;
-    control.set_nonblocking(false)?;
-    control.set_read_timeout(Some(Duration::from_secs(2)))?;
     let thread = std::thread::spawn(move || controller_loop(sender, receiver, terminate));
     Ok(ControllerCaptureHandle {
         control,
         thread: Some(thread),
+        next_sequence: AtomicU64::new(0),
     })
 }
 
 fn controller_loop(
-    sender: Sender<ControllerAction>,
+    sender: SyncSender<ControllerAction>,
     control: UnixDatagram,
     terminate: Arc<AtomicBool>,
 ) {
     let mut devices = Vec::<ControllerDevice>::new();
     let mut last_scan = Instant::now() - SCAN_INTERVAL;
     let mut capturing = false;
+    let mut capture_sequence = 0;
+    let mut reported = None::<(u64, bool, GrabSummary)>;
 
     while !terminate.load(Ordering::Relaxed) {
         if last_scan.elapsed() >= SCAN_INTERVAL {
-            scan_controllers(&mut devices, capturing);
+            scan_controllers(&mut devices);
+            if capturing {
+                for device in &mut devices {
+                    if !device.grabbed {
+                        drain_device(device);
+                    }
+                }
+            }
+            let summary = reconcile_grabs(&mut devices, capturing);
+            let report = (capture_sequence, capturing, summary);
+            if reported != Some(report)
+                && send_capture_status(
+                    &control,
+                    capture_status(capture_sequence, capturing, summary),
+                )
+            {
+                reported = Some(report);
+            }
             last_scan = Instant::now();
         }
 
@@ -214,22 +397,25 @@ fn controller_loop(
         }
 
         if poll_fds[0].revents & libc::POLLIN != 0
-            && let Some(requested) = receive_capture_state(&control)
+            && let Some(command) = receive_capture_command(&control)
         {
-            if requested != capturing {
-                for device in &mut devices {
-                    if requested {
-                        drain_device(device);
-                    }
-                    set_grabbed(device, requested);
-                    device.held.clear();
-                    device.stick = StickState::default();
+            capture_sequence = command.sequence;
+            capturing = command.enabled;
+            for device in &mut devices {
+                if capturing && !device.grabbed {
+                    drain_device(device);
                 }
-                capturing = requested;
+                device.held.clear();
+                device.stick = StickState::default();
             }
-            let acknowledged = devices.iter().all(|device| device.grabbed == requested);
-            let byte = [if acknowledged { 0x81 } else { 0x80 }];
-            let _ = control.send(&byte);
+            let summary = reconcile_grabs(&mut devices, capturing);
+            let report = (capture_sequence, capturing, summary);
+            if send_capture_status(
+                &control,
+                capture_status(capture_sequence, capturing, summary),
+            ) {
+                reported = Some(report);
+            }
         }
 
         let ready: HashSet<_> = poll_fds
@@ -254,23 +440,38 @@ fn controller_loop(
                 }
             }
         });
+        let summary = GrabSummary {
+            grabbed: devices.iter().filter(|device| device.grabbed).count(),
+            total: devices.len(),
+        };
+        let report = (capture_sequence, capturing, summary);
+        if reported != Some(report)
+            && send_capture_status(
+                &control,
+                capture_status(capture_sequence, capturing, summary),
+            )
+        {
+            reported = Some(report);
+        }
         if capturing {
             emit_repeats(&mut devices, &sender);
         }
     }
 
-    for device in &mut devices {
-        set_grabbed(device, false);
-    }
+    let _ = reconcile_grabs(&mut devices, false);
 }
 
-fn receive_capture_state(control: &UnixDatagram) -> Option<bool> {
+fn receive_capture_command(control: &UnixDatagram) -> Option<CaptureCommand> {
     let mut latest = None;
-    let mut states = [0_u8; 32];
+    let mut packet = [0_u8; 32];
     loop {
-        match control.recv(&mut states) {
+        match control.recv(&mut packet) {
             Ok(0) => break,
-            Ok(count) => latest = Some(states[count - 1] != 0),
+            Ok(count) => {
+                if let Some(command) = decode_capture_command(&packet[..count]) {
+                    latest = Some(command);
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
             Err(error) => {
                 tracing::warn!(%error, "controller control channel failed");
@@ -279,6 +480,83 @@ fn receive_capture_state(control: &UnixDatagram) -> Option<bool> {
         }
     }
     latest
+}
+
+fn decode_capture_command(packet: &[u8]) -> Option<CaptureCommand> {
+    if packet.len() != 10 || packet[0] != CAPTURE_COMMAND || packet[9] > 1 {
+        return None;
+    }
+    Some(CaptureCommand {
+        sequence: u64::from_le_bytes(packet[1..9].try_into().ok()?),
+        enabled: packet[9] != 0,
+    })
+}
+
+fn encode_capture_status(status: CaptureStatus) -> [u8; CAPTURE_PACKET_BYTES] {
+    let (kind, sequence, requested, grabbed, total) = match status {
+        CaptureStatus::Captured {
+            sequence,
+            grabbed,
+            total,
+        } => (1, sequence, true, grabbed, total),
+        CaptureStatus::Released {
+            sequence,
+            grabbed,
+            total,
+        } => (2, sequence, false, grabbed, total),
+        CaptureStatus::PartialGrab {
+            sequence,
+            requested,
+            grabbed,
+            total,
+        } => (3, sequence, requested, grabbed, total),
+    };
+    let mut packet = [0_u8; CAPTURE_PACKET_BYTES];
+    packet[0] = CAPTURE_STATUS;
+    packet[1] = kind;
+    packet[2..10].copy_from_slice(&sequence.to_le_bytes());
+    packet[10] = u8::from(requested);
+    packet[11..13].copy_from_slice(&(grabbed.min(u16::MAX as usize) as u16).to_le_bytes());
+    packet[13..15].copy_from_slice(&(total.min(u16::MAX as usize) as u16).to_le_bytes());
+    packet
+}
+
+fn decode_capture_status(packet: &[u8]) -> Option<CaptureStatus> {
+    if packet.len() != CAPTURE_PACKET_BYTES || packet[0] != CAPTURE_STATUS || packet[10] > 1 {
+        return None;
+    }
+    let sequence = u64::from_le_bytes(packet[2..10].try_into().ok()?);
+    let grabbed = u16::from_le_bytes(packet[11..13].try_into().ok()?) as usize;
+    let total = u16::from_le_bytes(packet[13..15].try_into().ok()?) as usize;
+    match packet[1] {
+        1 => Some(CaptureStatus::Captured {
+            sequence,
+            grabbed,
+            total,
+        }),
+        2 => Some(CaptureStatus::Released {
+            sequence,
+            grabbed,
+            total,
+        }),
+        3 => Some(CaptureStatus::PartialGrab {
+            sequence,
+            requested: packet[10] != 0,
+            grabbed,
+            total,
+        }),
+        _ => None,
+    }
+}
+
+fn send_capture_status(control: &UnixDatagram, status: CaptureStatus) -> bool {
+    match control.send(&encode_capture_status(status)) {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::debug!(%error, ?status, "controller capture status was not delivered");
+            false
+        }
+    }
 }
 
 fn next_poll_timeout(last_scan: Instant, capturing: bool, devices: &[ControllerDevice]) -> i32 {
@@ -293,7 +571,7 @@ fn next_poll_timeout(last_scan: Instant, capturing: bool, devices: &[ControllerD
     remaining.as_millis().max(1).min(i32::MAX as u128) as i32
 }
 
-fn scan_controllers(devices: &mut Vec<ControllerDevice>, capture: bool) {
+fn scan_controllers(devices: &mut Vec<ControllerDevice>) {
     let known: HashSet<PathBuf> = devices.iter().map(|device| device.path.clone()).collect();
     let Ok(entries) = fs::read_dir("/sys/class/input") else {
         return;
@@ -319,18 +597,20 @@ fn scan_controllers(devices: &mut Vec<ControllerDevice>, capture: bool) {
             continue;
         };
         let name = read_trimmed(entry.path().join("device/name"));
-        let mut device = ControllerDevice {
+        let calibration = if class == DeviceClass::Controller {
+            query_stick_calibration(file.as_raw_fd())
+        } else {
+            StickCalibration::default()
+        };
+        let device = ControllerDevice {
             path,
             file,
             class,
             grabbed: false,
             held: HashMap::new(),
             stick: StickState::default(),
+            calibration,
         };
-        if capture {
-            drain_device(&mut device);
-            set_grabbed(&mut device, true);
-        }
         tracing::info!(
             path = %device.path.display(),
             name,
@@ -381,6 +661,77 @@ fn read_hex_u16(path: PathBuf) -> Option<u16> {
     u16::from_str_radix(&read_trimmed(path), 16).ok()
 }
 
+const fn eviocgabs(axis: u16) -> libc::c_ulong {
+    // `_IOC_NR` occupies the low eight bits; the ioctl type (`'E'`) is the
+    // next byte. Advancing an ABS code therefore increments the request
+    // number directly rather than shifting into the type field.
+    EVIOCGABS_BASE + axis as libc::c_ulong
+}
+
+fn read_abs_info(fd: libc::c_int, axis: u16) -> io::Result<InputAbsInfo> {
+    let mut info = InputAbsInfo::default();
+    // SAFETY: `info` is a writable input_absinfo-compatible buffer and `fd`
+    // remains owned by the ControllerDevice for this call.
+    let result = unsafe { libc::ioctl(fd, eviocgabs(axis), &mut info) };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(info)
+    }
+}
+
+fn query_stick_calibration_with<F>(mut read_axis: F) -> StickCalibration
+where
+    F: FnMut(u16) -> io::Result<InputAbsInfo>,
+{
+    fn axis_range(info: InputAbsInfo) -> Option<AxisRange> {
+        let range = AxisRange::new(info.minimum, info.maximum)?;
+        (info.value >= info.minimum
+            && info.value <= info.maximum
+            && info.fuzz >= 0
+            && info.flat >= 0
+            && info.resolution >= 0)
+            .then_some(range)
+    }
+
+    fn query_axis<F>(axis: u16, read_axis: &mut F) -> Option<AxisRange>
+    where
+        F: FnMut(u16) -> io::Result<InputAbsInfo>,
+    {
+        match read_axis(axis) {
+            Ok(info) => match axis_range(info) {
+                Some(range) => Some(range),
+                None => {
+                    tracing::warn!(
+                        axis,
+                        value = info.value,
+                        minimum = info.minimum,
+                        maximum = info.maximum,
+                        fuzz = info.fuzz,
+                        flat = info.flat,
+                        resolution = info.resolution,
+                        "ignoring malformed controller ABS range"
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::debug!(%error, axis, "controller ABS range is unavailable");
+                None
+            }
+        }
+    }
+
+    StickCalibration {
+        x: query_axis(ABS_X, &mut read_axis),
+        y: query_axis(ABS_Y, &mut read_axis),
+    }
+}
+
+fn query_stick_calibration(fd: libc::c_int) -> StickCalibration {
+    query_stick_calibration_with(|axis| read_abs_info(fd, axis))
+}
+
 fn set_grabbed(device: &mut ControllerDevice, grabbed: bool) -> bool {
     if device.grabbed == grabbed {
         return true;
@@ -422,7 +773,7 @@ fn drain_device(device: &mut ControllerDevice) {
 fn read_device(
     device: &mut ControllerDevice,
     capture: bool,
-    sender: &Sender<ControllerAction>,
+    sender: &SyncSender<ControllerAction>,
 ) -> io::Result<()> {
     let event_size = std::mem::size_of::<libc::timeval>() + 8;
     let mut bytes = [0_u8; 24 * 32];
@@ -451,7 +802,7 @@ fn handle_controller_event(
     event_type: u16,
     code: u16,
     value: i32,
-    sender: &Sender<ControllerAction>,
+    sender: &SyncSender<ControllerAction>,
 ) {
     match event_type {
         EV_KEY => {
@@ -475,9 +826,9 @@ fn handle_controller_event(
         }
         EV_ABS if code == ABS_X || code == ABS_Y => {
             if code == ABS_X {
-                device.stick.x = value;
+                device.stick.x = device.calibration.normalize_x(value);
             } else {
-                device.stick.y = value;
+                device.stick.y = device.calibration.normalize_y(value);
             }
             apply_stick_direction(device, sender);
         }
@@ -574,7 +925,7 @@ fn stick_direction(x: i32, y: i32, current: Option<ControllerAction>) -> Option<
     }
 }
 
-fn apply_stick_direction(device: &mut ControllerDevice, sender: &Sender<ControllerAction>) {
+fn apply_stick_direction(device: &mut ControllerDevice, sender: &SyncSender<ControllerAction>) {
     let next = stick_direction(device.stick.x, device.stick.y, device.stick.direction);
     if next == device.stick.direction {
         return;
@@ -591,9 +942,9 @@ fn apply_stick_direction(device: &mut ControllerDevice, sender: &Sender<Controll
 fn emit_press(
     device: &mut ControllerDevice,
     action: ControllerAction,
-    sender: &Sender<ControllerAction>,
+    sender: &SyncSender<ControllerAction>,
 ) {
-    let _ = sender.send(action);
+    let _ = sender.try_send(action);
     if matches!(
         action,
         ControllerAction::Up
@@ -605,7 +956,7 @@ fn emit_press(
     }
 }
 
-fn emit_repeats(devices: &mut [ControllerDevice], sender: &Sender<ControllerAction>) {
+fn emit_repeats(devices: &mut [ControllerDevice], sender: &SyncSender<ControllerAction>) {
     let now = Instant::now();
     for device in devices {
         if !device.grabbed || device.class != DeviceClass::Controller {
@@ -613,7 +964,7 @@ fn emit_repeats(devices: &mut [ControllerDevice], sender: &Sender<ControllerActi
         }
         for (action, deadline) in &mut device.held {
             if now >= *deadline {
-                let _ = sender.send(*action);
+                let _ = sender.try_send(*action);
                 *deadline = now + REPEAT_INTERVAL;
             }
         }
@@ -622,7 +973,7 @@ fn emit_repeats(devices: &mut [ControllerDevice], sender: &Sender<ControllerActi
 
 fn read_events(
     device: &mut File,
-    sender: &Sender<DaemonEventKind>,
+    sender: &SyncSender<DaemonEventKind>,
     terminate: &AtomicBool,
 ) -> Result<(), String> {
     let event_size = std::mem::size_of::<libc::timeval>() + 8;
@@ -658,7 +1009,7 @@ fn read_events(
         let code = u16::from_ne_bytes(event[offset + 2..offset + 4].try_into().unwrap());
         let value = i32::from_ne_bytes(event[offset + 4..offset + 8].try_into().unwrap());
         if event_type == EV_KEY && code == KEY_PROG3 && value == 1 {
-            let _ = sender.send(DaemonEventKind::GuiToggle);
+            let _ = sender.try_send(DaemonEventKind::GuiToggle);
         }
     }
     Ok(())
@@ -740,10 +1091,264 @@ mod tests {
     fn capture_channel_coalesces_to_the_latest_state() {
         let (sender, receiver) = UnixDatagram::pair().unwrap();
         receiver.set_nonblocking(true).unwrap();
-        sender.send(&[1]).unwrap();
-        sender.send(&[0]).unwrap();
-        assert_eq!(receive_capture_state(&receiver), Some(false));
-        assert_eq!(receive_capture_state(&receiver), None);
+        sender
+            .send(&[CAPTURE_COMMAND, 7, 0, 0, 0, 0, 0, 0, 0, 1])
+            .unwrap();
+        sender
+            .send(&[CAPTURE_COMMAND, 8, 0, 0, 0, 0, 0, 0, 0, 0])
+            .unwrap();
+        assert_eq!(
+            receive_capture_command(&receiver),
+            Some(CaptureCommand {
+                sequence: 8,
+                enabled: false
+            })
+        );
+        assert_eq!(receive_capture_command(&receiver), None);
+    }
+
+    #[test]
+    fn capture_status_round_trips_partial_grab_and_counts() {
+        let status = CaptureStatus::PartialGrab {
+            sequence: 9,
+            requested: true,
+            grabbed: 2,
+            total: 3,
+        };
+        assert_eq!(
+            decode_capture_status(&encode_capture_status(status)),
+            Some(status)
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeGrabDevice {
+        grabbed: bool,
+        fail_grab: bool,
+        fail_ungrab: bool,
+        calls: Vec<bool>,
+    }
+
+    impl GrabDevice for FakeGrabDevice {
+        fn is_grabbed(&self) -> bool {
+            self.grabbed
+        }
+
+        fn try_set_grabbed(&mut self, grabbed: bool) -> bool {
+            self.calls.push(grabbed);
+            if (grabbed && self.fail_grab) || (!grabbed && self.fail_ungrab) {
+                return false;
+            }
+            self.grabbed = grabbed;
+            true
+        }
+    }
+
+    #[test]
+    fn failed_grab_is_explicitly_partial_and_never_captured() {
+        let mut devices = vec![
+            FakeGrabDevice::default(),
+            FakeGrabDevice {
+                fail_grab: true,
+                ..FakeGrabDevice::default()
+            },
+        ];
+        let summary = reconcile_grabs(&mut devices, true);
+        assert_eq!(
+            summary,
+            GrabSummary {
+                grabbed: 1,
+                total: 2
+            }
+        );
+        assert_eq!(
+            capture_status(11, true, summary),
+            CaptureStatus::PartialGrab {
+                sequence: 11,
+                requested: true,
+                grabbed: 1,
+                total: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn failed_ungrab_keeps_partial_cleanup_state_for_retry() {
+        let mut devices = vec![FakeGrabDevice {
+            grabbed: true,
+            fail_ungrab: true,
+            ..FakeGrabDevice::default()
+        }];
+        let summary = reconcile_grabs(&mut devices, false);
+        assert_eq!(
+            summary,
+            GrabSummary {
+                grabbed: 1,
+                total: 1
+            }
+        );
+        assert_eq!(
+            capture_status(12, false, summary),
+            CaptureStatus::PartialGrab {
+                sequence: 12,
+                requested: false,
+                grabbed: 1,
+                total: 1,
+            }
+        );
+        devices[0].fail_ungrab = false;
+        let summary = reconcile_grabs(&mut devices, false);
+        assert_eq!(
+            summary,
+            GrabSummary {
+                grabbed: 0,
+                total: 1
+            }
+        );
+        assert_eq!(
+            capture_status(12, false, summary),
+            CaptureStatus::Released {
+                sequence: 12,
+                grabbed: 0,
+                total: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn hotplug_device_is_not_blocked_until_it_is_grabbed() {
+        let mut devices = vec![FakeGrabDevice::default()];
+        let first = reconcile_grabs(&mut devices, true);
+        assert_eq!(
+            first,
+            GrabSummary {
+                grabbed: 1,
+                total: 1
+            }
+        );
+        devices.push(FakeGrabDevice {
+            fail_grab: true,
+            ..FakeGrabDevice::default()
+        });
+        let partial = reconcile_grabs(&mut devices, true);
+        assert_eq!(
+            partial,
+            GrabSummary {
+                grabbed: 1,
+                total: 2
+            }
+        );
+        assert!(matches!(
+            capture_status(13, true, partial),
+            CaptureStatus::PartialGrab { .. }
+        ));
+    }
+
+    fn fake_abs_info(minimum: i32, maximum: i32) -> InputAbsInfo {
+        InputAbsInfo {
+            minimum,
+            maximum,
+            ..InputAbsInfo::default()
+        }
+    }
+
+    #[test]
+    fn normalizes_asymmetric_ranges_and_clamps_ioctl_values() {
+        let range = AxisRange::new(100, 500).unwrap();
+        assert_eq!(range.normalize(100), -32_768);
+        assert_eq!(range.normalize(300), 0);
+        assert_eq!(range.normalize(500), 32_767);
+        assert_eq!(range.normalize(i32::MIN), -32_768);
+        assert_eq!(range.normalize(i32::MAX), 32_767);
+
+        let calibration = StickCalibration {
+            x: Some(range),
+            y: Some(AxisRange::new(-20, 30).unwrap()),
+        };
+        assert_eq!(calibration.normalize_x(300), 0);
+        assert_eq!(calibration.normalize_y(-20), -32_768);
+    }
+
+    #[test]
+    fn rejects_degenerate_or_reversed_abs_ranges_without_disabling_other_axis() {
+        assert_eq!(AxisRange::new(7, 7), None);
+        assert_eq!(AxisRange::new(8, 7), None);
+
+        let malformed = query_stick_calibration_with(|_| {
+            Ok(InputAbsInfo {
+                value: 256,
+                minimum: 0,
+                maximum: 255,
+                ..InputAbsInfo::default()
+            })
+        });
+        assert_eq!(malformed, StickCalibration::default());
+
+        let calibration = query_stick_calibration_with(|axis| {
+            if axis == ABS_X {
+                Ok(fake_abs_info(7, 7))
+            } else {
+                Ok(fake_abs_info(-10, 10))
+            }
+        });
+        assert_eq!(calibration.x, None);
+        assert_eq!(calibration.y, Some(AxisRange::new(-10, 10).unwrap()));
+        assert_eq!(calibration.normalize_x(i32::MAX), 0);
+        assert_eq!(calibration.normalize_y(10), 32_767);
+    }
+
+    #[test]
+    fn ioctl_errors_are_isolated_per_axis_and_hotplug_queries_are_fresh() {
+        let unavailable = query_stick_calibration_with(|axis| {
+            if axis == ABS_X {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            } else {
+                Ok(fake_abs_info(0, 255))
+            }
+        });
+        assert_eq!(unavailable.x, None);
+        assert_eq!(unavailable.y, Some(AxisRange::new(0, 255).unwrap()));
+
+        // A newly opened event node gets a new ioctl query rather than
+        // inheriting the range of the device that used the path before it.
+        let first = query_stick_calibration_with(|_| Ok(fake_abs_info(0, 255)));
+        let replacement = query_stick_calibration_with(|_| Ok(fake_abs_info(-1_000, 1_000)));
+        assert_ne!(first, replacement);
+        assert_eq!(replacement.x.unwrap().minimum, -1_000);
+        assert_eq!(replacement.y.unwrap().maximum, 1_000);
+    }
+
+    #[test]
+    fn ev_iocgabs_requests_match_linux_input_abi() {
+        assert_eq!(std::mem::size_of::<InputAbsInfo>(), 24);
+        assert_eq!(eviocgabs(ABS_X), 0x8018_4540);
+        assert_eq!(eviocgabs(ABS_Y), 0x8018_4541);
+    }
+
+    #[test]
+    fn bpf_source_and_owner_keep_bounded_cleanup_contract_explicit() {
+        let source = include_str!("../bpf/hidraw_blocker.bpf.c");
+        assert!(source.contains("#define MAX_BLOCKED_PIDS 64"));
+        assert!(source.contains("BLOCKED_PID_MAP_CAPACITY (MAX_BLOCKED_PIDS * 2)"));
+        assert!(source.contains("__uint(max_entries, BLOCKED_PID_MAP_CAPACITY);"));
+        assert!(source.contains("bpf_get_current_pid_tgid() >> 32"));
+        assert!(source.contains("SEC(\"lsm/file_permission\")"));
+
+        let owner = include_str!("hidraw.rs");
+        assert!(owner.contains(".take(64)"));
+        let additions = owner.find("let additions").unwrap();
+        let removals = owner.find("let removals").unwrap();
+        assert!(additions < removals);
+        assert!(owner.contains("bpf_program__attach_lsm"));
+        assert!(owner.contains("bpf_link__destroy"));
+        assert!(owner.contains("bpf_object__close"));
+        assert!(!owner.contains("bpf_obj_pin"));
+        assert!(owner.contains("impl Drop for HidrawBlocker"));
+
+        let steam_owner = include_str!("steam.rs");
+        assert!(steam_owner.contains("let pids = steam_family()"));
+        assert!(steam_owner.contains("set_blocked_pids([])"));
+        assert!(steam_owner.contains("impl Drop for SteamBlocker"));
     }
 
     #[test]

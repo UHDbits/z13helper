@@ -21,9 +21,12 @@
   buildType ? "release",
 }:
 
+let
+  cargoMetadata = builtins.fromTOML (builtins.readFile ../Cargo.toml);
+in
 rustPlatform.buildRustPackage {
   pname = "z13helper";
-  version = "0.1.0";
+  version = cargoMetadata.workspace.package.version;
 
   src = lib.cleanSourceWith {
     src = ../.;
@@ -104,7 +107,10 @@ rustPlatform.buildRustPackage {
   meta = {
     description = "GTK4 control platform for the ASUS ROG Flow Z13 (GZ302EA)";
     homepage = "https://github.com/UHDbits/z13helper";
-    license = lib.licenses.mit;
+    license = [
+      lib.licenses.mit
+      lib.licenses.gpl2Only
+    ];
     platforms = lib.platforms.linux;
     mainProgram = "z13helper";
   };

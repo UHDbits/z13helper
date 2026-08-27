@@ -6,8 +6,8 @@ use std::rc::Rc;
 use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
-use z13helper_client::State;
 use z13helper_core::label::mode_label;
+use z13helper_core::{LightingState, WireStatus};
 
 use crate::app::AppState;
 use crate::services::worker;
@@ -185,6 +185,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
                 return glib::Propagation::Stop;
             }
             state.config.borrow_mut().panel_overdrive_always_on = enabled;
+            state.mark_config_changed();
             state.save_config();
             policy_row.set_subtitle(overdrive_policy_label(enabled));
             state.apply_panel_overdrive_policy();
@@ -415,10 +416,10 @@ struct ModeView {
 }
 
 impl MainView {
-    fn sync_from(&self, state: &AppState, daemon: &State) {
+    fn sync_from(&self, state: &AppState, daemon: &WireStatus) {
         state
             .undervolt_available
-            .set(Some(daemon.undervolt_available));
+            .set(Some(daemon.capabilities.undervolt));
         self.sync.run(|| {
             self.settings.sync_from(state, daemon);
             self.mode.sync_from(state, daemon);
@@ -427,7 +428,7 @@ impl MainView {
 }
 
 impl SettingsView {
-    fn sync_from(&self, state: &AppState, daemon: &State) {
+    fn sync_from(&self, state: &AppState, daemon: &WireStatus) {
         let always_on = state.config.borrow().panel_overdrive_always_on;
         self.overdrive.set_active(always_on);
         self.overdrive.set_state(always_on);
@@ -457,20 +458,12 @@ impl SettingsView {
             daemon.battery.status.as_deref(),
             daemon.battery.power_microwatts,
         ));
-        self.lightbar.sync_from(
-            daemon
-                .devices
-                .as_ref()
-                .and_then(|devices| devices.get("lightbar"))
-                .unwrap_or(&daemon.lighting),
-        );
-        self.keyboard.sync_from(
-            daemon
-                .devices
-                .as_ref()
-                .and_then(|devices| devices.get("keyboard"))
-                .unwrap_or(&daemon.lighting),
-        );
+        if let Some(lighting) = daemon.devices.get("lightbar") {
+            self.lightbar.sync_from(lighting);
+        }
+        if let Some(lighting) = daemon.devices.get("keyboard") {
+            self.keyboard.sync_from(lighting);
+        }
     }
 }
 
@@ -500,16 +493,17 @@ impl LightingView {
 }
 
 impl ModeView {
-    fn sync_from(&self, state: &AppState, daemon: &State) {
+    fn sync_from(&self, state: &AppState, daemon: &WireStatus) {
         self.label.set_label(&current_label(state));
         refresh_active_buttons(&self.buttons, &state.config.borrow().active_profile);
         self.telemetry.set_label(&format!(
             "APU: {}°C  Fans: {} / {} RPM",
             daemon
-                .temperature
+                .telemetry
+                .temperature_c
                 .map_or_else(|| "—".into(), |value| value.to_string()),
-            daemon.fan_rpms[0],
-            daemon.fan_rpms[1]
+            daemon.telemetry.fan_rpms[0],
+            daemon.telemetry.fan_rpms[1]
         ));
     }
 }
@@ -930,14 +924,16 @@ fn send_lighting_intent(state: &Rc<AppState>, view: &LightingView, device: &'sta
     );
     let client = state.client.clone();
     let feedback = state.clone();
+    let lighting = LightingState {
+        enabled,
+        mode: mode.into(),
+        color,
+        color2: "000000".into(),
+        speed,
+        brightness: 3,
+    };
     worker::blocking(
-        move || {
-            if enabled {
-                client.apply_lighting(mode, &color, "000000", &speed, 3, device)
-            } else {
-                client.lighting_off(device)
-            }
-        },
+        move || client.apply_lighting(device, lighting),
         move |result| {
             if let Err(error) = result {
                 tracing::error!(%error, %device, "lighting write failed");
@@ -1046,8 +1042,9 @@ fn current_label(state: &AppState) -> String {
 }
 
 fn select_profile(state: &Rc<AppState>, id: &str) {
-    state.config.borrow_mut().active_profile = id.into();
-    state.apply_active();
+    if state.activate_profile(id) {
+        state.apply_active();
+    }
 }
 
 #[cfg(test)]

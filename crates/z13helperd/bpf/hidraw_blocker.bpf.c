@@ -17,6 +17,15 @@
 #define EAGAIN 11
 #define MAY_READ 4
 #define MAJOR(dev) ((unsigned int)((dev) >> 20))
+#define MAX_BLOCKED_PIDS 64
+// The userspace owner updates additions before removals so a failed update can
+// be rolled back. Two bounded generations fit during a full-set replacement;
+// the map is still daemon-owned, unpinned, and cannot grow without limit.
+#define BLOCKED_PID_MAP_CAPACITY (MAX_BLOCKED_PIDS * 2)
+
+// Keys are numeric TGIDs because the userspace owner supplies a PID set.
+// Numeric identity can be reused after exit; userspace must refresh and clear
+// this set while the capture lease owns the attached link.
 
 struct inode {
 	__u64 i_ino;
@@ -30,7 +39,7 @@ struct file {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 64);
+	__uint(max_entries, BLOCKED_PID_MAP_CAPACITY);
 	__type(key, __u32);
 	__type(value, __u8);
 } blocked_pids SEC(".maps");

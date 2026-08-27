@@ -13,7 +13,19 @@ LIBEXECDIR ?= /usr/libexec
 SYSTEMDUNITDIR ?= /usr/lib/systemd/system
 SYSUSERSDIR ?= /usr/lib/sysusers.d
 
-.PHONY: build run test lint fmt install install-user-service install-service clean
+BPF_SOURCE := crates/z13helperd/bpf/hidraw_blocker.bpf.c
+BPF_OBJECT := crates/z13helperd/bpf/hidraw_blocker.bpf.o
+BPF_CHECK_OBJECT := $(TARGET_DIR)/bpf-check/hidraw_blocker.bpf.o
+BPF_CLANG ?= clang
+BPF_STRIP ?= llvm-strip
+BPF_CFLAGS ?= -O2 -g -target bpf -D__TARGET_ARCH_x86
+BPF_INCLUDE_FLAGS ?= -I/usr/include -I/usr/include/x86_64-linux-gnu
+# BTF.ext line information records the compilation directory. Use a stable,
+# synthetic path so the tracked object is checkout-independent and does not
+# disclose a developer's local filesystem.
+BPF_DEBUG_COMPILATION_DIR ?= /build/z13helper
+
+.PHONY: build run test lint fmt check-bpf bpf install install-user-service install-service clean
 
 build:
 	$(CARGO) build --release -p z13helper -p z13helperd -p z13helperctl
@@ -30,6 +42,16 @@ lint:
 
 fmt:
 	$(CARGO) fmt --all
+
+check-bpf:
+	mkdir -p $(TARGET_DIR)/bpf-check
+	$(BPF_CLANG) $(BPF_CFLAGS) $(BPF_INCLUDE_FLAGS) -fdebug-compilation-dir="$(BPF_DEBUG_COMPILATION_DIR)" -c $(BPF_SOURCE) -o $(BPF_CHECK_OBJECT)
+	$(BPF_STRIP) --strip-debug $(BPF_CHECK_OBJECT)
+	cmp $(BPF_OBJECT) $(BPF_CHECK_OBJECT)
+
+bpf:
+	$(BPF_CLANG) $(BPF_CFLAGS) $(BPF_INCLUDE_FLAGS) -fdebug-compilation-dir="$(BPF_DEBUG_COMPILATION_DIR)" -c $(BPF_SOURCE) -o $(BPF_OBJECT)
+	$(BPF_STRIP) --strip-debug $(BPF_OBJECT)
 
 install: build
 	install -Dm755 $(RELEASE_DIR)/z13helper $(BINDIR)/z13helper

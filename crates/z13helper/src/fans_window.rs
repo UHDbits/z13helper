@@ -15,7 +15,12 @@ use crate::services::worker;
 use crate::ui::curve_editor::CurveEditor;
 use crate::ui::sync::SyncGuard;
 
-type ApplySchedule = Rc<RefCell<Option<glib::SourceId>>>;
+struct PendingApply {
+    source: glib::SourceId,
+    edited_profile: String,
+}
+
+type ApplySchedule = Rc<RefCell<Option<PendingApply>>>;
 
 pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     if let Some(window) = state.fans_window() {
@@ -104,37 +109,19 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     editor.set_high_power_protection(protection_active);
     editor2.set_high_power_protection(protection_active);
 
-    // Shared "currently editing" profile id for the editor.
-    let editing_id = Rc::new(RefCell::new(profile.id.clone()));
     let loading = SyncGuard::default();
     let apply_schedule: ApplySchedule = Rc::new(RefCell::new(None));
     let state_close = state.clone();
     let schedule_close = apply_schedule.clone();
     window.connect_close_request(move |window| {
-        if let Some(source) = schedule_close.borrow_mut().take() {
-            source.remove();
-        }
+        flush_pending_edit(&state_close, &schedule_close);
         state_close.hide_auxiliary(window.upcast_ref());
         glib::Propagation::Stop
     });
 
-    let cpu = build_cpu_page(
-        state,
-        &editing_id,
-        &loading,
-        &apply_schedule,
-        &editor,
-        &editor2,
-    );
-    let advanced = build_advanced_page(
-        state,
-        &editing_id,
-        &loading,
-        &apply_schedule,
-        &window,
-        &editor,
-        &editor2,
-    );
+    let cpu = build_cpu_page(state, &loading, &apply_schedule, &editor, &editor2);
+    let advanced =
+        build_advanced_page(state, &loading, &apply_schedule, &window, &editor, &editor2);
     stack.add_titled(&cpu.0, Some("cpu"), "CPU");
     stack.add_titled(&advanced.0, Some("advanced"), "Advanced");
 
@@ -275,12 +262,12 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             Ok(status) => {
                 state_probe
                     .undervolt_available
-                    .set(Some(status.undervolt_available));
-                uv_probe.set_sensitive(status.undervolt_available);
-                apply_uv_probe.set_sensitive(status.undervolt_available);
-                manual_uv_probe.set_sensitive(status.undervolt_available);
-                cpu_temp_probe.set_sensitive(status.undervolt_available);
-                undervolt_note_probe.set_visible(!status.undervolt_available);
+                    .set(Some(status.capabilities.undervolt));
+                uv_probe.set_sensitive(status.capabilities.undervolt);
+                apply_uv_probe.set_sensitive(status.capabilities.undervolt);
+                manual_uv_probe.set_sensitive(status.capabilities.undervolt);
+                cpu_temp_probe.set_sensitive(status.capabilities.undervolt);
+                undervolt_note_probe.set_visible(!status.capabilities.undervolt);
                 sync_ppd_choices(
                     &ppd_probe,
                     &status.capabilities.ppd_profiles,
@@ -307,7 +294,10 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                 let duties = status
                     .direct_fan_duties
                     .map(|duty| (i32::from(duty) * 100 + 127) / 255);
-                let rpms = format!("{} / {}", status.fan_rpms[0], status.fan_rpms[1]);
+                let rpms = format!(
+                    "{} / {}",
+                    status.telemetry.fan_rpms[0], status.telemetry.fan_rpms[1]
+                );
                 if status.fan_control_mode == FanControlMode::Direct {
                     status_probe.set_label(&format!(
                         "Direct EC PWM: {}% / {}% · RPM {rpms}",
@@ -352,7 +342,6 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let editor2_muted = editor2.clone();
     let unified_fan_toggle = unified_toggle.clone();
     let state_fan = state.clone();
-    let editing_fan = editing_id.clone();
     let loading_fan = loading.clone();
     let apply_schedule_fan = apply_schedule.clone();
     fan_toggle.connect_toggled(move |t| {
@@ -364,15 +353,14 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         editor2_muted.set_muted(!enabled);
         editor_muted.set_editable(enabled);
         editor2_muted.set_editable(enabled && !unified_fan_toggle.is_active());
-        let id = editing_fan.borrow().clone();
-        if let Some(p) = state_fan.config.borrow_mut().find_mut(&id) {
+        let id = state_fan.editing_profile_id();
+        state_fan.edit_profile(&id, |p| {
             p.apply_fan_curve = t.is_active();
-        }
+        });
         schedule_apply(&state_fan, &apply_schedule_fan, id);
     });
 
     let state_unified = state.clone();
-    let editing_unified = editing_id.clone();
     let loading_unified = loading.clone();
     let apply_schedule_unified = apply_schedule.clone();
     let editor2_unified = editor2.clone();
@@ -384,18 +372,14 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             return;
         }
         let unified = toggle.is_active();
-        let id = editing_unified.borrow().clone();
-        let curve = state_unified
-            .config
-            .borrow_mut()
-            .find_mut(&id)
-            .map(|profile| {
-                profile.unified_fan_control = unified;
-                if unified {
-                    profile.fan_curves[1] = profile.fan_curves[0];
-                }
-                profile.fan_curves[0]
-            });
+        let id = state_unified.editing_profile_id();
+        let curve = state_unified.edit_profile(&id, |profile| {
+            profile.unified_fan_control = unified;
+            if unified {
+                profile.fan_curves[1] = profile.fan_curves[0];
+            }
+            profile.fan_curves[0]
+        });
         if let Some(curve) = curve
             && unified
         {
@@ -413,7 +397,6 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     });
 
     let state_direct = state.clone();
-    let editing_direct = editing_id.clone();
     let warning_direct = direct_warning.clone();
     let loading_direct = loading.clone();
     let apply_schedule_direct = apply_schedule.clone();
@@ -428,56 +411,53 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         hysteresis_up_direct.set_sensitive(toggle.is_active());
         hysteresis_down_direct.set_sensitive(toggle.is_active());
         temperature_average_direct.set_sensitive(toggle.is_active());
-        let id = editing_direct.borrow().clone();
-        if let Some(profile) = state_direct.config.borrow_mut().find_mut(&id) {
+        let id = state_direct.editing_profile_id();
+        state_direct.edit_profile(&id, |profile| {
             profile.fan_control_mode = if toggle.is_active() {
                 FanControlMode::Direct
             } else {
                 FanControlMode::Firmware
             };
-        }
+        });
         schedule_apply(&state_direct, &apply_schedule_direct, id);
     });
 
     for (scale, upwards) in [(&hysteresis_up.1, true), (&hysteresis_down.1, false)] {
         let state = state.clone();
-        let editing = editing_id.clone();
         let loading = loading.clone();
         let apply_schedule = apply_schedule.clone();
         scale.connect_value_changed(move |scale| {
             if loading.active() {
                 return;
             }
-            let id = editing.borrow().clone();
-            if let Some(profile) = state.config.borrow_mut().find_mut(&id) {
+            let id = state.editing_profile_id();
+            state.edit_profile(&id, |profile| {
                 if upwards {
                     profile.fan_hysteresis_up = scale.value() as u8;
                 } else {
                     profile.fan_hysteresis_down = scale.value() as u8;
                 }
-            }
+            });
             schedule_apply(&state, &apply_schedule, id);
         });
     }
 
     let state_average = state.clone();
-    let editing_average = editing_id.clone();
     let loading_average = loading.clone();
     let apply_schedule_average = apply_schedule.clone();
     temperature_average.1.connect_value_changed(move |scale| {
         if loading_average.active() {
             return;
         }
-        let id = editing_average.borrow().clone();
-        if let Some(profile) = state_average.config.borrow_mut().find_mut(&id) {
+        let id = state_average.editing_profile_id();
+        state_average.edit_profile(&id, |profile| {
             profile.fan_temperature_average_seconds = scale.value() as u8;
-        }
+        });
         schedule_apply(&state_average, &apply_schedule_average, id);
     });
 
     // Persist curve edits into the profile currently selected in this window.
     let state_curve = state.clone();
-    let editing_curve = editing_id.clone();
     let loading_curve = loading.clone();
     let apply_schedule_curve = apply_schedule.clone();
     let editor2_curve = editor2.clone();
@@ -485,31 +465,30 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         if loading_curve.active() {
             return;
         }
-        let id = editing_curve.borrow().clone();
-        if let Some(p) = state_curve.config.borrow_mut().find_mut(&id) {
+        let id = state_curve.editing_profile_id();
+        state_curve.edit_profile(&id, |p| {
             p.fan_curves[0] = curve;
             if p.unified_fan_control {
                 p.fan_curves[1] = curve;
                 editor2_curve.set_curve(curve);
             }
-        }
+        });
         schedule_apply(&state_curve, &apply_schedule_curve, id);
     });
     let state_curve = state.clone();
-    let editing_curve = editing_id.clone();
     let loading_curve = loading.clone();
     let apply_schedule_curve = apply_schedule.clone();
     editor2.set_changed(move |curve| {
         if loading_curve.active() {
             return;
         }
-        let id = editing_curve.borrow().clone();
-        if let Some(profile) = state_curve.config.borrow_mut().find_mut(&id) {
+        let id = state_curve.editing_profile_id();
+        state_curve.edit_profile(&id, |profile| {
             if profile.unified_fan_control {
                 profile.fan_curves[0] = curve;
             }
             profile.fan_curves[1] = curve;
-        }
+        });
         schedule_apply(&state_curve, &apply_schedule_curve, id);
     });
 
@@ -553,7 +532,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let state_sel = state.clone();
     let editor_sel = editor.clone();
     let editor2_sel = editor2.clone();
-    let editing_sel = editing_id.clone();
+    let schedule_sel = apply_schedule.clone();
     let fan_toggle_sel = fan_toggle.clone();
     let unified_toggle_sel = unified_toggle.clone();
     let editors_sel = editors.clone();
@@ -571,37 +550,38 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         };
         // Commit current curve into previous profile.
         {
-            let prev = editing_sel.borrow().clone();
+            let prev = state_sel.editing_profile_id();
             let curve = editor_sel.curve();
             let unified = unified_toggle_sel.is_active();
             let curve2 = if unified { curve } else { editor2_sel.curve() };
-            if let Some(p) = state_sel.config.borrow_mut().find_mut(&prev) {
+            state_sel.edit_profile(&prev, |p| {
                 p.fan_curves[0] = curve;
                 p.fan_curves[1] = curve2;
                 p.apply_fan_curve = fan_toggle_sel.is_active();
                 p.unified_fan_control = unified;
-            }
+            });
         }
-        *editing_sel.borrow_mut() = next.id.clone();
-        state_sel.config.borrow_mut().active_profile = next.id.clone();
+        flush_pending_edit(&state_sel, &schedule_sel);
+        state_sel.select_editing_profile(&next.id);
         editors_sel.load(
             next,
             state_sel.config.borrow().disable_high_power_fan_protection,
         );
         set_profile_action_sensitivity(&state_sel, &next.id, &rename_sel, &remove_sel);
-        state_sel.apply_active();
     });
 
     let state_def = state.clone();
-    let editing_def = editing_id.clone();
     let editors_def = editors.clone();
     let restored_toast = toast_overlay.clone();
     let restore_factory = Rc::new(move || {
-        let id = editing_def.borrow().clone();
+        let id = state_def.editing_profile_id();
         let Some(mut restored) = state_def.config.borrow().find(&id).cloned() else {
             return;
         };
         restored.factory_defaults();
+        let Some(token) = state_def.begin_profile_operation(&id) else {
+            return;
+        };
         let ppd_profile = restored.ppd_profile.clone();
         let request = ApplyRequest::from_profile(
             &restored,
@@ -611,6 +591,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         let state_done = state_def.clone();
         let editors_done = editors_def.clone();
         let toast_done = restored_toast.clone();
+        let worker_token = token.clone();
         worker::blocking(
             move || {
                 let apply = client.apply(request)?;
@@ -638,15 +619,27 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                             )),
                         }
                     }
-                    if let Some(profile) = state_done.config.borrow_mut().find_mut(&id) {
-                        *profile = restored.clone();
+                    let current = state_done.operation_is_current(&worker_token);
+                    let editing_current = state_done.operation_is_current_editor(&worker_token);
+                    let committed = current
+                        && state_done.replace_profile_if_current(&worker_token, restored.clone());
+                    if committed && editing_current {
+                        editors_done.load(
+                            &restored,
+                            state_done.config.borrow().disable_high_power_fan_protection,
+                        );
                     }
-                    editors_done.load(
-                        &restored,
-                        state_done.config.borrow().disable_high_power_fan_protection,
-                    );
-                    state_done.save_config();
-                    toast_done.add_toast(adw::Toast::new("Factory defaults restored"));
+                    if committed {
+                        state_done.save_config();
+                        toast_done.add_toast(adw::Toast::new("Factory defaults restored"));
+                    } else if state_done.active_profile_id() == worker_token.id {
+                        // The daemon finished an older restore.  Never cancel
+                        // it; converge to the current active profile instead.
+                        state_done.apply_active();
+                    }
+                    if committed && state_done.active_profile_id() == worker_token.id {
+                        state_done.apply_active();
+                    }
                     if !warnings.is_empty() {
                         state_done.report_error(&warnings.join(" · "));
                     }
@@ -664,7 +657,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         let name = restore_state
             .config
             .borrow()
-            .active()
+            .find(&restore_state.editing_profile_id())
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "selected profile".into());
         let body = format!("Reset “{name}” power, fan, APU temperature, and undervolt settings?");
@@ -682,7 +675,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let selector_add = selector.clone();
     let loading_add = loading.clone();
     plus.connect_clicked(move |_| {
-        state_add.config.borrow_mut().add_custom();
+        state_add.add_custom_profile();
         state_add.save_config();
         let names: Vec<String> = state_add
             .config
@@ -698,19 +691,20 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         });
         // Trigger load via notify by toggling selected (already at end).
         selector_add.notify("selected");
+        state_add.apply_active();
     });
 
     let state_rm = state.clone();
     let selector_rm = selector.clone();
     let editors_rm = editors.clone();
-    let editing_rm = editing_id.clone();
     let loading_rm = loading.clone();
     let rename_rm = rename.clone();
     let remove_rm = minus.clone();
     let removed_toast = toast_overlay.clone();
     let remove_profile = Rc::new(move || {
-        let id = state_rm.config.borrow().active_profile.clone();
-        if state_rm.config.borrow_mut().remove(&id) {
+        let id = state_rm.editing_profile_id();
+        let old_active = state_rm.active_profile_id();
+        if state_rm.remove_profile(&id) {
             let profiles = state_rm.config.borrow().profiles.clone();
             let active = state_rm.config.borrow().active_profile.clone();
             let selected = profiles
@@ -727,7 +721,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
                 selector_rm.set_model(Some(&model));
                 selector_rm.set_selected(selected as u32);
                 if let Some(profile) = profiles.get(selected) {
-                    *editing_rm.borrow_mut() = profile.id.clone();
+                    state_rm.select_editing_profile(&profile.id);
                     editors_rm.load(
                         profile,
                         state_rm.config.borrow().disable_high_power_fan_protection,
@@ -736,7 +730,9 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             });
             set_profile_action_sensitivity(&state_rm, &active, &rename_rm, &remove_rm);
             state_rm.save_config();
-            state_rm.apply_active();
+            if old_active != state_rm.active_profile_id() {
+                state_rm.apply_active();
+            }
             removed_toast.add_toast(adw::Toast::new("Profile removed"));
         }
     });
@@ -746,7 +742,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         let name = remove_state
             .config
             .borrow()
-            .active()
+            .find(&remove_state.editing_profile_id())
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "selected profile".into());
         let body = format!("Permanently remove “{name}”?");
@@ -765,7 +761,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
     let selector_ren = selector.clone();
     let loading_ren = loading.clone();
     rename.connect_clicked(move |_| {
-        let id = state_ren.config.borrow().active_profile.clone();
+        let id = state_ren.editing_profile_id();
         if state_ren
             .config
             .borrow()
@@ -799,7 +795,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         dialog.connect_response(None, move |_, response| {
             if response == "rename" {
                 let new_name = entry.text().trim().to_owned();
-                if !new_name.is_empty() && state.config.borrow_mut().rename(&id, &new_name) {
+                if !new_name.is_empty() && state.rename_profile(&id, &new_name) {
                     state.save_config();
                     let names: Vec<String> = state
                         .config
@@ -875,7 +871,6 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
 /// Returns (page, spl, sppt, fppt, apply_power, ppd).
 fn build_cpu_page(
     state: &Rc<AppState>,
-    editing_id: &Rc<RefCell<String>>,
     loading: &SyncGuard,
     apply_schedule: &ApplySchedule,
     first_editor: &CurveEditor,
@@ -971,7 +966,6 @@ fn build_cpu_page(
 
     let update = {
         let state = state.clone();
-        let editing = editing_id.clone();
         let ppd = ppd.clone();
         let power = apply_power.clone();
         let pl1 = spl.1.clone();
@@ -985,9 +979,9 @@ fn build_cpu_page(
             if loading.active() {
                 return;
             }
-            let id = editing.borrow().clone();
+            let id = state.editing_profile_id();
             let high_power_disabled = state.config.borrow().disable_high_power_fan_protection;
-            if let Some(profile) = state.config.borrow_mut().find_mut(&id) {
+            let changed = state.edit_profile(&id, |profile| {
                 let ppd_profile = ppd
                     .selected_item()
                     .and_downcast::<gtk::StringObject>()
@@ -1021,6 +1015,8 @@ fn build_cpu_page(
                     && !high_power_disabled;
                 first_editor.set_high_power_protection(protection);
                 second_editor.set_high_power_protection(protection);
+            });
+            if changed.is_some() {
                 schedule_apply(&state, &apply_schedule, id);
             }
         })
@@ -1052,7 +1048,6 @@ fn build_cpu_page(
 
 fn build_advanced_page(
     state: &Rc<AppState>,
-    editing_id: &Rc<RefCell<String>>,
     loading: &SyncGuard,
     apply_schedule: &ApplySchedule,
     parent: &adw::Window,
@@ -1194,10 +1189,11 @@ fn build_advanced_page(
             let second = second_protection.clone();
             dialog.connect_response(Some("disable"), move |_, _| {
                 state.config.borrow_mut().disable_high_power_fan_protection = true;
+                state.mark_config_changed();
                 loading.run(|| toggle.set_active(true));
                 first.set_high_power_protection(false);
                 second.set_high_power_protection(false);
-                let profile_id = state.config.borrow().active_profile.clone();
+                let profile_id = state.active_profile_id();
                 schedule_apply(&state, &schedule, profile_id);
             });
             dialog.present(Some(&parent_protection));
@@ -1206,6 +1202,7 @@ fn build_advanced_page(
                 .config
                 .borrow_mut()
                 .disable_high_power_fan_protection = false;
+            state_protection.mark_config_changed();
             let active = state_protection
                 .config
                 .borrow()
@@ -1215,7 +1212,7 @@ fn build_advanced_page(
                 });
             first_protection.set_high_power_protection(active);
             second_protection.set_high_power_protection(active);
-            let profile_id = state_protection.config.borrow().active_profile.clone();
+            let profile_id = state_protection.active_profile_id();
             schedule_apply(&state_protection, &apply_schedule_protection, profile_id);
         }
     });
@@ -1229,34 +1226,32 @@ fn build_advanced_page(
     }
 
     let state_temperature = state.clone();
-    let editing_temperature = editing_id.clone();
     let loading_temperature = loading.clone();
     let apply_schedule_temperature = apply_schedule.clone();
     cpu_temp_limit.connect_value_changed(move |scale| {
         if loading_temperature.active() {
             return;
         }
-        let id = editing_temperature.borrow().clone();
-        if let Some(profile) = state_temperature.config.borrow_mut().find_mut(&id) {
+        let id = state_temperature.editing_profile_id();
+        state_temperature.edit_profile(&id, |profile| {
             profile.cpu_temp_limit = scale.value() as u8;
-        }
+        });
         schedule_apply(&state_temperature, &apply_schedule_temperature, id);
     });
 
     let state_uv = state.clone();
     let apply_uv_c = apply_uv.clone();
-    let editing = editing_id.clone();
     let loading_uv = loading.clone();
     let apply_schedule_uv = apply_schedule.clone();
     uv.connect_value_changed(move |scale| {
         if loading_uv.active() {
             return;
         }
-        let id = editing.borrow().clone();
-        if let Some(p) = state_uv.config.borrow_mut().find_mut(&id) {
+        let id = state_uv.editing_profile_id();
+        state_uv.edit_profile(&id, |p| {
             p.cpu_co = scale.value() as i32;
             p.apply_undervolt = apply_uv_c.is_active();
-        }
+        });
         if apply_uv_c.is_active() {
             schedule_apply(&state_uv, &apply_schedule_uv, id);
         } else {
@@ -1264,28 +1259,26 @@ fn build_advanced_page(
         }
     });
     let state_chk = state.clone();
-    let editing = editing_id.clone();
     let loading_uv = loading.clone();
     let apply_schedule_uv = apply_schedule.clone();
     apply_uv.connect_toggled(move |chk| {
         if loading_uv.active() {
             return;
         }
-        let id = editing.borrow().clone();
-        if let Some(p) = state_chk.config.borrow_mut().find_mut(&id) {
+        let id = state_chk.editing_profile_id();
+        state_chk.edit_profile(&id, |p| {
             p.apply_undervolt = chk.is_active();
-        }
+        });
         schedule_apply(&state_chk, &apply_schedule_uv, id);
     });
 
     let state_manual = state.clone();
-    let editing_manual = editing_id.clone();
     let loading_manual = loading.clone();
     manual_apply.connect_clicked(move |button| {
         if loading_manual.active() {
             return;
         }
-        let id = editing_manual.borrow().clone();
+        let id = state_manual.editing_profile_id();
         let Some(offset) = state_manual
             .config
             .borrow()
@@ -1313,25 +1306,36 @@ fn build_advanced_page(
 }
 
 fn schedule_apply(state: &Rc<AppState>, schedule: &ApplySchedule, edited_profile: String) {
-    if let Some(source) = schedule.borrow_mut().take() {
-        source.remove();
+    if let Some(pending) = schedule.borrow_mut().take() {
+        pending.source.remove();
     }
     let state = state.clone();
     let schedule_done = schedule.clone();
-    *schedule.borrow_mut() = Some(glib::timeout_add_local_once(
-        std::time::Duration::from_millis(200),
-        move || {
-            schedule_done.borrow_mut().take();
-            state.save_config();
-            if profile_is_active(&state.config.borrow().active_profile, &edited_profile) {
-                state.apply_active();
-            }
-        },
-    ));
+    let edited_profile_for_callback = edited_profile.clone();
+    let source = glib::timeout_add_local_once(std::time::Duration::from_millis(200), move || {
+        schedule_done.borrow_mut().take();
+        commit_pending_edit(&state, &edited_profile_for_callback);
+    });
+    *schedule.borrow_mut() = Some(PendingApply {
+        source,
+        edited_profile,
+    });
 }
 
-fn profile_is_active(active_profile: &str, edited_profile: &str) -> bool {
-    active_profile == edited_profile
+fn flush_pending_edit(state: &Rc<AppState>, schedule: &ApplySchedule) -> bool {
+    let Some(pending) = schedule.borrow_mut().take() else {
+        return false;
+    };
+    pending.source.remove();
+    commit_pending_edit(state, &pending.edited_profile);
+    true
+}
+
+fn commit_pending_edit(state: &Rc<AppState>, edited_profile: &str) {
+    state.save_config();
+    if state.active_profile_id() == edited_profile {
+        state.apply_active();
+    }
 }
 
 struct ProfileEditorView {
@@ -1696,7 +1700,7 @@ fn profile_actions_are_editable(config: &z13helper_core::Config, profile_id: &st
 
 #[cfg(test)]
 mod tests {
-    use super::{profile_actions_are_editable, profile_is_active};
+    use super::profile_actions_are_editable;
 
     #[test]
     fn builtins_cannot_be_renamed_or_removed() {
@@ -1704,11 +1708,5 @@ mod tests {
         assert!(!profile_actions_are_editable(&config, "silent"));
         let custom = config.add_custom().id.clone();
         assert!(profile_actions_are_editable(&config, &custom));
-    }
-
-    #[test]
-    fn delayed_edits_do_not_apply_a_different_active_profile() {
-        assert!(profile_is_active("balanced", "balanced"));
-        assert!(!profile_is_active("turbo", "balanced"));
     }
 }

@@ -2,6 +2,7 @@
 mod app;
 mod css;
 mod gamescope;
+mod profile_coordinator;
 mod resources;
 mod services;
 mod ui;

@@ -21,6 +21,7 @@ pub struct Controller<P> {
     temperature_average: TemperatureAverager,
     hysteresis_state: HysteresisState,
     last_duty: [u8; 2],
+    duty_known: [bool; 2],
     last_ramp_at: Option<Instant>,
     consecutive_ec_errors: u32,
     release_failure: Option<String>,
@@ -37,6 +38,7 @@ impl<P: PortIo> Controller<P> {
             temperature_average: TemperatureAverager::default(),
             hysteresis_state: HysteresisState::default(),
             last_duty: [0; 2],
+            duty_known: [false; 2],
             last_ramp_at: None,
             consecutive_ec_errors: 0,
             release_failure: None,
@@ -68,6 +70,7 @@ impl<P: PortIo> Controller<P> {
         self.temperature_average.clear();
         self.hysteresis_state = HysteresisState::default();
         self.last_duty = [0; 2];
+        self.duty_known = [false; 2];
         self.last_ramp_at = None;
         self.consecutive_ec_errors = 0;
         Ok(())
@@ -78,6 +81,7 @@ impl<P: PortIo> Controller<P> {
         self.temperature_average.clear();
         self.hysteresis_state = HysteresisState::default();
         self.last_duty = [0; 2];
+        self.duty_known = [false; 2];
         self.last_ramp_at = None;
         match self.ec.set_global_mode(false) {
             Ok(()) => {
@@ -144,14 +148,19 @@ impl<P: PortIo> Controller<P> {
             // Mailbox writes are expensive and reselect the fan; leave a
             // stable duty untouched rather than sending the same command four
             // times per second.
-            if duty == self.last_duty[fan] {
+            if self.duty_known[fan] && duty == self.last_duty[fan] {
                 continue;
             }
             if let Err(error) = self.ec.set_duty(fan as u8, duty) {
+                // A mailbox transaction may have reached the EC before
+                // reporting an error. Do not treat the previous duty as
+                // authoritative, and retry this fan on the next tick/prime.
+                self.duty_known[fan] = false;
                 return Err(self.note_ec_error(error.to_string()));
             }
+            self.last_duty[fan] = duty;
+            self.duty_known[fan] = true;
         }
-        self.last_duty = duties;
         self.last_ramp_at = Some(now);
         self.consecutive_ec_errors = 0;
         Ok(())
@@ -197,6 +206,7 @@ impl<P: PortIo> Controller<P> {
         self.temperature_average.clear();
         self.hysteresis_state = HysteresisState::default();
         self.last_duty = [0; 2];
+        self.duty_known = [false; 2];
         self.last_ramp_at = None;
         match self.ec.set_global_mode(false) {
             Ok(()) => None,
@@ -242,7 +252,7 @@ pub fn ramp_duty(current: u8, target: u8, elapsed: Duration) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::io;
     use std::rc::Rc;
 
@@ -268,6 +278,7 @@ mod tests {
 
     struct SwitchIo {
         fail_writes: Rc<Cell<bool>>,
+        writes: Rc<RefCell<Vec<(u16, u8)>>>,
     }
 
     impl PortIo for SwitchIo {
@@ -279,7 +290,7 @@ mod tests {
             if self.fail_writes.get() {
                 return Err(io::Error::other("write failed"));
             }
-            let _ = (port, value);
+            self.writes.borrow_mut().push((port, value));
             Ok(())
         }
     }
@@ -295,6 +306,19 @@ mod tests {
             [80, duty],
             [90, duty],
         ]
+    }
+
+    fn duty_transaction_values(writes: &[(u16, u8)]) -> Vec<u8> {
+        writes
+            .windows(5)
+            .filter(|writes| {
+                writes[0] == (COMMAND_STATUS_PORT, 0xff)
+                    && writes[1] == (COMMAND_STATUS_PORT, 0xdd)
+                    && writes[2] == (DATA_PORT, 0x82)
+                    && writes[3] == (DATA_PORT, Register::Duty as u8)
+            })
+            .map(|writes| writes[4].1)
+            .collect()
     }
 
     #[test]
@@ -329,6 +353,44 @@ mod tests {
             .unwrap();
         controller.prime(Instant::now(), 60_000).unwrap();
         assert_eq!(controller.last_duty(), [200, 180]);
+    }
+
+    #[test]
+    fn controller_prime_physically_writes_initial_zero_then_skips_unchanged_zero() {
+        let mut controller = Controller::new(EcMailbox::new(FakeIo::default()));
+        controller
+            .enable([curve(0), curve(0)], FanHysteresis::default(), 0)
+            .unwrap();
+        let now = Instant::now();
+        controller.prime(now, 60_000).unwrap();
+        controller
+            .prime(now + DIRECT_TICK_INTERVAL, 60_000)
+            .unwrap();
+
+        let io = controller.into_io();
+        assert_eq!(duty_transaction_values(&io.writes), [0, 0]);
+    }
+
+    #[test]
+    fn failed_zero_prime_is_unknown_and_retried_with_an_ec_write() {
+        let fail_writes = Rc::new(Cell::new(false));
+        let writes = Rc::new(RefCell::new(Vec::new()));
+        let mut controller = Controller::new(EcMailbox::new(SwitchIo {
+            fail_writes: fail_writes.clone(),
+            writes: writes.clone(),
+        }));
+        controller
+            .enable([curve(0), curve(0)], FanHysteresis::default(), 0)
+            .unwrap();
+
+        fail_writes.set(true);
+        assert!(controller.prime(Instant::now(), 60_000).is_err());
+        fail_writes.set(false);
+        controller
+            .prime(Instant::now() + DIRECT_TICK_INTERVAL, 60_000)
+            .unwrap();
+
+        assert_eq!(duty_transaction_values(&writes.borrow()), [0, 0]);
     }
 
     #[test]
@@ -376,6 +438,7 @@ mod tests {
         let fail_writes = Rc::new(Cell::new(false));
         let mut controller = Controller::new(EcMailbox::new(SwitchIo {
             fail_writes: fail_writes.clone(),
+            writes: Rc::new(RefCell::new(Vec::new())),
         }));
         controller
             .enable([curve(100), curve(100)], FanHysteresis::default(), 0)

@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-pub type FanCurve = [[i32; 2]; 8];
+use crate::curve::Curve;
+
+pub const PPD_PROFILES: [&str; 3] = ["power-saver", "balanced", "performance"];
+
+pub fn is_known_ppd_profile(profile: &str) -> bool {
+    PPD_PROFILES.contains(&profile)
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -31,7 +37,7 @@ pub struct Profile {
     pub fan_temperature_average_seconds: u8,
     #[serde(default = "default_unified_fan_control")]
     pub unified_fan_control: bool,
-    pub fan_curves: [FanCurve; 2],
+    pub fan_curves: [Curve; 2],
     #[serde(default)]
     pub factory_fan_curves_loaded: bool,
     pub apply_undervolt: bool,
@@ -76,7 +82,7 @@ pub fn stock_ppt(ppd_profile: Option<&str>) -> (u32, u32, u32) {
 /// G-Helper's current portable fallback curves. These are editor defaults,
 /// not a claim about the firmware's private real-time fan control law.
 /// G-Helper stores duty as percent; these values are scaled to PWM 0-255.
-pub fn stock_fan_curves(ppd_profile: Option<&str>) -> [FanCurve; 2] {
+pub fn stock_fan_curves(ppd_profile: Option<&str>) -> [Curve; 2] {
     match ppd_profile {
         Some("power-saver") => [
             // CPU: 0/0/3/12/20/28/34/41 %
@@ -163,6 +169,11 @@ impl Profile {
         {
             return Err("PPD profile must not be empty".into());
         }
+        if let Some(ppd_profile) = &self.ppd_profile
+            && !is_known_ppd_profile(ppd_profile)
+        {
+            return Err(format!("unknown PPD profile {ppd_profile:?}"));
+        }
         for (name, value, maximum) in [
             ("PL1", self.pl1_spl, 93),
             ("PL2", self.pl2_sppt, 93),
@@ -182,6 +193,9 @@ impl Profile {
         }
         if self.fan_temperature_average_seconds > 15 {
             return Err("fan temperature averaging must be between 0 and 15 seconds".into());
+        }
+        if self.fan_control_mode == FanControlMode::Direct && !self.apply_fan_curve {
+            return Err("direct fan mode requires fan-curve application".into());
         }
         if !(-40..=0).contains(&self.cpu_co) {
             return Err("Curve Optimizer offset must be between -40 and 0".into());
@@ -247,10 +261,6 @@ impl Profile {
     }
 }
 
-pub fn default_fan_curve() -> FanCurve {
-    stock_fan_curves(Some("balanced"))[0]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,10 +283,26 @@ mod tests {
 
     #[test]
     fn g_helper_fallbacks_keep_cpu_and_gpu_distinct() {
-        for ppd in ["power-saver", "balanced", "performance"] {
+        for ppd in PPD_PROFILES {
             let curves = stock_fan_curves(Some(ppd));
             assert_ne!(curves[0], curves[1]);
         }
+    }
+
+    #[test]
+    fn rejects_unknown_ppd_profile() {
+        let mut profile = Profile::builtin("balanced", "Balanced");
+        profile.ppd_profile = Some("future-mode".into());
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn direct_mode_requires_fan_curve_application() {
+        let mut profile = Profile::builtin("balanced", "Balanced");
+        profile.fan_control_mode = FanControlMode::Direct;
+        assert!(profile.validate().is_err());
+        profile.apply_fan_curve = true;
+        assert!(profile.validate().is_ok());
     }
 
     #[test]

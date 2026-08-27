@@ -4,4 +4,7 @@ mod client;
 
 pub use client::{Client, SubscribeCancel};
 pub use z13helper_core::DaemonError;
-pub use z13helper_core::protocol::{DaemonState as State, LightingState, TdpState, UndervoltState};
+pub use z13helper_core::protocol::{
+    ClientId, DaemonState as State, LightingState, RequestId, RequestOutcome, TdpState,
+    UndervoltState, WireResponse,
+};

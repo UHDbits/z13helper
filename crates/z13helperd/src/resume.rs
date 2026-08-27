@@ -1,4 +1,4 @@
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -11,7 +11,7 @@ pub enum SleepEvent {
     Resumed,
 }
 
-pub fn spawn_resume_watcher(sender: Sender<SleepEvent>, terminate: Arc<AtomicBool>) {
+pub fn spawn_resume_watcher(sender: SyncSender<SleepEvent>, terminate: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         while !terminate.load(Ordering::Relaxed) {
             let result = (|| -> Result<(), zbus::Error> {

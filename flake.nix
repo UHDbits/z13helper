@@ -13,6 +13,9 @@
       flake-utils,
     }:
     let
+      cargoMetadata = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+      cargoVersion = cargoMetadata.workspace.package.version;
+
       packageOverlay = final: _prev: {
         z13helper = final.callPackage ./nix/package.nix { };
         z13helper-debug = final.callPackage ./nix/package.nix {
@@ -31,6 +34,11 @@
       system:
       let
         pkgs = mkPkgs system;
+        bpfClang = pkgs.llvmPackages.clang;
+        bpfLlvm = pkgs.llvmPackages.llvm;
+        bpfLibbpf = pkgs.lib.getDev pkgs.libbpf;
+        bpfCflags = "-O2 -g -target bpf -D__TARGET_ARCH_x86";
+        bpfIncludeFlags = "-I${bpfLibbpf}/include -I${pkgs.linuxHeaders}/include";
       in
       {
         packages = {
@@ -73,7 +81,15 @@
             pkgs.libxrandr
             pkgs.libxi
             pkgs.gsettings-desktop-schemas
+            bpfClang
+            bpfLlvm
+            pkgs.linuxHeaders
           ];
+
+          BPF_CLANG = "${bpfClang}/bin/clang";
+          BPF_STRIP = "${bpfLlvm}/bin/llvm-strip";
+          BPF_CFLAGS = bpfCflags;
+          BPF_INCLUDE_FLAGS = bpfIncludeFlags;
 
           shellHook = ''
             echo "z13helper dev shell (rustc $(rustc --version))"
@@ -111,7 +127,7 @@
             ];
             buildPhase = ''
               runHook preBuild
-              cargo clippy -p z13helper -p z13helperd -p z13helperctl --all-targets -- -D warnings
+              cargo clippy --workspace --all-targets --locked -- -D warnings
               runHook postBuild
             '';
             installPhase = "mkdir -p $out && touch $out/ok";
@@ -119,6 +135,33 @@
             doCheck = false;
             postFixup = "";
           });
+
+          fmt = pkgs.runCommand "z13helper-fmt" {
+            nativeBuildInputs = [ pkgs.cargo pkgs.rustfmt ];
+          } ''
+            cd ${self}
+            cargo fmt --all -- --check
+            touch "$out"
+          '';
+
+          metadata = pkgs.runCommand "z13helper-metadata-parity" { } ''
+            test "${pkgs.z13helper.version}" = "${cargoVersion}"
+            test "${cargoMetadata.workspace.package.license}" = "MIT"
+            touch "$out"
+          '';
+
+          bpf = pkgs.runCommand "z13helper-bpf-source-object" {
+            nativeBuildInputs = [ bpfClang bpfLlvm bpfLibbpf pkgs.linuxHeaders pkgs.gnumake ];
+          } ''
+            cd ${self}
+            make check-bpf \
+              TARGET_DIR="$TMPDIR/target" \
+              BPF_CLANG="${bpfClang}/bin/clang" \
+              BPF_STRIP="${bpfLlvm}/bin/llvm-strip" \
+              BPF_CFLAGS="${bpfCflags}" \
+              BPF_INCLUDE_FLAGS="${bpfIncludeFlags}"
+            touch "$out"
+          '';
         };
 
         formatter = pkgs.nixfmt-rfc-style;

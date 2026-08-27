@@ -10,8 +10,11 @@ use z13helper_core::{ApplyRequest, Config, ControllerAction};
 
 use crate::css;
 use crate::gamescope::Gamescope;
+use crate::profile_coordinator::{
+    ApplyRequest as CoordinatorApplyRequest, ApplyToken, ProfileCoordinator, ProfileOperationToken,
+};
 use crate::services::{controller::ControllerCapture, subscribe, worker};
-use crate::ui::main_window;
+use crate::ui::{hud, main_window};
 
 type ControllerActivation = (glib::WeakRef<gtk4::Widget>, Rc<dyn Fn()>);
 
@@ -21,16 +24,17 @@ pub struct AppState {
     pub app: adw::Application,
     pub config: RefCell<Config>,
     pub config_path: PathBuf,
+    /// Runtime-only profile identity/revision state. Never serialized.
+    pub coordinator: RefCell<ProfileCoordinator>,
     config_writable: Cell<bool>,
     pub client: Client,
-    pub applying: Cell<bool>,
-    apply_pending: Cell<bool>,
     pub on_battery: Cell<bool>,
     pub undervolt_available: Cell<Option<bool>>,
     pub main_window: RefCell<Option<adw::ApplicationWindow>>,
     fans_window: RefCell<Option<gtk4::Window>>,
     main_window_visible: Cell<bool>,
     pub gamescope: Option<Rc<Gamescope>>,
+    pub(crate) notification_owner: hud::NotificationOwner,
     controller_capture: Option<ControllerCapture>,
     controller_activations: RefCell<Vec<ControllerActivation>>,
     pub persistent_banner: RefCell<Option<adw::Banner>>,
@@ -63,20 +67,22 @@ impl AppState {
                 )
             }
         };
+        let profile_ids = config.profiles.iter().map(|profile| profile.id.clone());
+        let coordinator = ProfileCoordinator::new(config.active_profile.clone(), profile_ids);
         Rc::new(Self {
             app: app.clone(),
             config: RefCell::new(config),
             config_path,
+            coordinator: RefCell::new(coordinator),
             config_writable: Cell::new(config_writable),
             client,
-            applying: Cell::new(false),
-            apply_pending: Cell::new(false),
             on_battery: Cell::new(false),
             undervolt_available: Cell::new(None),
             main_window: RefCell::new(None),
             fans_window: RefCell::new(None),
             main_window_visible: Cell::new(false),
             gamescope,
+            notification_owner: hud::NotificationOwner::start(),
             controller_capture,
             controller_activations: RefCell::new(Vec::new()),
             persistent_banner: RefCell::new(None),
@@ -84,6 +90,122 @@ impl AppState {
             pending_persistent_error: RefCell::new(pending_error),
             pending_toast: RefCell::new(None),
         })
+    }
+
+    pub fn active_profile_id(&self) -> String {
+        self.coordinator.borrow().active_id().to_owned()
+    }
+
+    pub fn editing_profile_id(&self) -> String {
+        self.coordinator.borrow().editing_id().to_owned()
+    }
+
+    pub fn activate_profile(&self, id: &str) -> bool {
+        if self.config.borrow().find(id).is_none() {
+            return false;
+        }
+        let changed = self.coordinator.borrow_mut().activate(id);
+        if changed {
+            self.config.borrow_mut().active_profile = id.into();
+        }
+        changed
+    }
+
+    pub fn select_editing_profile(&self, id: &str) -> bool {
+        if self.config.borrow().find(id).is_none() {
+            return false;
+        }
+        self.coordinator.borrow_mut().select_editing(id)
+    }
+
+    pub fn mark_config_changed(&self) {
+        self.coordinator.borrow_mut().mark_config_changed();
+    }
+
+    /// Mutate one named profile and advance only that profile's runtime
+    /// revision. All callers run on GTK's main thread.
+    pub fn edit_profile<T>(
+        &self,
+        id: &str,
+        edit: impl FnOnce(&mut z13helper_core::Profile) -> T,
+    ) -> Option<T> {
+        let result = self.config.borrow_mut().find_mut(id).map(edit);
+        if result.is_some() {
+            self.coordinator.borrow_mut().mark_profile_changed(id);
+        }
+        result
+    }
+
+    pub fn add_custom_profile(&self) -> String {
+        let id = self.config.borrow_mut().add_custom().id.clone();
+        let mut coordinator = self.coordinator.borrow_mut();
+        coordinator.add_profile(&id);
+        coordinator.activate(&id);
+        coordinator.select_editing(&id);
+        id
+    }
+
+    pub fn rename_profile(&self, id: &str, name: &str) -> bool {
+        let renamed = self.config.borrow_mut().rename(id, name);
+        if renamed {
+            self.coordinator.borrow_mut().mark_profile_changed(id);
+        }
+        renamed
+    }
+
+    pub fn remove_profile(&self, id: &str) -> bool {
+        let old_active = self.active_profile_id();
+        let old_editing = self.editing_profile_id();
+        if !self.config.borrow_mut().remove(id) {
+            return false;
+        }
+        let config = self.config.borrow();
+        let fallback_editing = if old_editing == id {
+            config.active_profile.clone()
+        } else {
+            old_editing
+        };
+        let active = config.active_profile.clone();
+        drop(config);
+        self.coordinator
+            .borrow_mut()
+            .remove_profile(id, &active, &fallback_editing);
+        debug_assert_eq!(old_active == id, self.active_profile_id() != old_active);
+        true
+    }
+
+    pub fn begin_profile_operation(&self, id: &str) -> Option<ProfileOperationToken> {
+        self.coordinator.borrow_mut().begin_operation(id)
+    }
+
+    pub fn operation_is_current(&self, token: &ProfileOperationToken) -> bool {
+        self.coordinator.borrow().is_current_operation(token)
+    }
+
+    pub fn operation_is_current_editor(&self, token: &ProfileOperationToken) -> bool {
+        self.coordinator.borrow().is_current_editor(token)
+    }
+
+    pub fn replace_profile_if_current(
+        &self,
+        token: &ProfileOperationToken,
+        replacement: z13helper_core::Profile,
+    ) -> bool {
+        if !self.operation_is_current(token) {
+            return false;
+        }
+        let replaced = self
+            .config
+            .borrow_mut()
+            .find_mut(&token.id)
+            .map(|profile| *profile = replacement)
+            .is_some();
+        if replaced {
+            self.coordinator
+                .borrow_mut()
+                .mark_profile_changed(&token.id);
+        }
+        replaced
     }
 
     pub fn save_config(self: &Rc<Self>) {
@@ -114,7 +236,7 @@ impl AppState {
         let client = self.client.clone();
         let feedback = self.clone();
         worker::blocking(
-            move || client.panel_overdrive_set(i32::from(enabled)),
+            move || client.panel_overdrive_set(enabled),
             move |result| {
                 if let Err(error) = result {
                     feedback.report_error(&format!("Panel overdrive failed: {error}"));
@@ -134,7 +256,7 @@ impl AppState {
         {
             return;
         }
-        let mut ppd_profiles: Vec<String> = self
+        let targets: Vec<(ProfileOperationToken, String, String)> = self
             .config
             .borrow()
             .profiles
@@ -142,30 +264,64 @@ impl AppState {
             .filter(|profile| {
                 profile.builtin && !profile.factory_fan_curves_loaded && !profile.apply_fan_curve
             })
-            .filter_map(|profile| profile.ppd_profile.clone())
+            .filter_map(|profile| {
+                let ppd = profile.ppd_profile.clone()?;
+                let token = self.begin_profile_operation(&profile.id)?;
+                Some((token, profile.id.clone(), ppd))
+            })
             .collect();
+        let mut ppd_profiles: Vec<String> = targets.iter().map(|(_, _, ppd)| ppd.clone()).collect();
         ppd_profiles.sort();
         ppd_profiles.dedup();
+        if targets.is_empty() {
+            return;
+        }
         let client = self.client.clone();
         let done = self.clone();
         worker::blocking(
             move || client.factory_fan_curves(ppd_profiles),
             move |result| match result {
                 Ok(curves) => {
-                    let mut config = done.config.borrow_mut();
-                    for profile in &mut config.profiles {
-                        if !profile.builtin || profile.apply_fan_curve {
+                    let mut changed = false;
+                    let mut changed_active = false;
+                    for (token, id, ppd) in &targets {
+                        if !done.operation_is_current(token) {
+                            if done.active_profile_id() == *id {
+                                changed_active = true;
+                            }
                             continue;
                         }
-                        if let Some(curve) =
-                            profile.ppd_profile.as_ref().and_then(|ppd| curves.get(ppd))
-                        {
-                            profile.fan_curves = *curve;
-                            profile.factory_fan_curves_loaded = true;
+                        let Some(curve) = curves.get(ppd) else {
+                            continue;
+                        };
+                        let committed = done.edit_profile(id, |profile| {
+                            if profile.builtin
+                                && !profile.apply_fan_curve
+                                && profile.ppd_profile.as_deref() == Some(ppd.as_str())
+                            {
+                                profile.fan_curves = *curve;
+                                profile.factory_fan_curves_loaded = true;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if committed == Some(true) {
+                            changed = true;
+                            changed_active |= done.active_profile_id() == *id;
+                        }
+                        if !done.operation_is_current(token) && done.active_profile_id() == *id {
+                            // A stale read may have completed after an edit;
+                            // converge hardware to the newest active intent.
+                            changed_active = true;
                         }
                     }
-                    drop(config);
-                    done.save_config();
+                    if changed {
+                        done.save_config();
+                    }
+                    if changed_active {
+                        done.apply_active();
+                    }
                 }
                 Err(error) => done.report_error(&format!(
                     "Could not read firmware factory fan curves; using bundled defaults: {error}"
@@ -177,16 +333,26 @@ impl AppState {
     /// Apply the active profile. Requests are serialized and the latest one is
     /// queued while an apply is in flight.
     pub fn apply_active(self: &Rc<Self>) {
-        if self.applying.replace(true) {
-            self.apply_pending.set(true);
+        let active_id = self.active_profile_id();
+        if self.config.borrow().find(&active_id).is_none() {
             return;
         }
-        let profile = self.config.borrow().active().cloned();
-        let requested_profile = profile.as_ref().map(|profile| profile.id.clone());
+        let request = self
+            .coordinator
+            .borrow_mut()
+            .request_apply(self.on_battery.get());
+        let CoordinatorApplyRequest::Started(token) = request else {
+            return;
+        };
+        self.start_apply(token);
+    }
+
+    fn start_apply(self: &Rc<Self>, token: ApplyToken) {
+        let profile = self.config.borrow().find(&token.id).cloned();
         let disable_high_power = self.config.borrow().disable_high_power_fan_protection;
         let client = self.client.clone();
         let done = self.clone();
-        let on_battery = self.on_battery.get();
+        let worker_token = token.clone();
         worker::blocking(
             move || {
                 profile.map(|profile| {
@@ -194,22 +360,24 @@ impl AppState {
                 })
             },
             move |result| {
-                done.applying.set(false);
+                let on_battery = done.on_battery.get();
+                let completion = done
+                    .coordinator
+                    .borrow_mut()
+                    .complete_apply(&worker_token, on_battery);
                 match result {
-                    Some(Ok(response)) => {
-                        if let Some(id) = requested_profile.as_deref()
-                            && apply_result_is_current(
-                                &done.config.borrow().active_profile,
-                                id,
-                                done.on_battery.get(),
-                                on_battery,
-                            )
+                    Some(Ok(response)) if completion.current => {
                         {
                             done.config
                                 .borrow_mut()
-                                .set_active_for_power_source(id, on_battery);
+                                .set_active_for_power_source(&worker_token.id, on_battery);
                         }
                         done.save_config();
+                        if !response.warnings.is_empty() {
+                            done.report_error(&response.warnings.join(" · "));
+                        }
+                    }
+                    Some(Ok(response)) => {
                         if !response.warnings.is_empty() {
                             done.report_error(&response.warnings.join(" · "));
                         }
@@ -217,8 +385,8 @@ impl AppState {
                     Some(Err(error)) => done.report_error(&error.to_string()),
                     None => {}
                 }
-                if done.apply_pending.replace(false) {
-                    done.apply_active();
+                if let Some(next) = completion.next {
+                    done.start_apply(next);
                 }
             },
         );
@@ -470,15 +638,6 @@ impl AppState {
     }
 }
 
-fn apply_result_is_current(
-    active_profile: &str,
-    requested_profile: &str,
-    on_battery: bool,
-    requested_on_battery: bool,
-) -> bool {
-    active_profile == requested_profile && on_battery == requested_on_battery
-}
-
 fn focus_direction(window: &gtk4::Window, direction: gtk4::DirectionType) {
     if window_focus(window).is_none() {
         window.child_focus(gtk4::DirectionType::TabForward);
@@ -525,20 +684,4 @@ fn present_from_hardware_button(window: &adw::ApplicationWindow) {
         };
         toplevel.focus(gdk4::CURRENT_TIME);
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::apply_result_is_current;
-
-    #[test]
-    fn apply_completion_only_updates_the_state_it_requested() {
-        assert!(apply_result_is_current(
-            "balanced", "balanced", false, false
-        ));
-        assert!(!apply_result_is_current("turbo", "balanced", false, false));
-        assert!(!apply_result_is_current(
-            "balanced", "balanced", true, false
-        ));
-    }
 }

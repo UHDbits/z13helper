@@ -18,8 +18,6 @@ pub type Curve = [[i32; 2]; POINT_COUNT]; // [temp, pwm]
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CurveError {
-    #[error("fan curve must have exactly {POINT_COUNT} points")]
-    BadLength,
     #[error("temp {temp} in point {index} out of range 0–120")]
     TempRange { temp: i32, index: usize },
     #[error("pwm {pwm} in point {index} out of range 0–255")]
@@ -149,7 +147,10 @@ pub fn percent_to_pwm(pct: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::default_fan_curve;
+
+    fn default_fan_curve() -> Curve {
+        crate::profile::stock_fan_curves(Some("balanced"))[0]
+    }
 
     #[test]
     fn default_curve_valid() {

@@ -8,7 +8,7 @@ use crate::protocol::{ApplyRequest, TdpState};
 /// Hardware operations owned by `z13helperd`.
 pub trait Daemon {
     fn ppd_set(&mut self, profile: Option<&str>) -> Result<Option<String>, DaemonError>;
-    fn tdp_set(&mut self, limits: TdpState, force: bool) -> Result<(), DaemonError>;
+    fn tdp_set(&mut self, limits: TdpState) -> Result<(), DaemonError>;
     fn firmware_fans_set(
         &mut self,
         curves: &[Curve; 2],
@@ -65,11 +65,11 @@ pub fn apply_request(
     if pl1 >= HIGH_POWER_THRESHOLD_W && !request.disable_high_power_fan_protection {
         set_fans(daemon, request, &curves, pl1)?;
         if let Some(limits) = limits {
-            daemon.tdp_set(limits, true)?;
+            daemon.tdp_set(limits)?;
         }
     } else {
         if let Some(limits) = limits {
-            daemon.tdp_set(limits, pl1 >= HIGH_POWER_THRESHOLD_W)?;
+            daemon.tdp_set(limits)?;
         }
         if request.fan_curves.is_some() {
             set_fans(daemon, request, &curves, pl1)?;
@@ -124,9 +124,9 @@ mod tests {
             self.call(format!("ppd:{}", profile.unwrap_or("off")))?;
             Ok(None)
         }
-        fn tdp_set(&mut self, limits: TdpState, force: bool) -> Result<(), DaemonError> {
+        fn tdp_set(&mut self, limits: TdpState) -> Result<(), DaemonError> {
             self.call(format!(
-                "tdp:{}/{}/{}/{}/{}:force={force}",
+                "tdp:{}/{}/{}/{}/{}",
                 limits.pl1_spl, limits.pl2_sppt, limits.fppt, limits.apu_sppt, limits.platform_sppt
             ))
         }
@@ -181,6 +181,29 @@ mod tests {
     }
 
     #[test]
+    fn every_apply_stage_stops_before_a_later_hardware_stage() {
+        let mut request = request(80);
+        request.undervolt = Some(-10);
+        for stage in ["ppd", "firmware-fans", "tdp", "cpu-temp", "undervolt"] {
+            let mut daemon = RecordingDaemon {
+                fail_at: Some(stage),
+                uv: true,
+                ..Default::default()
+            };
+            assert!(
+                apply_request(&mut daemon, &request).is_err(),
+                "stage {stage}"
+            );
+            let calls = daemon.calls.into_inner();
+            let failed = calls
+                .iter()
+                .position(|call| call.split(':').next() == Some(stage))
+                .expect("the injected stage was called");
+            assert_eq!(calls.len(), failed + 1, "stage {stage} ran later work");
+        }
+    }
+
+    #[test]
     fn confirmed_override_does_not_install_protected_fans() {
         let mut request = request(80);
         request.disable_high_power_fan_protection = true;
@@ -229,20 +252,16 @@ mod tests {
         apply_request(&mut daemon, &request).unwrap();
         assert_eq!(
             daemon.calls.into_inner(),
-            [
-                "ppd:balanced",
-                "tdp:52/71/70/70/70:force=false",
-                "fans-release"
-            ]
+            ["ppd:balanced", "tdp:52/71/70/70/70", "fans-release"]
         );
     }
 
     #[test]
     fn stock_profiles_write_distinct_power_tables() {
         for (id, expected) in [
-            ("silent", "tdp:40/55/55/70/70:force=false"),
-            ("balanced", "tdp:52/71/70/70/70:force=false"),
-            ("turbo", "tdp:70/86/86/70/70:force=false"),
+            ("silent", "tdp:40/55/55/70/70"),
+            ("balanced", "tdp:52/71/70/70/70"),
+            ("turbo", "tdp:70/86/86/70/70"),
         ] {
             let profile = Profile::builtin(id, id);
             let request = ApplyRequest::from_profile(&profile, false);

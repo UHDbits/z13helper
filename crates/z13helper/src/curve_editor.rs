@@ -289,11 +289,11 @@ impl CurveEditor {
             if editor.high_power_protection.get() && idx >= 6 {
                 return glib::Propagation::Stop;
             }
-            curve[idx][0] += dt;
-            curve[idx][1] += curve::percent_to_pwm(dp) - curve::percent_to_pwm(0);
-            curve::enforce_curve(&mut curve, idx);
+            let changed = adjust_authored_point(&mut curve, idx, dt, dp);
             drop(curve);
-            editor.emit_changed();
+            if changed {
+                editor.emit_changed();
+            }
             glib::Propagation::Stop
         });
         self.area.add_controller(keys);
@@ -343,6 +343,35 @@ impl CurveEditor {
     }
 }
 
+fn adjust_authored_point(
+    curve: &mut Curve,
+    idx: usize,
+    temp_delta: i32,
+    pwm_delta_percent: i32,
+) -> bool {
+    if idx >= POINT_COUNT {
+        return false;
+    }
+
+    let before = *curve;
+    curve[idx][0] = curve[idx][0]
+        .saturating_add(temp_delta)
+        .clamp(curve::TEMP_MIN, curve::TEMP_MAX);
+    let pwm_step = if pwm_delta_percent >= 0 {
+        curve::percent_to_pwm(pwm_delta_percent)
+    } else {
+        curve::percent_to_pwm(pwm_delta_percent.saturating_neg())
+    };
+    curve[idx][1] = if pwm_delta_percent >= 0 {
+        curve[idx][1].saturating_add(pwm_step)
+    } else {
+        curve[idx][1].saturating_sub(pwm_step)
+    }
+    .clamp(curve::PWM_MIN, curve::PWM_MAX);
+    curve::enforce_curve(curve, idx);
+    *curve != before
+}
+
 fn curve_for_display(authored: &Curve, protection: bool) -> Curve {
     if protection {
         curve::high_power_curve(authored)
@@ -353,8 +382,57 @@ fn curve_for_display(authored: &Curve, protection: bool) -> Curve {
 
 #[cfg(test)]
 mod tests {
-    use super::curve_for_display;
+    use super::{adjust_authored_point, curve_for_display};
     use z13helper_core::curve::{self, Curve};
+
+    fn test_curve() -> Curve {
+        [
+            [20, 0],
+            [30, 32],
+            [40, 64],
+            [50, 96],
+            [60, 128],
+            [70, 160],
+            [80, 192],
+            [90, 224],
+        ]
+    }
+
+    #[test]
+    fn keyboard_pwm_adjustment_uses_saturating_authored_deltas() {
+        let mut curve = test_curve();
+        curve[0][1] = 0;
+        assert!(!adjust_authored_point(&mut curve, 0, 0, -1));
+        assert_eq!(curve[0][1], 0);
+
+        curve[0][1] = 1;
+        assert!(adjust_authored_point(&mut curve, 0, 0, -1));
+        assert_eq!(curve[0][1], 0);
+
+        curve[0][1] = 0;
+        assert!(adjust_authored_point(&mut curve, 0, 0, 1));
+        assert_eq!(curve[0][1], 2);
+
+        curve[0][1] = 254;
+        assert!(adjust_authored_point(&mut curve, 0, 0, 1));
+        assert_eq!(curve[0][1], 255);
+
+        curve[0][1] = 255;
+        assert!(adjust_authored_point(&mut curve, 0, 0, -1));
+        assert_eq!(curve[0][1], 253);
+        assert!(curve::validate(&curve).is_ok());
+    }
+
+    #[test]
+    fn keyboard_adjustment_preserves_authored_curve_invariants() {
+        let mut curve = test_curve();
+        assert!(adjust_authored_point(&mut curve, 4, 0, -5));
+        assert!(curve::validate(&curve).is_ok());
+        for pair in curve.windows(2) {
+            assert!(pair[1][0] > pair[0][0]);
+            assert!(pair[1][1] >= pair[0][1]);
+        }
+    }
 
     #[test]
     fn protection_only_changes_the_display_copy() {
