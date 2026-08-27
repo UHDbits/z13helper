@@ -64,25 +64,16 @@ impl<P: PortIo> Controller<P> {
         self.ec
             .set_global_mode(true)
             .map_err(|error| self.note_ec_error(error.to_string()))?;
+        self.reset_runtime();
+        self.consecutive_ec_errors = 0;
         self.curves = Some(curves);
         self.hysteresis = hysteresis;
         self.temperature_average_seconds = temperature_average_seconds;
-        self.temperature_average.clear();
-        self.hysteresis_state = HysteresisState::default();
-        self.last_duty = [0; 2];
-        self.duty_known = [false; 2];
-        self.last_ramp_at = None;
-        self.consecutive_ec_errors = 0;
         Ok(())
     }
 
     pub fn release(&mut self) -> Result<(), String> {
-        self.curves = None;
-        self.temperature_average.clear();
-        self.hysteresis_state = HysteresisState::default();
-        self.last_duty = [0; 2];
-        self.duty_known = [false; 2];
-        self.last_ramp_at = None;
+        self.reset_runtime();
         match self.ec.set_global_mode(false) {
             Ok(()) => {
                 self.consecutive_ec_errors = 0;
@@ -202,12 +193,7 @@ impl<P: PortIo> Controller<P> {
     }
 
     fn release_best_effort(&mut self) -> Option<String> {
-        self.curves = None;
-        self.temperature_average.clear();
-        self.hysteresis_state = HysteresisState::default();
-        self.last_duty = [0; 2];
-        self.duty_known = [false; 2];
-        self.last_ramp_at = None;
+        self.reset_runtime();
         match self.ec.set_global_mode(false) {
             Ok(()) => None,
             Err(error) => {
@@ -217,6 +203,15 @@ impl<P: PortIo> Controller<P> {
                 Some(error)
             }
         }
+    }
+
+    fn reset_runtime(&mut self) {
+        self.curves = None;
+        self.temperature_average.clear();
+        self.hysteresis_state = HysteresisState::default();
+        self.last_duty = [0; 2];
+        self.duty_known = [false; 2];
+        self.last_ramp_at = None;
     }
 
     #[cfg(test)]
@@ -322,27 +317,21 @@ mod tests {
     }
 
     #[test]
-    fn ramp_reaches_a_higher_target_within_one_second_without_overshoot() {
+    fn ramp_reaches_targets_with_timing_and_bounds() {
         let mut duty = 0;
-        let target = 200;
         for _ in 0..4 {
-            duty = ramp_duty(duty, target, DIRECT_TICK_INTERVAL);
-            assert!(duty <= target);
+            duty = ramp_duty(duty, 200, DIRECT_TICK_INTERVAL);
+            assert!(duty <= 200);
         }
-        assert_eq!(duty, target);
-    }
+        assert_eq!(duty, 200);
 
-    #[test]
-    fn ramp_falls_smoothly_in_about_two_and_a_half_seconds_without_undershoot() {
-        let mut duty = 255;
-        let target = 20;
+        duty = 255;
         for _ in 0..9 {
-            duty = ramp_duty(duty, target, DIRECT_TICK_INTERVAL);
-            assert!(duty >= target);
+            duty = ramp_duty(duty, 20, DIRECT_TICK_INTERVAL);
+            assert!(duty >= 20);
         }
-        assert!(duty > target);
-        duty = ramp_duty(duty, target, DIRECT_TICK_INTERVAL);
-        assert_eq!(duty, target);
+        assert!(duty > 20);
+        assert_eq!(ramp_duty(duty, 20, DIRECT_TICK_INTERVAL), 20);
     }
 
     #[test]

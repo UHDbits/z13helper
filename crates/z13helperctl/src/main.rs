@@ -58,12 +58,6 @@ fn expect_arity_between(
     }
 }
 
-fn parse_i32(value: &str, name: &str) -> Result<i32, String> {
-    value
-        .parse::<i32>()
-        .map_err(|error| format!("{name} must be an integer: {error}"))
-}
-
 fn parse_request_id(value: &str) -> Result<u64, String> {
     let request_id = value
         .parse::<u64>()
@@ -76,7 +70,9 @@ fn parse_request_id(value: &str) -> Result<u64, String> {
 }
 
 fn parse_i32_in_range(value: &str, name: &str, range: RangeInclusive<i32>) -> Result<i32, String> {
-    let parsed = parse_i32(value, name)?;
+    let parsed = value
+        .parse::<i32>()
+        .map_err(|error| format!("{name} must be an integer: {error}"))?;
     if range.contains(&parsed) {
         Ok(parsed)
     } else {
@@ -101,9 +97,7 @@ fn validate_lighting_color(value: &str) -> Result<(), String> {
 
 fn validate_lighting_mode(value: &str) -> Result<(), String> {
     match value {
-        "static" | "breathe" | "breathing" | "cycle" | "color-cycle" | "rainbow" | "strobe" => {
-            Ok(())
-        }
+        "static" | "breathe" | "cycle" | "rainbow" | "strobe" => Ok(()),
         _ => Err(format!("unsupported lighting mode {value:?}")),
     }
 }
@@ -404,10 +398,6 @@ mod tests {
         ];
         let error = parse_lighting(&args).unwrap_err();
         assert!(error.contains("between 0 and 3"));
-    }
-
-    #[test]
-    fn lighting_off_does_not_accept_extra_fields() {
         let args = vec!["keyboard".into(), "off".into(), "FFFFFF".into()];
         assert!(parse_lighting(&args).is_err());
     }

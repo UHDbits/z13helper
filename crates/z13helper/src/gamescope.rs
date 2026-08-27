@@ -848,10 +848,6 @@ mod tests {
         assert_eq!(ui_scale(2560, "1.25"), 1.25);
         assert_eq!(ui_scale(2560, "0.1"), MIN_SCALE);
         assert_eq!(ui_scale(2560, "30"), MAX_SCALE);
-    }
-
-    #[test]
-    fn invalid_scaling_override_uses_auto_detection() {
         let automatic = ui_scale(2560, "");
         for invalid in ["garbage", "0", "-2", "NaN"] {
             assert_eq!(ui_scale(2560, invalid), automatic);

@@ -7,7 +7,7 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use z13helper_core::label::mode_label;
-use z13helper_core::{LightingState, WireStatus};
+use z13helper_core::{DaemonError, LightingState, WireStatus};
 
 use crate::app::AppState;
 use crate::services::worker;
@@ -982,19 +982,23 @@ fn install_battery_debounce(state: &Rc<AppState>, scale: &gtk::Scale, sync: &Syn
     });
 }
 
+fn reconcile_state(state: &AppState, view: &MainView, result: Result<WireStatus, DaemonError>) {
+    match result {
+        Ok(status) => {
+            view.banner.set_revealed(false);
+            view.sync_from(state, &status);
+        }
+        Err(_) => view.banner.set_revealed(true),
+    }
+}
+
 fn sync_once(state: &Rc<AppState>, view: &MainView) {
     let client = state.client.clone();
     let view = view.clone();
     let state = state.clone();
     worker::blocking(
         move || client.get_state(),
-        move |result| match result {
-            Ok(s) => {
-                view.banner.set_revealed(false);
-                view.sync_from(&state, &s);
-            }
-            Err(_) => view.banner.set_revealed(true),
-        },
+        move |result| reconcile_state(&state, &view, result),
     );
 }
 
@@ -1013,13 +1017,7 @@ fn install_telemetry(state: &Rc<AppState>, view: MainView) {
             move || client.get_state(),
             move |result| {
                 busy.set(false);
-                match result {
-                    Ok(s) => {
-                        view.banner.set_revealed(false);
-                        view.sync_from(&state, &s);
-                    }
-                    Err(_) => view.banner.set_revealed(true),
-                }
+                reconcile_state(&state, &view, result);
             },
         );
         glib::ControlFlow::Continue

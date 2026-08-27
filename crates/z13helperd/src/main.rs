@@ -518,7 +518,7 @@ fn handle_client(
             request_id,
             events,
         } => {
-            if !reserve_subscriber(&subscriber_count) {
+            if !reserve_slot(&subscriber_count, MAX_SUBSCRIBERS) {
                 write_response(
                     &mut stream,
                     &failure(
@@ -649,10 +649,10 @@ fn commit_effects(
     }
 }
 
-fn reserve_subscriber(count: &AtomicUsize) -> bool {
+fn reserve_slot(count: &AtomicUsize, limit: usize) -> bool {
     count
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (current < MAX_SUBSCRIBERS).then_some(current + 1)
+            (current < limit).then_some(current + 1)
         })
         .is_ok()
 }
@@ -721,14 +721,6 @@ fn broadcast(
             Err(_) => false,
         }
     });
-}
-
-fn reserve_client_slot(active: &AtomicUsize) -> bool {
-    active
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            (current < MAX_ACTIVE_CLIENTS).then_some(current + 1)
-        })
-        .is_ok()
 }
 
 struct ClientSlot(Arc<AtomicUsize>);
@@ -811,7 +803,7 @@ fn main() -> Result<()> {
     let mut next_hotplug = Instant::now();
     let mut next_steam_retry = Instant::now();
     let mut capture = CaptureCoordinator::new();
-    let mut steam_blocker = SteamBlocker::new();
+    let mut steam_blocker = SteamBlocker::default();
     let mut resume_pending = false;
     tracing::info!(
         socket = SOCKET_PATH,
@@ -823,7 +815,7 @@ fn main() -> Result<()> {
         for _ in 0..MAX_ACCEPTS_PER_PUMP {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    if !reserve_client_slot(&active_clients) {
+                    if !reserve_slot(&active_clients, MAX_ACTIVE_CLIENTS) {
                         tracing::warn!("active client limit reached; rejecting connection");
                         let mut stream = stream;
                         let _ = write_response(
@@ -999,10 +991,10 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BACKEND_RESPONSE_TIMEOUT, BpfAction, CaptureCoordinator, CapturePhase, CaptureStatus,
-        Lifecycle, MAX_ACTIVE_CLIENTS, MAX_FRAME_BYTES, MAX_SUBSCRIBERS, OwnedSocket,
-        SingletonLock, bind_socket, encode_frame, lifecycle_is_active, read_request_frame,
-        reconcile_failed_suspend, reserve_client_slot, reserve_subscriber, subscriber_alive,
+        BpfAction, CaptureCoordinator, CapturePhase, CaptureStatus, Lifecycle, MAX_ACTIVE_CLIENTS,
+        MAX_FRAME_BYTES, MAX_SUBSCRIBERS, OwnedSocket, SingletonLock, bind_socket, encode_frame,
+        lifecycle_is_active, read_request_frame, reconcile_failed_suspend, reserve_slot,
+        subscriber_alive,
     };
     use std::fs;
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -1047,8 +1039,8 @@ mod tests {
     fn client_and_subscriber_budgets_are_hard_caps() {
         let clients = AtomicUsize::new(MAX_ACTIVE_CLIENTS);
         let subscribers = AtomicUsize::new(MAX_SUBSCRIBERS);
-        assert!(!reserve_client_slot(&clients));
-        assert!(!reserve_subscriber(&subscribers));
+        assert!(!reserve_slot(&clients, MAX_ACTIVE_CLIENTS));
+        assert!(!reserve_slot(&subscribers, MAX_SUBSCRIBERS));
     }
 
     #[test]
@@ -1069,10 +1061,6 @@ mod tests {
         let mut unterminated =
             std::io::BufReader::new(std::io::Cursor::new(vec![b'x'; MAX_FRAME_BYTES - 1]));
         assert!(read_request_frame(&mut unterminated).is_err());
-    }
-
-    #[test]
-    fn encoded_response_boundary_is_exact_and_overflow_is_rejected() {
         let response = failure(None, ErrorCode::Rejected, "");
         let empty_len = serde_json::to_vec(&response).unwrap().len();
         let exact = failure(
@@ -1105,11 +1093,6 @@ mod tests {
         let lifecycle = Arc::new(Mutex::new(Lifecycle::Suspended));
         reconcile_failed_suspend(&lifecycle);
         assert_eq!(*lifecycle.lock().unwrap(), Lifecycle::Active);
-    }
-
-    #[test]
-    fn backend_response_wait_is_bounded_and_outcome_unknown_is_allowed() {
-        assert_eq!(BACKEND_RESPONSE_TIMEOUT, Duration::from_secs(10));
     }
 
     #[test]

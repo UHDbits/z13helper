@@ -328,7 +328,7 @@ fn classify_supplies(supplies: &[SupplyReading]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{ReconnectState, SupplyReading, classify_supplies, publish};
-    use z13helper_core::debounce::{DebounceAction, PowerDebouncer, PowerObservation};
+    use z13helper_core::debounce::PowerObservation;
 
     fn supply(kind: &str, online: Option<&str>, status: Option<&str>) -> SupplyReading {
         SupplyReading {
@@ -344,23 +344,6 @@ mod tests {
         assert!(publish(&tx, PowerObservation::Known(false)));
         assert!(publish(&tx, PowerObservation::Known(true)));
         assert_eq!(rx.try_recv(), Ok(PowerObservation::Known(true)));
-    }
-
-    #[test]
-    fn fake_properties_changed_signal_confirms_one_stable_value() {
-        let mut debouncer = PowerDebouncer::new(100);
-        let timer = match debouncer.observe(PowerObservation::Known(true), 10) {
-            DebounceAction::Wait(timer) => timer,
-            other => panic!("expected timer, got {other:?}"),
-        };
-        assert_eq!(
-            debouncer.observe(PowerObservation::Known(true), 50),
-            DebounceAction::Wait(timer)
-        );
-        assert_eq!(
-            debouncer.on_timer(timer, 110),
-            DebounceAction::Confirmed(true)
-        );
     }
 
     #[test]

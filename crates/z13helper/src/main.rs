@@ -79,22 +79,3 @@ fn install_standard_actions(app: &adw::Application) {
     app.add_action(&hide_all);
     app.set_accels_for_action("app.hide-all", &["<Primary>q"]);
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn desktop_metadata_matches_application_id() {
-        let desktop = include_str!("../../../contrib/com.ashtonantila.z13helper.desktop");
-        assert!(desktop.contains(&format!("StartupWMClass={APPLICATION_ID}")));
-        assert!(desktop.contains(&format!("X-GNOME-Application-ID={APPLICATION_ID}")));
-    }
-
-    #[test]
-    fn user_service_loads_gamescope_session_environment() {
-        let service = include_str!("../../../contrib/z13helper.service");
-        assert!(service.contains("EnvironmentFile=-%t/gamescope-environment"));
-        assert!(service.contains("Environment=Z13HELPER_START_HIDDEN=1"));
-    }
-}

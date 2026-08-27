@@ -29,9 +29,7 @@ let
         type = types.enum [
           "static"
           "breathe"
-          "breathing"
           "cycle"
-          "color-cycle"
           "rainbow"
           "strobe"
           "off"

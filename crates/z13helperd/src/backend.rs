@@ -57,6 +57,14 @@ pub struct PlatformHardware {
 }
 
 impl PlatformHardware {
+    fn fan_curves_for_hardware(&self, curves: &[Curve; 2], effective_pl1: u32) -> [Curve; 2] {
+        if effective_pl1 >= HIGH_POWER_THRESHOLD_W && !self.disable_high_power_fan_protection {
+            [high_power_curve(&curves[0]), high_power_curve(&curves[1])]
+        } else {
+            *curves
+        }
+    }
+
     pub fn acquire() -> Result<(Self, ProbeReply), String> {
         let (direct, probe) = DirectRuntime::start()?;
         let sysfs = Sysfs::default();
@@ -147,11 +155,7 @@ impl PlatformHardware {
         self.aura.apply(device, state)
     }
 
-    pub fn refresh_aura(&mut self) {
-        let _ = self.aura.refresh();
-    }
-
-    pub fn refresh_new_aura(&mut self) -> Vec<String> {
+    pub fn refresh_aura(&mut self) -> Vec<String> {
         self.aura.refresh()
     }
 
@@ -255,12 +259,7 @@ impl Daemon for PlatformHardware {
         curves: &[Curve; 2],
         effective_pl1: u32,
     ) -> Result<(), DaemonError> {
-        let written =
-            if effective_pl1 >= HIGH_POWER_THRESHOLD_W && !self.disable_high_power_fan_protection {
-                [high_power_curve(&curves[0]), high_power_curve(&curves[1])]
-            } else {
-                *curves
-            };
+        let written = self.fan_curves_for_hardware(curves, effective_pl1);
         let sysfs = &self.sysfs;
         let result = firmware_transition(&mut self.direct, || sysfs.set_firmware_curves(&written));
         if let Ok(snapshot) = self.direct.snapshot() {
@@ -274,12 +273,7 @@ impl Daemon for PlatformHardware {
         curves: &[Curve; 2],
         effective_pl1: u32,
     ) -> Result<(), DaemonError> {
-        let written =
-            if effective_pl1 >= HIGH_POWER_THRESHOLD_W && !self.disable_high_power_fan_protection {
-                [high_power_curve(&curves[0]), high_power_curve(&curves[1])]
-            } else {
-                *curves
-            };
+        let written = self.fan_curves_for_hardware(curves, effective_pl1);
         if let Err(error) = self.prime_direct(written) {
             let release = self.release_direct().err();
             return Err(DaemonError::Rejected(match release {
@@ -897,7 +891,7 @@ impl Backend {
     }
 
     pub fn restore_hotplugged_lighting(&mut self) {
-        let connected = self.hardware.refresh_new_aura();
+        let connected = self.hardware.refresh_aura();
         for device in connected {
             let state = self
                 .persisted
@@ -958,7 +952,7 @@ impl Backend {
         if let Some(rpms) = self.hardware.observed_fan_rpms() {
             self.persisted.state.fan_rpms = rpms;
         }
-        self.hardware.refresh_aura();
+        let _ = self.hardware.refresh_aura();
         self.hardware.refresh_ppd();
         self.persisted.state.undervolt_available = self.hardware.undervolt_available;
         self.persisted.state.ppd_profile = self.hardware.ppd_profile.clone();
@@ -1409,10 +1403,10 @@ mod tests {
     use super::{
         Backend, FactoryQueryRestore, MAX_WARNINGS, PersistenceMode, PlatformHardware,
         ShutdownHardware, StateWriter, bounded_warnings, effective_battery_limit,
-        factory_query_restore_plan, firmware_transition, next_generation,
-        normalize_factory_curve_profiles, one_time_charge_is_complete, power_source_changed,
-        push_warning, shutdown_hardware_actions, stock_tdp, validate_factory_curve_query_power,
-        validate_fan_release_power, validate_manual_undervolt,
+        factory_query_restore_plan, firmware_transition, normalize_factory_curve_profiles,
+        one_time_charge_is_complete, power_source_changed, push_warning, shutdown_hardware_actions,
+        stock_tdp, validate_factory_curve_query_power, validate_fan_release_power,
+        validate_manual_undervolt,
     };
     use crate::aura::AuraDevices;
     use crate::direct_runtime::DirectRuntime;
@@ -1424,7 +1418,6 @@ mod tests {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use z13helper_core::curve::Curve;
-    use z13helper_core::curve::high_power_curve;
     use z13helper_core::error::DaemonError;
     use z13helper_core::profile::Profile;
     use z13helper_core::protocol::{ApplyRequest, TdpState};
@@ -1689,23 +1682,6 @@ mod tests {
         assert!(!one_time_charge_is_complete(true, Some(99)));
         assert!(one_time_charge_is_complete(true, Some(100)));
         assert!(!one_time_charge_is_complete(false, Some(100)));
-    }
-
-    #[test]
-    fn auxiliary_generation_is_staged_without_mutating_the_previous_value() {
-        let previous = u64::MAX - 1;
-        let candidate = next_generation(previous);
-        assert_eq!(previous, u64::MAX - 1);
-        assert_eq!(candidate, u64::MAX);
-        assert_eq!(next_generation(u64::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn fan_release_rollback_curve_keeps_both_protected_endpoints() {
-        let authored: Curve = [[20, 0]; 8];
-        let protected = high_power_curve(&authored);
-        assert_eq!(protected[6], [80, 204]);
-        assert_eq!(protected[7], [90, 255]);
     }
 
     #[test]

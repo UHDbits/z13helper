@@ -208,8 +208,8 @@ fn parse_color(value: &str) -> Result<[u8; 3], String> {
 fn mode_byte(mode: &str) -> Result<u8, String> {
     match mode {
         "static" => Ok(0x00),
-        "breathe" | "breathing" => Ok(0x01),
-        "cycle" | "color-cycle" => Ok(0x02),
+        "breathe" => Ok(0x01),
+        "cycle" => Ok(0x02),
         "rainbow" => Ok(0x03),
         "strobe" => Ok(0x0A),
         _ => Err(format!("unsupported Aura mode {mode:?}")),
@@ -219,7 +219,7 @@ fn mode_byte(mode: &str) -> Result<u8, String> {
 fn speed_byte(speed: &str) -> Result<u8, String> {
     match speed {
         "slow" => Ok(0xE1),
-        "normal" | "medium" | "" => Ok(0xEB),
+        "normal" | "" => Ok(0xEB),
         "fast" => Ok(0xF5),
         _ => Err(format!("unsupported Aura speed {speed:?}")),
     }

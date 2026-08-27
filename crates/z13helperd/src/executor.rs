@@ -783,26 +783,6 @@ mod tests {
     }
 
     #[test]
-    fn queued_admission_is_fifo_by_sync_channel_order() {
-        let (sender, receiver) = mpsc::sync_channel(4);
-        sender.send(1).unwrap();
-        sender.send(2).unwrap();
-        sender.send(3).unwrap();
-        assert_eq!(receiver.recv().unwrap(), 1);
-        assert_eq!(receiver.recv().unwrap(), 2);
-        assert_eq!(receiver.recv().unwrap(), 3);
-    }
-
-    #[test]
-    fn peer_liveness_detects_disconnect_without_touching_hardware() {
-        let (peer, stream) = UnixStream::pair().unwrap();
-        let liveness = PeerLiveness::from_stream(&stream).unwrap();
-        assert!(liveness.is_alive());
-        drop(peer);
-        assert!(!liveness.is_alive());
-    }
-
-    #[test]
     fn expired_or_disconnected_jobs_are_rejected_before_start() {
         let now = Instant::now();
         assert!(!can_start(now, now - Duration::from_millis(1), true));

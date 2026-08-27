@@ -224,13 +224,6 @@ impl Client {
         Ok(())
     }
 
-    /// Look up an accepted request after a reconnect. The returned response
-    /// carries the request's current outcome and, when completed, its original
-    /// payload or error.
-    pub fn get_outcome(&self, request_id: u64) -> Result<WireResponse, DaemonError> {
-        self.get_outcome_for(Self::client_id(), request_id)
-    }
-
     /// Look up an accepted request using the complete recovery identity shown
     /// by [`DaemonError::OutcomeUnknown`]. This supports a new process after
     /// the process that submitted the request has exited.
@@ -333,12 +326,6 @@ pub struct SubscribeCancel {
     tx: std::sync::mpsc::Sender<()>,
 }
 
-impl SubscribeCancel {
-    pub fn cancel(self) {
-        let _ = self.tx.send(());
-    }
-}
-
 impl Drop for SubscribeCancel {
     fn drop(&mut self) {
         let _ = self.tx.send(());
@@ -421,6 +408,40 @@ mod tests {
     use super::*;
     use std::io::{BufReader, Cursor};
     use std::os::unix::net::UnixListener;
+
+    fn assert_command(
+        check: impl FnOnce(Command) + Send + 'static,
+        invoke: impl FnOnce(Client) -> Result<(), DaemonError>,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "z13helper-client-command-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: WireRequest = serde_json::from_str(line.trim()).unwrap();
+            let request_id = request.request_id;
+            check(request.command);
+            let mut stream = stream;
+            writeln!(
+                stream,
+                "{}",
+                serde_json::to_string(&WireResponse::success(request_id)).unwrap()
+            )
+            .unwrap();
+        });
+        invoke(Client::with_path(path)).unwrap();
+    }
 
     #[test]
     fn missing_socket_error_is_not_running() {
@@ -611,92 +632,25 @@ mod tests {
     }
 
     #[test]
-    fn one_time_charge_uses_persistent_daemon_command() {
-        let dir = std::env::temp_dir().join(format!(
-            "z13helper-client-charge-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("daemon.sock");
-        let listener = match UnixListener::bind(&path) {
-            Ok(listener) => listener,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(error) => panic!("bind {}: {error}", path.display()),
-        };
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            assert!(request.contains("\"cmd\":\"set-battery-one-time-charge\""));
-            assert!(request.contains("\"enabled\":true"));
-            let request_id = serde_json::from_str::<WireRequest>(request.trim())
-                .unwrap()
-                .request_id;
-            let mut stream = stream;
-            writeln!(
-                stream,
-                "{}",
-                serde_json::to_string(&WireResponse::success(request_id)).unwrap()
-            )
-            .unwrap();
-        });
-        Client::with_path(path)
-            .battery_one_time_charge_set(true)
-            .unwrap();
-    }
-
-    #[test]
-    fn panel_overdrive_accepts_a_typed_boolean() {
-        let dir = std::env::temp_dir().join(format!(
-            "z13helper-client-panel-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("daemon.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            let request: WireRequest = serde_json::from_str(request.trim()).unwrap();
-            assert!(matches!(
-                request.command,
-                Command::SetPanelOverdrive { enabled: true }
-            ));
-            let mut stream = stream;
-            writeln!(
-                stream,
-                "{}",
-                serde_json::to_string(&WireResponse::success(request.request_id)).unwrap()
-            )
-            .unwrap();
-        });
-        Client::with_path(path).panel_overdrive_set(true).unwrap();
-    }
-
-    #[test]
-    fn lighting_accepts_the_complete_typed_state() {
-        let dir = std::env::temp_dir().join(format!(
-            "z13helper-client-lighting-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("daemon.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+    fn scalar_commands_use_typed_daemon_requests() {
+        assert_command(
+            |command| {
+                assert!(matches!(
+                    command,
+                    Command::SetBatteryOneTimeCharge { enabled: true }
+                ))
+            },
+            |client| client.battery_one_time_charge_set(true),
+        );
+        assert_command(
+            |command| {
+                assert!(matches!(
+                    command,
+                    Command::SetPanelOverdrive { enabled: true }
+                ))
+            },
+            |client| client.panel_overdrive_set(true),
+        );
         let expected = LightingState {
             enabled: false,
             mode: "static".into(),
@@ -705,67 +659,24 @@ mod tests {
             speed: "slow".into(),
             brightness: 1,
         };
-        let expected_for_server = expected.clone();
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            let request: WireRequest = serde_json::from_str(request.trim()).unwrap();
-            assert!(matches!(
-                request.command,
-                Command::SetLighting { device, state }
-                    if device == "keyboard" && state == expected_for_server
-            ));
-            let mut stream = stream;
-            writeln!(
-                stream,
-                "{}",
-                serde_json::to_string(&WireResponse::success(request.request_id)).unwrap()
-            )
-            .unwrap();
-        });
-        Client::with_path(path)
-            .apply_lighting("keyboard", expected)
-            .unwrap();
-    }
-
-    #[test]
-    fn one_shot_undervolt_uses_non_persistent_daemon_command() {
-        let dir = std::env::temp_dir().join(format!(
-            "z13helper-client-uv-once-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("daemon.sock");
-        let listener = match UnixListener::bind(&path) {
-            Ok(listener) => listener,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(error) => panic!("bind {}: {error}", path.display()),
-        };
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            assert!(request.contains("\"cmd\":\"apply-undervolt-once\""));
-            assert!(request.contains("\"offset\":-20"));
-            let request_id = serde_json::from_str::<WireRequest>(request.trim())
-                .unwrap()
-                .request_id;
-            let mut stream = stream;
-            writeln!(
-                stream,
-                "{}",
-                serde_json::to_string(&WireResponse::success(request_id)).unwrap()
-            )
-            .unwrap();
-        });
-        Client::with_path(path).apply_undervolt_once(-20).unwrap();
+        let expected_for_check = expected.clone();
+        assert_command(
+            move |command| {
+                assert!(
+                    matches!(command, Command::SetLighting { device, state } if device == "keyboard" && state == expected_for_check)
+                )
+            },
+            move |client| client.apply_lighting("keyboard", expected),
+        );
+        assert_command(
+            |command| {
+                assert!(matches!(
+                    command,
+                    Command::ApplyUndervoltOnce { offset: -20 }
+                ))
+            },
+            |client| client.apply_undervolt_once(-20),
+        );
     }
 
     #[test]

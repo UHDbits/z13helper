@@ -87,16 +87,6 @@ impl PowerDebouncer {
         self.action_for_pending(pending, now_ms)
     }
 
-    /// Preserve the small legacy convenience API for callers that only need
-    /// to feed a signal. Timer-aware callers should use [`Self::observe`] and
-    /// [`Self::on_timer`].
-    pub fn on_signal(&mut self, on_battery: bool, now_ms: u64) -> Option<bool> {
-        match self.observe(PowerObservation::Known(on_battery), now_ms) {
-            DebounceAction::Confirmed(value) => Some(value),
-            DebounceAction::Ignored | DebounceAction::Wait(_) => None,
-        }
-    }
-
     /// Force confirmation for one timer generation. Stale, canceled, or
     /// early callbacks are harmless; an early callback receives the current
     /// token so the UI can schedule the remaining delay.
@@ -273,6 +263,9 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(d.on_signal(true, 200), Some(true));
+        assert_eq!(
+            d.observe(PowerObservation::Known(true), 200),
+            DebounceAction::Confirmed(true)
+        );
     }
 }

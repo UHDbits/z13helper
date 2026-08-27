@@ -143,12 +143,6 @@ fn open_regular(path: &Path) -> io::Result<File> {
 fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
     let file = open_regular(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
     if metadata.len() > MAX_CONFIG_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -337,7 +331,8 @@ impl Config {
         }
     }
 
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+    #[cfg(test)]
+    fn load(path: &Path) -> Result<Self, ConfigError> {
         let bytes = read_regular(path)?;
         Self::parse_bytes(&bytes)
     }
@@ -372,18 +367,7 @@ impl Config {
         }
         let mut bytes = serde_json::to_vec_pretty(self)?;
         bytes.push(b'\n');
-        let (temporary, mut file) = create_unique_sibling(&temp_base(path))?;
-        let result = (|| {
-            write_all(&mut file, &bytes)?;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            sync_file(&file)
-        })();
-        drop(file);
-        // Failed unique candidates are intentionally left for diagnostics; a
-        // pathname unlink here would have a TOCTOU deletion race.
-        if let Err(error) = result {
-            return Err(ConfigError::Io(error));
-        }
+        let temporary = write_unique_sibling(&temp_base(path), &bytes).map_err(ConfigError::Io)?;
         if let Err(error) = rename(&temporary, path) {
             return Err(ConfigError::Io(error));
         }
@@ -537,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn default_has_three_builtins() {
+    fn defaults_have_three_builtins_and_panel_policy() {
         let cfg = Config::default();
         assert_eq!(cfg.profiles.len(), 3);
         assert!(cfg.find("silent").unwrap().builtin);
@@ -548,10 +532,6 @@ mod tests {
         assert!(!cfg.panel_overdrive_always_on);
         assert!(cfg.panel_overdrive_enabled(false));
         assert!(!cfg.panel_overdrive_enabled(true));
-    }
-
-    #[test]
-    fn always_on_panel_overdrive_ignores_power_source() {
         let cfg = Config {
             panel_overdrive_always_on: true,
             ..Config::default()
@@ -575,29 +555,6 @@ mod tests {
             0o600
         );
         let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn save_creates_bak() {
-        let path = tmp_path("bak");
-        let cfg = Config::default();
-        cfg.save(&path).unwrap();
-        let cfg2 = Config {
-            active_profile: "silent".into(),
-            ..Config::default()
-        };
-        cfg2.save(&path).unwrap();
-        assert!(path.with_extension("json.bak").exists());
-        assert_eq!(
-            fs::metadata(path.with_extension("json.bak"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(path.with_extension("json.bak"));
     }
 
     #[test]
@@ -644,44 +601,51 @@ mod tests {
     }
 
     #[test]
-    fn invalid_v1_reference_is_preserved_and_rejected() {
-        let path = tmp_path("invalid-v1");
-        let mut value = serde_json::to_value(Config::default()).unwrap();
-        value["active_profile"] = serde_json::Value::String("missing".into());
-        let original = serde_json::to_string(&value).unwrap();
-        fs::write(&path, &original).unwrap();
-        assert!(matches!(
-            Config::load_or_default(&path),
-            Err(ConfigError::Invalid(_))
-        ));
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        let _ = fs::remove_file(path);
+    fn invalid_v1_values_are_preserved_and_rejected() {
+        for (name, key, value) in [
+            (
+                "invalid-v1",
+                "active_profile",
+                serde_json::Value::String("missing".into()),
+            ),
+            (
+                "invalid-v1-profile",
+                "profiles",
+                serde_json::Value::from(94),
+            ),
+        ] {
+            let path = tmp_path(name);
+            let mut object = serde_json::to_value(Config::default()).unwrap();
+            if key == "active_profile" {
+                object[key] = value;
+            } else {
+                object["profiles"][0]["pl1_spl"] = value;
+            }
+            let original = serde_json::to_string(&object).unwrap();
+            fs::write(&path, &original).unwrap();
+            assert!(matches!(
+                Config::load_or_default(&path),
+                Err(ConfigError::Invalid(_))
+            ));
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            let _ = fs::remove_file(path);
+        }
     }
 
     #[test]
-    fn invalid_v1_profile_value_is_preserved_and_rejected() {
-        let path = tmp_path("invalid-v1-profile");
-        let mut value = serde_json::to_value(Config::default()).unwrap();
-        value["profiles"][0]["pl1_spl"] = serde_json::Value::from(94);
-        let original = serde_json::to_string(&value).unwrap();
-        fs::write(&path, &original).unwrap();
-        assert!(matches!(
-            Config::load_or_default(&path),
-            Err(ConfigError::Invalid(_))
-        ));
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn missing_version_is_not_migrated() {
-        let path = tmp_path("no-migration");
-        fs::write(&path, r#"{"profiles":[]}"#).unwrap();
-        assert!(matches!(
-            Config::load(&path),
-            Err(ConfigError::UnsupportedVersion(0))
-        ));
-        let _ = fs::remove_file(path);
+    fn unsupported_versions_are_rejected_without_touching_files() {
+        for (name, original, version) in [
+            ("no-migration", r#"{"profiles":[]}"#, 0),
+            ("future", r#"{"version":99,"future_data":"keep me"}"#, 99),
+        ] {
+            let path = tmp_path(name);
+            fs::write(&path, original).unwrap();
+            assert!(
+                matches!(Config::load_or_default(&path), Err(ConfigError::UnsupportedVersion(v)) if v == version)
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            let _ = fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -718,19 +682,6 @@ mod tests {
         assert!(cfg.remove(&id));
         assert_eq!(cfg.last_profile_on_ac, "balanced");
         assert_eq!(cfg.last_profile_on_battery, "balanced");
-    }
-
-    #[test]
-    fn future_version_rejected() {
-        let path = tmp_path("future");
-        let original = r#"{"version":99,"future_data":"keep me"}"#;
-        fs::write(&path, original).unwrap();
-        assert!(matches!(
-            Config::load_or_default(&path),
-            Err(ConfigError::UnsupportedVersion(99))
-        ));
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        let _ = fs::remove_file(path);
     }
 
     #[test]

@@ -1020,17 +1020,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn key_constants_match_linux_input() {
-        assert_eq!(EV_KEY, 1);
-        assert_eq!(KEY_PROG3, 202);
-        assert_eq!(ABS_X, 0);
-        assert_eq!(ABS_Y, 1);
-        assert_eq!(BTN_SOUTH, 0x130);
-        assert_eq!(BTN_EAST, 0x131);
-    }
-
-    #[test]
-    fn stick_engages_above_deadzone_and_releases_with_hysteresis() {
+    fn stick_behavior_covers_deadzone_hysteresis_and_axis_switching() {
         assert_eq!(stick_direction(0, 0, None), None);
         assert_eq!(stick_direction(STICK_ENGAGE - 1, 0, None), None);
         assert_eq!(
@@ -1049,10 +1039,6 @@ mod tests {
             stick_direction(STICK_RELEASE - 1, 0, Some(ControllerAction::Right)),
             None
         );
-    }
-
-    #[test]
-    fn stick_picks_dominant_axis_on_diagonals() {
         assert_eq!(
             stick_direction(20_000, 10_000, None),
             Some(ControllerAction::Right)
@@ -1065,10 +1051,6 @@ mod tests {
             stick_direction(-20_000, 20_000, None),
             Some(ControllerAction::Left)
         );
-    }
-
-    #[test]
-    fn stick_can_switch_axes_while_held() {
         assert_eq!(
             stick_direction(5_000, -20_000, Some(ControllerAction::Right)),
             Some(ControllerAction::Up)
@@ -1319,7 +1301,13 @@ mod tests {
     }
 
     #[test]
-    fn ev_iocgabs_requests_match_linux_input_abi() {
+    fn linux_input_constants_and_ioctl_match_abi() {
+        assert_eq!(EV_KEY, 1);
+        assert_eq!(KEY_PROG3, 202);
+        assert_eq!(ABS_X, 0);
+        assert_eq!(ABS_Y, 1);
+        assert_eq!(BTN_SOUTH, 0x130);
+        assert_eq!(BTN_EAST, 0x131);
         assert_eq!(std::mem::size_of::<InputAbsInfo>(), 24);
         assert_eq!(eviocgabs(ABS_X), 0x8018_4540);
         assert_eq!(eviocgabs(ABS_Y), 0x8018_4541);

@@ -21,25 +21,20 @@ mod tests {
     use crate::profile::Profile;
 
     #[test]
-    fn plain_builtin() {
-        let p = Profile::builtin("balanced", "Balanced");
-        assert_eq!(mode_label(&p), "Mode: Balanced");
-    }
-
-    #[test]
-    fn with_curve_and_power() {
-        let mut p = Profile::builtin("balanced", "Balanced");
-        p.apply_fan_curve = true;
-        p.apply_power_limits = true;
-        p.pl1_spl = 20;
-        assert_eq!(mode_label(&p), "Mode: Balanced+ 20W");
-    }
-
-    #[test]
-    fn direct_curve_is_identified() {
-        let mut p = Profile::builtin("balanced", "Balanced");
-        p.apply_fan_curve = true;
-        p.fan_control_mode = FanControlMode::Direct;
-        assert_eq!(mode_label(&p), "Mode: Balanced+EC");
+    fn mode_labels_cover_builtin_curve_and_power_variants() {
+        let mut cases = Vec::new();
+        cases.push((Profile::builtin("balanced", "Balanced"), "Mode: Balanced"));
+        let mut firmware = Profile::builtin("balanced", "Balanced");
+        firmware.apply_fan_curve = true;
+        firmware.apply_power_limits = true;
+        firmware.pl1_spl = 20;
+        cases.push((firmware, "Mode: Balanced+ 20W"));
+        let mut direct = Profile::builtin("balanced", "Balanced");
+        direct.apply_fan_curve = true;
+        direct.fan_control_mode = FanControlMode::Direct;
+        cases.push((direct, "Mode: Balanced+EC"));
+        for (profile, expected) in cases {
+            assert_eq!(mode_label(&profile), expected);
+        }
     }
 }

@@ -5,21 +5,12 @@ use std::fs;
 
 use crate::hidraw::HidrawBlocker;
 
+#[derive(Default)]
 pub struct SteamBlocker {
     hidraw: Option<HidrawBlocker>,
 }
 
-impl Default for SteamBlocker {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SteamBlocker {
-    pub fn new() -> Self {
-        Self { hidraw: None }
-    }
-
     fn ensure_hidraw_blocker(&mut self) -> bool {
         if self.hidraw.is_some() {
             return true;

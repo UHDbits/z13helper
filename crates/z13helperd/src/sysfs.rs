@@ -794,10 +794,6 @@ mod tests {
             )
             .is_ok()
         );
-    }
-
-    #[test]
-    fn smu_power_limit_verification_ignores_firmware_managed_stapm() {
         assert!(verify_smu_power_limits([84.0, 86.0, 70.0, 70.0], [86, 86, 70, 70],).is_ok());
     }
 

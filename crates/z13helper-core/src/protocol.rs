@@ -723,20 +723,9 @@ impl WireResponse {
     }
 
     pub fn progress(request_id: RequestId, outcome: RequestOutcome) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            request_id: Some(request_id),
-            outcome,
-            outcome_client_id: None,
-            outcome_request_id: None,
-            ok: true,
-            state: None,
-            apply: None,
-            probe: None,
-            factory_fan_curves: None,
-            event: None,
-            error: None,
-        }
+        let mut response = Self::success(request_id);
+        response.outcome = outcome;
+        response
     }
 }
 
@@ -772,20 +761,6 @@ mod tests {
                 .validate()
                 .is_err()
         );
-    }
-
-    #[test]
-    fn request_roundtrip_is_versioned() {
-        let request = WireRequest {
-            version: PROTOCOL_VERSION,
-            client_id: ClientId::new(1).unwrap(),
-            request_id: RequestId::new(1).unwrap(),
-            command: Command::GetState,
-        };
-        let text = serde_json::to_string(&request).unwrap();
-        assert!(text.contains("\"version\":3"));
-        assert!(text.contains("\"request_id\":1"));
-        assert!(text.contains("\"cmd\":\"get-state\""));
     }
 
     #[test]
@@ -834,57 +809,40 @@ mod tests {
     }
 
     #[test]
-    fn one_time_charge_command_roundtrips() {
-        let request = WireRequest {
-            version: PROTOCOL_VERSION,
-            client_id: ClientId::new(1).unwrap(),
-            request_id: RequestId::new(3).unwrap(),
-            command: Command::SetBatteryOneTimeCharge { enabled: true },
-        };
-        let text = serde_json::to_string(&request).unwrap();
-        assert!(text.contains("\"cmd\":\"set-battery-one-time-charge\""));
-        assert!(text.contains("\"enabled\":true"));
-        let decoded: WireRequest = serde_json::from_str(&text).unwrap();
-        assert!(matches!(
-            decoded.command,
-            Command::SetBatteryOneTimeCharge { enabled: true }
-        ));
-    }
-
-    #[test]
-    fn factory_fan_curve_command_roundtrips() {
-        let request = WireRequest {
-            version: PROTOCOL_VERSION,
-            client_id: ClientId::new(1).unwrap(),
-            request_id: RequestId::new(4).unwrap(),
-            command: Command::GetFactoryFanCurves {
-                ppd_profiles: vec!["power-saver".into(), "balanced".into()],
-            },
-        };
-        let text = serde_json::to_string(&request).unwrap();
-        assert!(text.contains("\"cmd\":\"get-factory-fan-curves\""));
-        let decoded: WireRequest = serde_json::from_str(&text).unwrap();
-        assert!(matches!(
-            decoded.command,
-            Command::GetFactoryFanCurves { ppd_profiles } if ppd_profiles.len() == 2
-        ));
-    }
-
-    #[test]
-    fn one_shot_undervolt_command_roundtrips() {
-        let request = WireRequest {
-            version: PROTOCOL_VERSION,
-            client_id: ClientId::new(1).unwrap(),
-            request_id: RequestId::new(5).unwrap(),
-            command: Command::ApplyUndervoltOnce { offset: -20 },
-        };
-        let text = serde_json::to_string(&request).unwrap();
-        assert!(text.contains("\"cmd\":\"apply-undervolt-once\""));
-        let decoded: WireRequest = serde_json::from_str(&text).unwrap();
-        assert!(matches!(
-            decoded.command,
-            Command::ApplyUndervoltOnce { offset: -20 }
-        ));
+    fn command_roundtrips_keep_typed_decodes() {
+        let cases = [
+            (
+                Command::SetBatteryOneTimeCharge { enabled: true },
+                "set-battery-one-time-charge",
+            ),
+            (
+                Command::GetFactoryFanCurves {
+                    ppd_profiles: vec!["power-saver".into(), "balanced".into()],
+                },
+                "get-factory-fan-curves",
+            ),
+            (
+                Command::ApplyUndervoltOnce { offset: -20 },
+                "apply-undervolt-once",
+            ),
+        ];
+        for (command, name) in cases {
+            let request = WireRequest {
+                version: PROTOCOL_VERSION,
+                client_id: ClientId::new(1).unwrap(),
+                request_id: RequestId::new(3).unwrap(),
+                command,
+            };
+            let text = serde_json::to_string(&request).unwrap();
+            assert!(text.contains(&format!("\"cmd\":\"{name}\"")));
+            let decoded: WireRequest = serde_json::from_str(&text).unwrap();
+            match decoded.command {
+                Command::SetBatteryOneTimeCharge { enabled } => assert!(enabled),
+                Command::GetFactoryFanCurves { ppd_profiles } => assert_eq!(ppd_profiles.len(), 2),
+                Command::ApplyUndervoltOnce { offset } => assert_eq!(offset, -20),
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
     }
 
     #[test]

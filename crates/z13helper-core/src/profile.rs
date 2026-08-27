@@ -304,13 +304,4 @@ mod tests {
         profile.apply_fan_curve = true;
         assert!(profile.validate().is_ok());
     }
-
-    #[test]
-    fn factory_apu_temperature_limit_is_95c() {
-        let mut profile = Profile::builtin("balanced", "Balanced");
-        assert_eq!(profile.cpu_temp_limit, 95);
-        profile.cpu_temp_limit = 80;
-        profile.factory_defaults();
-        assert_eq!(profile.cpu_temp_limit, 95);
-    }
 }

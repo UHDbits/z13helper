@@ -1545,33 +1545,14 @@ fn gamescope_dropdown_button(dropdown: &gtk::DropDown, title: &'static str) -> g
         let Some(model) = dropdown_select.model() else {
             return;
         };
-        let dialog = adw::AlertDialog::new(Some(title), Some("Choose a selection"));
-        dialog.add_response("cancel", "Cancel");
-        dialog.set_close_response("cancel");
-        for index in 0..model.n_items() {
-            let Some(label) = model
-                .item(index)
-                .and_downcast::<gtk::StringObject>()
-                .map(|item| item.string())
-            else {
-                continue;
-            };
-            let response = format!("choice-{index}");
-            dialog.add_response(&response, &label);
-            if dropdown_select.selected() == index {
-                dialog.set_response_appearance(&response, adw::ResponseAppearance::Suggested);
-            }
-        }
         let dropdown = dropdown_select.clone();
-        dialog.connect_response(None, move |_, response| {
-            if let Some(index) = response
-                .strip_prefix("choice-")
-                .and_then(|index| index.parse::<u32>().ok())
-            {
-                dropdown.set_selected(index);
-            }
-        });
-        dialog.present(Some(&button_parent));
+        show_selection_dialog(
+            &model,
+            title,
+            &button_parent,
+            dropdown.selected(),
+            move |index| dropdown.set_selected(index),
+        );
     });
     button
 }
@@ -1606,35 +1587,51 @@ fn gamescope_combo_row(combo: &adw::ComboRow, title: &'static str) -> adw::Actio
         let Some(model) = combo_select.model() else {
             return;
         };
-        let dialog = adw::AlertDialog::new(Some(title), Some("Choose a selection"));
-        dialog.add_response("cancel", "Cancel");
-        dialog.set_close_response("cancel");
-        for index in 0..model.n_items() {
-            let Some(label) = model
-                .item(index)
-                .and_downcast::<gtk::StringObject>()
-                .map(|item| item.string())
-            else {
-                continue;
-            };
-            let response = format!("choice-{index}");
-            dialog.add_response(&response, &label);
-            if combo_select.selected() == index {
-                dialog.set_response_appearance(&response, adw::ResponseAppearance::Suggested);
-            }
-        }
         let combo = combo_select.clone();
-        dialog.connect_response(None, move |_, response| {
-            if let Some(index) = response
-                .strip_prefix("choice-")
-                .and_then(|index| index.parse::<u32>().ok())
-            {
-                combo.set_selected(index);
-            }
-        });
-        dialog.present(Some(&button_parent));
+        show_selection_dialog(
+            &model,
+            title,
+            &button_parent,
+            combo.selected(),
+            move |index| combo.set_selected(index),
+        );
     });
     row
+}
+
+fn show_selection_dialog(
+    model: &gio::ListModel,
+    title: &str,
+    parent: &gtk::Button,
+    selected: u32,
+    on_selected: impl Fn(u32) + 'static,
+) {
+    let dialog = adw::AlertDialog::new(Some(title), Some("Choose a selection"));
+    dialog.add_response("cancel", "Cancel");
+    dialog.set_close_response("cancel");
+    for index in 0..model.n_items() {
+        let Some(label) = model
+            .item(index)
+            .and_downcast::<gtk::StringObject>()
+            .map(|item| item.string())
+        else {
+            continue;
+        };
+        let response = format!("choice-{index}");
+        dialog.add_response(&response, &label);
+        if selected == index {
+            dialog.set_response_appearance(&response, adw::ResponseAppearance::Suggested);
+        }
+    }
+    dialog.connect_response(None, move |_, response| {
+        if let Some(index) = response
+            .strip_prefix("choice-")
+            .and_then(|index| index.parse::<u32>().ok())
+        {
+            on_selected(index);
+        }
+    });
+    dialog.present(Some(parent));
 }
 
 fn update_combo_button_label(button: &gtk::Button, combo: &adw::ComboRow) {
