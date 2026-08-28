@@ -34,7 +34,7 @@
       system:
       let
         pkgs = mkPkgs system;
-        bpfClang = pkgs.llvmPackages.clang;
+        bpfClang = pkgs.llvmPackages.clang-unwrapped;
         bpfLlvm = pkgs.llvmPackages.llvm;
         bpfLibbpf = pkgs.lib.getDev pkgs.libbpf;
         bpfCflags = "-O2 -g -target bpf -D__TARGET_ARCH_x86";
@@ -136,13 +136,19 @@
             postFixup = "";
           });
 
-          fmt = pkgs.runCommand "z13helper-fmt" {
-            nativeBuildInputs = [ pkgs.cargo pkgs.rustfmt ];
-          } ''
-            cd ${self}
-            cargo fmt --all -- --check
-            touch "$out"
-          '';
+          fmt =
+            pkgs.runCommand "z13helper-fmt"
+              {
+                nativeBuildInputs = [
+                  pkgs.cargo
+                  pkgs.rustfmt
+                ];
+              }
+              ''
+                cd ${self}
+                cargo fmt --all -- --check
+                touch "$out"
+              '';
 
           metadata = pkgs.runCommand "z13helper-metadata-parity" { } ''
             test "${pkgs.z13helper.version}" = "${cargoVersion}"
@@ -150,18 +156,27 @@
             touch "$out"
           '';
 
-          bpf = pkgs.runCommand "z13helper-bpf-source-object" {
-            nativeBuildInputs = [ bpfClang bpfLlvm bpfLibbpf pkgs.linuxHeaders pkgs.gnumake ];
-          } ''
-            cd ${self}
-            make check-bpf \
-              TARGET_DIR="$TMPDIR/target" \
-              BPF_CLANG="${bpfClang}/bin/clang" \
-              BPF_STRIP="${bpfLlvm}/bin/llvm-strip" \
-              BPF_CFLAGS="${bpfCflags}" \
-              BPF_INCLUDE_FLAGS="${bpfIncludeFlags}"
-            touch "$out"
-          '';
+          bpf =
+            pkgs.runCommand "z13helper-bpf-source-object"
+              {
+                nativeBuildInputs = [
+                  bpfClang
+                  bpfLlvm
+                  bpfLibbpf
+                  pkgs.linuxHeaders
+                  pkgs.gnumake
+                ];
+              }
+              ''
+                cd ${self}
+                make check-bpf \
+                  TARGET_DIR="$TMPDIR/target" \
+                  BPF_CLANG="${bpfClang}/bin/clang" \
+                  BPF_STRIP="${bpfLlvm}/bin/llvm-strip" \
+                  BPF_CFLAGS="${bpfCflags}" \
+                  BPF_INCLUDE_FLAGS="${bpfIncludeFlags}"
+                touch "$out"
+              '';
         };
 
         formatter = pkgs.nixfmt-rfc-style;
@@ -179,7 +194,9 @@
         }:
         {
           imports = [ ./nix/nixos-module.nix ];
-          services.z13helperd.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          services.z13helperd.package =
+            lib.mkDefault
+              self.packages.${pkgs.stdenv.hostPlatform.system}.default;
           programs.z13helper.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
         };
 
