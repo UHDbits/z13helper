@@ -1372,7 +1372,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "z13helper"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1392,7 +1392,7 @@ dependencies = [
 
 [[package]]
 name = "z13helper-client"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde_json",
  "z13helper-core",
@@ -1400,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "z13helper-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "serde",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "z13helperctl"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "z13helperd"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "libc",
