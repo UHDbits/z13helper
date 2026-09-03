@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main, master]
+    paths-ignore: ["**/*.md"]
   pull_request:
     branches: [main, master]
+    paths-ignore: ["**/*.md"]
 
 permissions:
   contents: read
@@ -14,24 +16,52 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  nix:
-    runs-on: ubuntu-latest
+  check:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - uses: DeterminateSystems/nix-installer-action@v16
-
-      - uses: cachix/cachix-action@v15
+      - uses: dtolnay/rust-toolchain@1.92.0
         with:
-          # Create a Cachix cache named "z13helper" and set CACHIX_AUTH_TOKEN.
-          name: z13helper
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-          # Allow PRs from forks to evaluate without a push token.
-          skipPush: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          components: clippy, rustfmt
 
-      - name: Build and check
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build dependencies
         run: |
-          nix flake check -L
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            gcc \
+            libadwaita-1-dev \
+            libbpf-dev \
+            libgdk-pixbuf-2.0-dev \
+            libgtk-4-dev \
+            libwayland-dev \
+            librsvg2-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            meson \
+            ninja-build \
+            pkg-config \
+            wayland-protocols
 
-      - name: Verify contributed systemd units
+      - name: Build GTK4 Layer Shell 1.3.0
+        run: |
+          curl -fsSL https://github.com/wmww/gtk4-layer-shell/archive/refs/tags/v1.3.0.tar.gz |
+            tar -xz -C /tmp
+          meson setup /tmp/gtk4-layer-shell-1.3.0/build /tmp/gtk4-layer-shell-1.3.0 \
+            --buildtype=release \
+            -Dintrospection=false \
+            -Dvapi=false
+          meson compile -C /tmp/gtk4-layer-shell-1.3.0/build
+          sudo meson install -C /tmp/gtk4-layer-shell-1.3.0/build
+          sudo ldconfig
+
+      - name: Test and lint
+        run: make test lint
+
+      - name: Verify systemd units
         run: systemd-analyze verify contrib/z13helper.service contrib/systemd/z13helperd.service

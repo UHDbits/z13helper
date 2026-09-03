@@ -102,7 +102,6 @@
 
         checks = {
           package = pkgs.z13helper;
-          package-debug = pkgs.z13helper-debug;
 
           test = pkgs.z13helper.overrideAttrs (_old: {
             pname = "z13helper-test";
