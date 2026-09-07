@@ -63,5 +63,10 @@ jobs:
       - name: Test and lint
         run: make test lint
 
-      - name: Verify systemd units
-        run: systemd-analyze verify contrib/z13helper.service contrib/systemd/z13helperd.service
+      - name: Verify systemd unit syntax
+        run: |
+          check_dir=$(mktemp -d)
+          sed 's|%h/.local/bin/z13helper|/usr/bin/true|' contrib/z13helper.service > "$check_dir/z13helper.service"
+          sed 's|/usr/libexec/z13helperd|/usr/bin/true|g' contrib/systemd/z13helperd.service > "$check_dir/z13helperd.service"
+          systemd-analyze verify --user "$check_dir/z13helper.service"
+          systemd-analyze verify "$check_dir/z13helperd.service"
