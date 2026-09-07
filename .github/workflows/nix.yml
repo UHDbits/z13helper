@@ -1,35 +1,7 @@
 name: Nix
 
 on:
-  push:
-    branches: [main, master]
-    paths:
-      - .github/workflows/nix.yml
-      - flake.nix
-      - flake.lock
-      - nix/**
-      - Cargo.toml
-      - Cargo.lock
-      - crates/*/Cargo.toml
-      - crates/z13helperd/bpf/**
-      - assets/**
-      - contrib/**
-      - Makefile
-  pull_request:
-    branches: [main, master]
-    paths:
-      - .github/workflows/nix.yml
-      - flake.nix
-      - flake.lock
-      - nix/**
-      - Cargo.toml
-      - Cargo.lock
-      - crates/*/Cargo.toml
-      - crates/z13helperd/bpf/**
-      - assets/**
-      - contrib/**
-      - Makefile
-  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read

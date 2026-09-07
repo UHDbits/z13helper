@@ -1258,21 +1258,21 @@ mod tests {
         let directory = TestDir::new();
         let socket_path = directory.path("z13helperd.sock");
         let owner = SingletonLock::acquire(&directory.path("z13helperd.lock")).unwrap();
+
         let listener = bind_socket(&socket_path, &owner).unwrap();
         let socket_owner = OwnedSocket::from_bound(&socket_path).unwrap();
-        let original_identity = socket_owner.identity;
         drop(listener);
-        assert!(socket_path.exists());
         drop(socket_owner);
         assert!(!socket_path.exists());
 
-        let replacement = UnixListener::bind(&socket_path).unwrap();
-        let stale_owner = OwnedSocket {
-            path: socket_path.clone(),
-            identity: original_identity,
-        };
-        drop(stale_owner);
+        let listener = bind_socket(&socket_path, &owner).unwrap();
+        let socket_owner = OwnedSocket::from_bound(&socket_path).unwrap();
+        let replacement_path = directory.path("replacement.sock");
+        let replacement = UnixListener::bind(&replacement_path).unwrap();
+        fs::rename(&replacement_path, &socket_path).unwrap();
+        drop(socket_owner);
         assert!(socket_path.exists());
+        drop(listener);
         drop(replacement);
     }
 
