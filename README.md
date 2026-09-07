@@ -7,10 +7,7 @@
 ## AI usage disclaimer
 
 Parts of this project were written with assistance from AI coding tools. The
-behavior that matters — power limits, fan curves, undervolt, and restore after
-sleep — is still meant to be reviewed, tested, and owned by humans. Treat
-hardware controls as safety-critical: verify changes on your device, keep
-sensible limits, and do not assume generated code is correct by default.
+entire project and the code was manually reviewed and tested by a human.
 
 ## About / Features
 
