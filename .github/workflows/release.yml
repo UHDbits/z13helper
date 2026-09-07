@@ -24,6 +24,7 @@ jobs:
           name: z13helper
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           useDaemon: false
+          skipPush: true
 
       - uses: dtolnay/rust-toolchain@1.92.0
 
