@@ -27,9 +27,9 @@ scale.undervolt-scale > value.right { margin-left: 6px; }
   font-weight: 700;
   color: white;
 }
-.gamescope-overlay-window { background: transparent; }
-.gamescope-wrapper { background: transparent; }
-.gamescope-backdrop { background: rgba(0, 0, 0, 0.30); }
+.gamescope-overlay-window,
+.gamescope-wrapper,
+.gamescope-backdrop { background: transparent; }
 .gamescope-panel {
   background: @window_bg_color;
   border-radius: 12px;

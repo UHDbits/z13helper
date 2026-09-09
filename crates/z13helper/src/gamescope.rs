@@ -7,7 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -30,14 +30,175 @@ const MAX_SCALE: f64 = 3.0;
 const FULL_OPACITY: u32 = u32::MAX;
 const SCALE_ENV: &str = "Z13HELPER_GAMESCOPE_SCALE";
 const MAX_WINDOWS: usize = 32;
+const X11_SOCKET_DIRECTORY: &str = "/tmp/.X11-unix";
+const XWAYLAND_SERVER_ID_ATOM: &[u8] = b"GAMESCOPE_XWAYLAND_SERVER_ID";
 
-/// Force GTK onto gamescope's Xwayland server only when the advertised
-/// gamescope Wayland socket is a real socket inside XDG_RUNTIME_DIR.
+#[derive(Debug, Eq, PartialEq)]
+struct GamescopeDisplays {
+    wayland: OsString,
+    x11: OsString,
+}
+
+/// Force GTK onto gamescope's Xwayland server only after validating a real
+/// gamescope Wayland socket inside XDG_RUNTIME_DIR.
 pub fn select_gdk_backend() {
-    if validated_socket_from_env().is_some() && std::env::var_os("DISPLAY").is_some() {
+    let displays = resolve_gamescope_displays(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .as_deref()
+            .map(Path::new),
+        std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("DISPLAY").as_deref(),
+        session_is_gamescope(),
+        discover_gamescope_wayland,
+        discover_primary_gamescope_x11,
+    );
+    if let Some(displays) = displays {
         // SAFETY: this runs before GTK or any worker threads are initialized.
-        unsafe { std::env::set_var("GDK_BACKEND", "x11") };
+        unsafe {
+            std::env::set_var("GAMESCOPE_WAYLAND_DISPLAY", displays.wayland);
+            std::env::set_var("DISPLAY", displays.x11);
+            std::env::set_var("GDK_BACKEND", "x11");
+        }
     }
+}
+
+fn resolve_gamescope_displays<F, G>(
+    runtime: Option<&Path>,
+    advertised_wayland: Option<&OsStr>,
+    advertised_x11: Option<&OsStr>,
+    session_is_gamescope: bool,
+    discover_wayland: F,
+    discover_x11: G,
+) -> Option<GamescopeDisplays>
+where
+    F: FnOnce(&Path) -> Option<OsString>,
+    G: FnOnce() -> Option<OsString>,
+{
+    let runtime = runtime?;
+    let advertised_wayland = advertised_wayland
+        .filter(|display| socket_path(runtime, display).is_some_and(|path| is_socket(&path)));
+    let wayland_was_advertised = advertised_wayland.is_some();
+    let wayland = match advertised_wayland {
+        Some(display) => display.to_os_string(),
+        None if session_is_gamescope => discover_wayland(runtime)?,
+        None => return None,
+    };
+    let x11 = if wayland_was_advertised {
+        advertised_x11
+            .map(OsStr::to_os_string)
+            .or_else(discover_x11)?
+    } else {
+        // A display inherited from an earlier desktop session may still be in
+        // the user manager. Pair a discovered Wayland socket only with the
+        // primary Xwayland server that identifies itself as Gamescope.
+        discover_x11()?
+    };
+    Some(GamescopeDisplays { wayland, x11 })
+}
+
+fn session_is_gamescope() -> bool {
+    ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .any(|value| desktop_names_gamescope(&value))
+}
+
+fn desktop_names_gamescope(value: &OsStr) -> bool {
+    value.to_str().is_some_and(|value| {
+        value
+            .split(':')
+            .any(|desktop| desktop.eq_ignore_ascii_case("gamescope"))
+    })
+}
+
+fn discover_gamescope_wayland(runtime: &Path) -> Option<OsString> {
+    let displays = runtime
+        .read_dir()
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            gamescope_wayland_name(&name)
+                .then(|| entry.path())
+                .filter(|path| is_socket(path))
+                .map(|_| name)
+        });
+    exactly_one(displays)
+}
+
+fn gamescope_wayland_name(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.strip_prefix("gamescope-").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    })
+}
+
+fn discover_primary_gamescope_x11() -> Option<OsString> {
+    let displays = Path::new(X11_SOCKET_DIRECTORY)
+        .read_dir()
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            is_socket(&entry.path())
+                .then(|| x11_display_from_socket_name(&entry.file_name()))
+                .flatten()
+        });
+    select_primary_x11_display(displays, is_primary_gamescope_x11)
+}
+
+fn x11_display_from_socket_name(name: &OsStr) -> Option<OsString> {
+    let suffix = name.to_str()?.strip_prefix('X')?;
+    (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| OsString::from(format!(":{suffix}")))
+}
+
+fn select_primary_x11_display<I, F>(displays: I, mut is_primary: F) -> Option<OsString>
+where
+    I: IntoIterator<Item = OsString>,
+    F: FnMut(&OsStr) -> bool,
+{
+    exactly_one(displays.into_iter().filter(|display| is_primary(display)))
+}
+
+fn is_primary_gamescope_x11(display: &OsStr) -> bool {
+    display.to_str().and_then(gamescope_xwayland_server_id) == Some(0)
+}
+
+fn gamescope_xwayland_server_id(display: &str) -> Option<u32> {
+    let (conn, screen_number) = x11rb::connect(Some(display)).ok()?;
+    let root = conn.setup().roots.get(screen_number)?.root;
+    let atom = conn
+        .intern_atom(true, XWAYLAND_SERVER_ID_ATOM)
+        .ok()?
+        .reply()
+        .ok()?
+        .atom;
+    if atom == u32::from(AtomEnum::NONE) {
+        return None;
+    }
+    let property = conn
+        .get_property(false, root, atom, AtomEnum::CARDINAL, 0, 1)
+        .ok()?
+        .reply()
+        .ok()?;
+    (property.format == 32 && property.type_ == u32::from(AtomEnum::CARDINAL))
+        .then(|| property.value32()?.next())
+        .flatten()
+}
+
+fn exactly_one<I>(values: I) -> Option<I::Item>
+where
+    I: IntoIterator,
+{
+    let mut values = values.into_iter();
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn is_socket(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_socket())
 }
 
 fn validated_socket_from_env() -> Option<PathBuf> {
@@ -499,15 +660,16 @@ impl Gamescope {
         width: i32,
         height: Option<i32>,
         on_backdrop: impl Fn() + 'static,
-    ) -> gtk::Box {
-        let wrapper = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    ) -> gtk::Overlay {
+        let wrapper = gtk::Overlay::new();
         wrapper.add_css_class("gamescope-wrapper");
         let backdrop = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        backdrop.set_hexpand(true);
         backdrop.add_css_class("gamescope-backdrop");
         let click = gtk::GestureClick::new();
         click.connect_released(move |_, _, _, _| on_backdrop());
         backdrop.add_controller(click);
+        wrapper.set_child(Some(&backdrop));
+
         let panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
         panel.add_css_class("gamescope-panel");
         let panel_width = self.pixels(width).min((self.output_width * 94) / 100);
@@ -515,6 +677,7 @@ impl Gamescope {
         if let Some(height) = height {
             panel.set_height_request(self.panel_size(width, height).1);
         }
+        panel.set_halign(gtk::Align::Center);
         panel.set_valign(gtk::Align::Center);
         panel.set_margin_top(self.output_height / 20);
         panel.set_margin_bottom(self.output_height / 20);
@@ -523,8 +686,7 @@ impl Gamescope {
         clamp.set_tightening_threshold(panel_width);
         clamp.set_child(Some(child));
         panel.append(&clamp);
-        wrapper.append(&backdrop);
-        wrapper.append(&panel);
+        wrapper.add_overlay(&panel);
         wrapper
     }
 
@@ -773,6 +935,8 @@ fn parse_scale(value: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::net::UnixListener;
     use std::time::Duration;
 
     struct FakeX11 {
@@ -837,6 +1001,79 @@ mod tests {
         );
         for invalid in ["", "../gamescope-0", "/tmp/gamescope-0", "a/b"] {
             assert_eq!(socket_path(runtime, OsStr::new(invalid)), None);
+        }
+    }
+
+    #[test]
+    fn gamescope_session_discovers_displays_when_environment_file_is_absent() {
+        let runtime = std::env::temp_dir().join(format!(
+            "z13helper-gamescope-display-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&runtime);
+        fs::create_dir(&runtime).unwrap();
+        let listener = UnixListener::bind(runtime.join("gamescope-0")).unwrap();
+
+        let displays = resolve_gamescope_displays(
+            Some(&runtime),
+            None,
+            None,
+            true,
+            discover_gamescope_wayland,
+            || Some(OsString::from(":0")),
+        );
+
+        assert_eq!(
+            displays,
+            Some(GamescopeDisplays {
+                wayland: OsString::from("gamescope-0"),
+                x11: OsString::from(":0"),
+            })
+        );
+        drop(listener);
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
+    fn ordinary_desktop_does_not_adopt_discovered_gamescope_displays() {
+        let displays = resolve_gamescope_displays(
+            Some(Path::new("/run/user/1000")),
+            None,
+            Some(OsStr::new(":2")),
+            false,
+            |_| Some(OsString::from("gamescope-0")),
+            || Some(OsString::from(":0")),
+        );
+        assert_eq!(displays, None);
+    }
+
+    #[test]
+    fn gamescope_desktop_marker_accepts_colon_separated_names() {
+        assert!(desktop_names_gamescope(OsStr::new("gamescope")));
+        assert!(desktop_names_gamescope(OsStr::new("KDE:gamescope")));
+        assert!(!desktop_names_gamescope(OsStr::new("KDE")));
+        assert!(!desktop_names_gamescope(OsStr::new("gamescope-session")));
+    }
+
+    #[test]
+    fn primary_xwayland_discovery_requires_one_gamescope_server_zero() {
+        let displays = vec![OsString::from(":0"), OsString::from(":1")];
+        assert_eq!(
+            select_primary_x11_display(displays.clone(), |display| display == ":0"),
+            Some(OsString::from(":0"))
+        );
+        assert_eq!(select_primary_x11_display(displays.clone(), |_| true), None);
+        assert_eq!(select_primary_x11_display(displays, |_| false), None);
+    }
+
+    #[test]
+    fn x11_socket_names_are_restricted_to_numeric_displays() {
+        assert_eq!(
+            x11_display_from_socket_name(OsStr::new("X12")),
+            Some(OsString::from(":12"))
+        );
+        for invalid in ["X", "Xfoo", "X1-lock", "gamescope-0"] {
+            assert_eq!(x11_display_from_socket_name(OsStr::new(invalid)), None);
         }
     }
 

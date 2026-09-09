@@ -145,18 +145,22 @@ selected points to assistive technology. Outer/section/row/compact spacing is
 
 GTK rules retained from field testing: never use CSS `hexpand`,
 `Scale::add_mark`, or animated box shadows, and keep custom chart drawing
-theme-aware. X11 is forced only when `GAMESCOPE_WAYLAND_DISPLAY` resolves to a
-real socket inside `XDG_RUNTIME_DIR` and an X11 display is advertised. In that
-mode interactive toplevels use gamescope's `STEAM_OVERLAY` and
+theme-aware. X11 is forced only when a real gamescope Wayland socket exists
+inside `XDG_RUNTIME_DIR`. The app uses advertised display variables when they
+are available. In gamescope sessions without that handoff, it accepts exactly
+one `gamescope-N` runtime socket and exactly one X11 root advertising
+`GAMESCOPE_XWAYLAND_SERVER_ID=0`; ambiguous discovery leaves the backend
+unchanged. In that mode interactive toplevels use gamescope's `STEAM_OVERLAY` and
 `STEAM_INPUT_FOCUS` properties, while click-through HUDs use
 `GAMESCOPE_EXTERNAL_OVERLAY`. Exactly one interactive toplevel has nonzero
 opacity and input focus; hidden windows remain mapped to avoid Xwayland surface
 lifecycle loss, and input focus is cleared before opacity. Resolution-derived
 CSS and panel sizing default to about 1.5x on the native Z13 panel and accept a
-clamped `Z13HELPER_GAMESCOPE_SCALE` override. The main drawer is clamped to 320
-logical pixels. Because Gamescope does not reliably composite GTK popup
-surfaces, its selectors use in-surface button groups or embedded dialogs and
-its color chooser is a page in the main window stack.
+clamped `Z13HELPER_GAMESCOPE_SCALE` override. The main panel is clamped to 320
+logical pixels and centered over a transparent, full-screen backdrop. Because
+Gamescope does not reliably composite GTK popup surfaces, its selectors use
+in-surface button groups or embedded dialogs and its color chooser is a page in
+the main window stack.
 
 Controller capture follows the hardware-access boundary: only `z13helperd`
 opens controller evdev nodes and issues `EVIOCGRAB`; the GUI receives normalized
@@ -198,9 +202,10 @@ preserves Plasma's dark appearance without using libadwaita's unsupported
 ## Lifecycle and packaging
 
 The user service optionally loads `%t/gamescope-environment`; gamescope-session
-uses that file to export its display variables to background user services. The
-GUI validates the advertised gamescope socket before selecting X11, so a stale
-environment file cannot by itself enable the overlay backend.
+implementations can use that file to export display variables to background
+user services. Some implementations keep those variables inside the session
+process instead. The GUI's constrained runtime-socket and X11-root discovery
+supports that case without trusting a stale desktop display.
 
 The systemd unit uses `RuntimeDirectory=z13helper`,
 `StateDirectory=z13helper`, AF_UNIX-only networking, `ProtectSystem=strict`,
