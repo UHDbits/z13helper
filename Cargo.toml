@@ -13,7 +13,7 @@ default-members = ["crates/z13helper"]
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
-version = "1.0.0"
+version = "1.0.1"
 repository = "https://github.com/UHDbits/z13helper"
 
 [workspace.dependencies]
