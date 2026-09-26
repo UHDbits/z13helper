@@ -19,7 +19,7 @@ let
 
   lightingDeviceType = types.submodule {
     options = {
-      enabled = mkOption {
+      enable = mkOption {
         type = types.bool;
         default = true;
         description = "Whether this Aura device is enabled.";
@@ -110,7 +110,7 @@ let
           lib.optionalString (s != null && s.panelOverdrive != null)
             "${ctl} panel-overdrive ${if s.panelOverdrive then "on" else "off"}\n";
         renderLighting = device: value:
-          if !value.enabled || value.mode == "off" then
+          if !value.enable || value.mode == "off" then
             "${ctl} lighting ${device} off\n"
           else
             "${ctl} lighting ${device} ${quote value.mode} ${quote value.color} ${toString value.brightness}\n";
@@ -182,7 +182,7 @@ in
           - `batteryChargeOnce` (bool)
           - `panelOverdrive` (bool)
           - `lighting.keyboard` / `lighting.lightbar` — typed attrsets with
-            `mode`, six-digit `color`, `brightness` 0–3, or `enabled = false`
+            `mode`, six-digit `color`, `brightness` 0–3, or `enable = false`
 
           Profile, PPT, fan, and undervolt configuration belongs in the user
           `config.json`, which remains application-managed.
