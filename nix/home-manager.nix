@@ -15,6 +15,11 @@ let
     ;
 
   cfg = config.programs.z13helper;
+  settingsFile =
+    if cfg.settings == null then
+      null
+    else
+      pkgs.writeText "z13helper-config.json" (builtins.toJSON cfg.settings);
 in
 {
   options.programs.z13helper = {
@@ -41,10 +46,29 @@ in
       description = "Optional `Z13HELPER_GAMESCOPE_SCALE` override (clamped 1.0–3.0 by the app).";
     };
 
+    settings = mkOption {
+      type = types.nullOr (types.attrsOf types.anything);
+      default = null;
+      description = ''
+        Complete z13helper schema-v1 config as a Nix attrset. Home Manager
+        copies it to the writable config path on every activation; edits made
+        by z13helper remain until the next activation.
+      '';
+    };
+
   };
 
   config = mkIf cfg.enable {
     home.packages = [ cfg.package ];
+
+    home.activation = lib.mkIf (cfg.settings != null) {
+      z13helperConfig = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+        config_dir=${lib.escapeShellArg "${config.xdg.configHome}/z13helper"}
+        $DRY_RUN_CMD mkdir -p "$config_dir"
+        $DRY_RUN_CMD install -m 600 ${lib.escapeShellArg settingsFile} "$config_dir/config.json.tmp"
+        $DRY_RUN_CMD mv -f "$config_dir/config.json.tmp" "$config_dir/config.json"
+      '';
+    };
 
     systemd.user.services.z13helper = mkIf cfg.systemd.enable {
       Unit = {
@@ -55,12 +79,11 @@ in
       Service = {
         Type = "simple";
         ExecStart = "${cfg.package}/bin/z13helper";
-        Environment =
-          [
-            "PATH=${cfg.package}/bin:/usr/bin:/bin"
-          ]
-          ++ lib.optional cfg.systemd.startHidden "Z13HELPER_START_HIDDEN=1"
-          ++ lib.optional (cfg.gamescopeScale != null) "Z13HELPER_GAMESCOPE_SCALE=${cfg.gamescopeScale}";
+        Environment = [
+          "PATH=${cfg.package}/bin:/usr/bin:/bin"
+        ]
+        ++ lib.optional cfg.systemd.startHidden "Z13HELPER_START_HIDDEN=1"
+        ++ lib.optional (cfg.gamescopeScale != null) "Z13HELPER_GAMESCOPE_SCALE=${cfg.gamescopeScale}";
         EnvironmentFile = [ "-%t/gamescope-environment" ];
         Restart = "on-failure";
         RestartSec = 3;
