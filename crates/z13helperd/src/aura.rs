@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -13,6 +13,8 @@ pub struct AuraDevices {
     sys_root: PathBuf,
     dev_root: PathBuf,
     devices: HashMap<String, (PathBuf, File)>,
+    reconnected: HashSet<String>,
+    open_errors: HashMap<String, String>,
 }
 
 impl Default for AuraDevices {
@@ -27,15 +29,12 @@ impl AuraDevices {
             sys_root: sys_root.into(),
             dev_root: dev_root.into(),
             devices: HashMap::new(),
+            reconnected: HashSet::new(),
+            open_errors: HashMap::new(),
         }
     }
 
-    pub fn refresh(&mut self) -> Vec<String> {
-        let previous = self
-            .devices
-            .iter()
-            .map(|(name, (path, _))| (name.clone(), path.clone()))
-            .collect::<HashMap<_, _>>();
+    pub fn refresh(&mut self) {
         let class = self.sys_root.join("class/hidraw");
         let mut found = HashMap::new();
         for entry in fs::read_dir(class).into_iter().flatten().flatten() {
@@ -57,6 +56,7 @@ impl AuraDevices {
             }
         }
         self.devices.retain(|name, _| found.contains_key(name));
+        self.open_errors.retain(|name, _| found.contains_key(name));
         for (name, path) in found {
             let changed = self
                 .devices
@@ -64,15 +64,31 @@ impl AuraDevices {
                 .is_none_or(|(previous_path, _)| previous_path != &path);
             if changed {
                 self.devices.remove(&name);
-                if let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) {
-                    self.devices.insert(name, (path, file));
+                match OpenOptions::new().read(true).write(true).open(&path) {
+                    Ok(file) => {
+                        self.open_errors.remove(&name);
+                        self.reconnected.insert(name.clone());
+                        self.devices.insert(name, (path, file));
+                    }
+                    Err(error) => {
+                        let error = format!("open Aura {name} {}: {error}", path.display());
+                        if self.open_errors.get(&name) != Some(&error) {
+                            tracing::warn!(%error, "cannot open Aura device");
+                        }
+                        self.open_errors.insert(name, error);
+                    }
                 }
             }
         }
-        self.devices
-            .keys()
-            .filter(|name| previous.get(*name) != self.devices.get(*name).map(|(path, _)| path))
-            .cloned()
+    }
+
+    /// Refresh, then drain devices (re)opened since the last call. Only the
+    /// hotplug path drains, so other refreshes cannot hide a reconnect.
+    pub fn take_reconnected(&mut self) -> Vec<String> {
+        self.refresh();
+        self.reconnected
+            .drain()
+            .filter(|name| self.devices.contains_key(name))
             .collect()
     }
 
@@ -80,37 +96,35 @@ impl AuraDevices {
         self.devices.contains_key(device)
     }
 
+    fn write(&mut self, device: &str, reports: &[[u8; 64]]) -> Result<(), String> {
+        self.refresh();
+        match self.devices.get_mut(device) {
+            Some((_, file)) => write_reports(file, reports),
+            None => Err(self
+                .open_errors
+                .get(device)
+                .cloned()
+                .unwrap_or_else(|| format!("Aura {device} device is not connected"))),
+        }
+    }
+
     pub fn apply(&mut self, device: &str, state: &LightingState) -> Result<(), String> {
         let reports = encode_reports(state)?;
-        let _ = self.refresh();
-        let first = self
-            .devices
-            .get_mut(device)
-            .ok_or_else(|| format!("Aura {device} device is not connected"))
-            .and_then(|file| write_reports(&mut file.1, &reports));
-        if first.is_ok() {
+        let Err(first_error) = self.write(device, &reports) else {
             return Ok(());
-        }
+        };
 
         // A disconnected hidraw node can be recreated at the same path while
         // the old descriptor remains cached. Evict it and retry one complete,
         // already-validated command through a freshly opened descriptor.
         self.devices.remove(device);
-        let _ = self.refresh();
-        let retry = self
-            .devices
-            .get_mut(device)
-            .ok_or_else(|| format!("Aura {device} device is not connected"))
-            .and_then(|file| write_reports(&mut file.1, &reports));
-        if retry.is_err() {
-            self.devices.remove(device);
-        }
-        retry.map_err(|retry_error| match first {
-            Err(first_error) => format!(
-                "Aura command failed ({first_error}); retry with a fresh handle failed ({retry_error})"
-            ),
-            Ok(()) => retry_error,
-        })
+        let Err(retry_error) = self.write(device, &reports) else {
+            return Ok(());
+        };
+        self.devices.remove(device);
+        Err(format!(
+            "Aura command failed ({first_error}); retry with a fresh handle failed ({retry_error})"
+        ))
     }
 }
 
@@ -311,12 +325,26 @@ mod tests {
 
         make_device("hidraw0");
         let mut devices = AuraDevices::new(&sys_root, &dev_root);
-        assert_eq!(devices.refresh(), ["keyboard"]);
+        assert_eq!(devices.take_reconnected(), ["keyboard"]);
         fs::remove_dir_all(sys_root.join("class/hidraw/hidraw0")).unwrap();
         fs::remove_file(dev_root.join("hidraw0")).unwrap();
         make_device("hidraw1");
-        assert_eq!(devices.refresh(), ["keyboard"]);
+        // Observe and apply refresh too; only the hotplug drain consumes it.
+        devices.refresh();
+        assert_eq!(devices.take_reconnected(), ["keyboard"]);
+        assert!(devices.take_reconnected().is_empty());
         assert_eq!(devices.devices["keyboard"].0, dev_root.join("hidraw1"));
+
+        // A present node that cannot be opened reports why it failed.
+        fs::remove_dir_all(sys_root.join("class/hidraw/hidraw1")).unwrap();
+        fs::remove_file(dev_root.join("hidraw1")).unwrap();
+        make_device("hidraw2");
+        fs::remove_file(dev_root.join("hidraw2")).unwrap();
+        fs::create_dir(dev_root.join("hidraw2")).unwrap();
+        let error = devices
+            .apply("keyboard", &LightingState::default())
+            .unwrap_err();
+        assert!(!error.contains("not connected"), "{error}");
         fs::remove_dir_all(root).unwrap();
     }
 }

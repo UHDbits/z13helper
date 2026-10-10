@@ -122,12 +122,7 @@ impl<P: PortIo> EcMailbox<P> {
         Ok(self.io.write_u8(DATA_PORT, value)?)
     }
 
-    fn transaction_once(
-        &mut self,
-        command: u8,
-        payload: &[u8],
-        want_result: bool,
-    ) -> Result<Option<u8>, EcError> {
+    fn send(&mut self, command: u8, payload: &[u8]) -> Result<(), EcError> {
         self.drain_output()?;
         self.command(PREAMBLE)?;
         self.command(command)?;
@@ -135,56 +130,52 @@ impl<P: PortIo> EcMailbox<P> {
             self.data(*byte)?;
         }
         // The EC finishes accepting the transaction only after IBF clears.
-        self.wait_input_empty()?;
-        if !want_result {
-            return Ok(None);
-        }
-        self.wait_output_full()?;
-        Ok(Some(self.io.read_u8(DATA_PORT)?))
+        self.wait_input_empty()
     }
 
-    fn transaction(
+    /// Run a whole mailbox transaction, making at most `TRANSACTION_RETRIES` attempts.
+    fn transaction<T>(
         &mut self,
-        command: u8,
-        payload: &[u8],
-        want_result: bool,
-    ) -> Result<Option<u8>, EcError> {
-        let mut last = EcError::Timeout("output buffer");
-        for _ in 0..TRANSACTION_RETRIES {
-            match self.transaction_once(command, payload, want_result) {
-                Ok(value) => return Ok(value),
-                Err(error) => last = error,
+        mut once: impl FnMut(&mut Self) -> Result<T, EcError>,
+    ) -> Result<T, EcError> {
+        let mut result = once(self);
+        for _ in 1..TRANSACTION_RETRIES {
+            if result.is_ok() {
+                break;
             }
+            result = once(self);
         }
-        Err(last)
+        result
+    }
+
+    fn query(&mut self, command: u8, payload: &[u8]) -> Result<u8, EcError> {
+        self.transaction(|ec| {
+            ec.send(command, payload)?;
+            ec.wait_output_full()?;
+            Ok(ec.io.read_u8(DATA_PORT)?)
+        })
     }
 
     pub fn version(&mut self) -> Result<u8, EcError> {
-        self.transaction(COMMAND_VERSION, &[VERSION_PAYLOAD], true)?
-            .ok_or(EcError::Timeout("output buffer"))
+        self.query(COMMAND_VERSION, &[VERSION_PAYLOAD])
     }
 
     pub fn read(&mut self, register: Register) -> Result<u8, EcError> {
-        self.transaction(
-            COMMAND_TABLE,
-            &[TABLE_READ, register as u8, TABLE_READ_PAD],
-            true,
-        )?
-        .ok_or(EcError::Timeout("output buffer"))
+        self.query(COMMAND_TABLE, &[TABLE_READ, register as u8, TABLE_READ_PAD])
     }
 
     pub fn write(&mut self, register: Register, value: u8) -> Result<(), EcError> {
-        self.transaction(COMMAND_TABLE, &[TABLE_WRITE, register as u8, value], false)
-            .map(|_| ())
+        self.transaction(|ec| ec.send(COMMAND_TABLE, &[TABLE_WRITE, register as u8, value]))
     }
 
-    pub fn probe(&mut self) -> Result<Probe, EcError> {
+    /// Return the EC version after confirming it reports exactly two fans.
+    pub fn probe(&mut self) -> Result<u8, EcError> {
         let version = self.version()?;
         let fan_count = self.read(Register::Count)?;
         if fan_count != 2 {
             return Err(EcError::FanCount(fan_count));
         }
-        Ok(Probe { version, fan_count })
+        Ok(version)
     }
 
     pub fn set_global_mode(&mut self, enabled: bool) -> Result<(), EcError> {
@@ -204,13 +195,15 @@ impl<P: PortIo> EcMailbox<P> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Probe {
-    pub version: u8,
-    pub fan_count: u8,
+/// Raw access to the EC mailbox ports. Only [`LinuxPortIo::acquire`] can
+/// construct it, so every instance holds the ioperm grant its `in`/`out` need.
+///
+/// ```compile_fail
+/// let _ = z13helperd::ec::LinuxPortIo;
+/// ```
+pub struct LinuxPortIo {
+    _ioperm_granted: (),
 }
-
-pub struct LinuxPortIo;
 
 impl LinuxPortIo {
     pub fn acquire() -> io::Result<Self> {
@@ -221,7 +214,9 @@ impl LinuxPortIo {
             if unsafe { libc::ioperm(DATA_PORT.into(), 2, 1) } != 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self)
+            Ok(Self {
+                _ioperm_granted: (),
+            })
         }
         #[cfg(not(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64"))))]
         {

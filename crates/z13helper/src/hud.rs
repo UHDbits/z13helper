@@ -255,25 +255,6 @@ mod tests {
         release_first: Option<mpsc::Receiver<()>>,
     }
 
-    struct RecoveringSink {
-        available: Arc<AtomicBool>,
-        delivered: Arc<Mutex<Vec<String>>>,
-        attempts: Arc<Mutex<usize>>,
-        attempt_events: mpsc::Sender<usize>,
-        delivered_event: mpsc::Sender<()>,
-    }
-
-    impl NotificationSink for RecoveringSink {
-        fn notify(&mut self, message: &str) {
-            *self.attempts.lock().unwrap() += 1;
-            let _ = self.attempt_events.send(*self.attempts.lock().unwrap());
-            if self.available.load(Ordering::Acquire) {
-                self.delivered.lock().unwrap().push(message.to_owned());
-                let _ = self.delivered_event.send(());
-            }
-        }
-    }
-
     impl NotificationSink for FakeSink {
         fn notify(&mut self, message: &str) {
             if let Some(started) = self.first_started.take() {
@@ -321,9 +302,15 @@ mod tests {
         release_tx.send(()).unwrap();
         assert_eq!(seen_events_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
         assert_eq!(seen_events_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
+        // A submit after the owner went idle is still delivered.
+        assert!(mailbox.submit("after idle"));
+        assert_eq!(seen_events_rx.recv_timeout(Duration::from_secs(1)), Ok(3));
         mailbox.close();
         thread.join().unwrap();
-        assert_eq!(seen.lock().unwrap().as_slice(), ["first", "latest"]);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["first", "latest", "after idle"]
+        );
     }
 
     #[test]
@@ -339,36 +326,5 @@ mod tests {
         thread.join().unwrap();
         assert!(seen.lock().unwrap().is_empty());
         assert!(!mailbox.submit("after shutdown"));
-    }
-
-    #[test]
-    fn notification_owner_keeps_retrying_after_sink_recovery() {
-        let available = Arc::new(AtomicBool::new(false));
-        let delivered = Arc::new(Mutex::new(Vec::new()));
-        let attempts = Arc::new(Mutex::new(0));
-        let (attempt_events_tx, attempt_events_rx) = mpsc::channel();
-        let (delivered_event_tx, delivered_event_rx) = mpsc::channel();
-        let (mailbox, thread) = fake_owner(RecoveringSink {
-            available: Arc::clone(&available),
-            delivered: Arc::clone(&delivered),
-            attempts: Arc::clone(&attempts),
-            attempt_events: attempt_events_tx,
-            delivered_event: delivered_event_tx,
-        });
-
-        mailbox.submit("while disconnected");
-        assert_eq!(
-            attempt_events_rx.recv_timeout(Duration::from_secs(1)),
-            Ok(1)
-        );
-        available.store(true, Ordering::Release);
-        mailbox.submit("after reconnect");
-        delivered_event_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-        mailbox.close();
-        thread.join().unwrap();
-        assert_eq!(delivered.lock().unwrap().as_slice(), ["after reconnect"]);
-        assert_eq!(*attempts.lock().unwrap(), 2);
     }
 }

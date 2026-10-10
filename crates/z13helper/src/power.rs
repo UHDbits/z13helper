@@ -1,34 +1,28 @@
-//! Power-source detection: UPower D-Bus primary, one-shot sysfs recovery.
+//! Power-source detection: UPower D-Bus primary, sysfs while UPower is down.
 //!
 //! Debounced transitions apply the remembered per-source profile and show the HUD.
 
+use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use z13helper_core::debounce::{
     ConfirmationTimer, DebounceAction, PowerDebouncer, PowerObservation,
 };
 
 use crate::app::AppState;
-use crate::ui::hud;
-
-thread_local! {
-    // Startup and resume both run on GTK's main thread. Keeping the coordinator
-    // here lets resume invalidate pre-suspend timers without making AppState
-    // own GTK-thread-only state or sending a socket call from a worker.
-    static COORDINATOR: std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<PowerDebouncer>>>> = const { std::cell::RefCell::new(None) };
-}
+use crate::hud;
 
 /// Start watching power source. The D-Bus owner lives for the UI process and
-/// exits when its bounded GLib delivery channel is closed. It never falls
-/// back to a recurring sysfs poll.
-pub fn start(state: &Rc<AppState>) {
+/// exits when its bounded GLib delivery channel is closed. While UPower is
+/// unavailable, sysfs is sampled once per backed-off reconnect attempt.
+/// Returns the GTK-thread debouncer that [`on_resume`] must share.
+pub fn start(state: &Rc<AppState>) -> Rc<RefCell<PowerDebouncer>> {
     // Power state is a snapshot, not an event log. Keep only the newest value
     // if GTK is temporarily busy.
     let (tx, rx) = async_channel::bounded::<PowerObservation>(1);
 
-    // Background UPower watcher with one explicit sysfs sample per outage.
+    // Background UPower watcher with a sysfs sample per failed reconnect.
     let watcher_tx = tx.clone();
     if let Err(error) = std::thread::Builder::new()
         .name("z13helper-power".into())
@@ -37,17 +31,15 @@ pub fn start(state: &Rc<AppState>) {
         })
     {
         tracing::error!(%error, "could not start power-source watcher");
-        let _ = publish(&tx, PowerObservation::Unknown);
+        let _ = tx.force_send(PowerObservation::Unknown);
     }
     drop(tx);
 
-    let debouncer = Rc::new(std::cell::RefCell::new(PowerDebouncer::new(
+    let debouncer = Rc::new(RefCell::new(PowerDebouncer::new(
         state.config.borrow().power_source_debounce_ms,
     )));
-    COORDINATOR.with(|coordinator| {
-        *coordinator.borrow_mut() = Some(debouncer.clone());
-    });
     let state = state.clone();
+    let for_resume = debouncer.clone();
 
     glib::MainContext::default().spawn_local(async move {
         while let Ok(observation) = rx.recv().await {
@@ -66,11 +58,12 @@ pub fn start(state: &Rc<AppState>) {
             handle_debounce_action(&state, &debouncer, action);
         }
     });
+    for_resume
 }
 
 fn handle_debounce_action(
     state: &Rc<AppState>,
-    debouncer: &Rc<std::cell::RefCell<PowerDebouncer>>,
+    debouncer: &Rc<RefCell<PowerDebouncer>>,
     action: DebounceAction,
 ) {
     match action {
@@ -86,7 +79,7 @@ fn handle_debounce_action(
 
 fn schedule_confirmation(
     state: &Rc<AppState>,
-    debouncer: &Rc<std::cell::RefCell<PowerDebouncer>>,
+    debouncer: &Rc<RefCell<PowerDebouncer>>,
     timer: ConfirmationTimer,
 ) {
     let delay = timer.deadline_ms.saturating_sub(monotonic_millis());
@@ -99,9 +92,7 @@ fn schedule_confirmation(
 }
 
 fn monotonic_millis() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
-    u64::try_from(elapsed).unwrap_or(u64::MAX)
+    glib::monotonic_time() as u64 / 1000
 }
 
 fn on_confirmed_transition(state: &Rc<AppState>, on_battery: bool) {
@@ -127,30 +118,26 @@ fn on_confirmed_transition(state: &Rc<AppState>, on_battery: bool) {
     tracing::info!(%id, on_battery, "applying remembered power-source profile");
     // Power-source automation changes only the active profile.  The profile
     // editor's explicit target remains untouched.
-    state.activate_profile(&id);
-    state.apply_active();
+    select_profile(state, &id);
     if state.config.borrow().show_hud {
         hud::show(state, &name, on_battery);
+    }
+}
+
+/// Make `id` the active profile and apply it if that changed anything.
+pub fn select_profile(state: &Rc<AppState>, id: &str) {
+    if state.activate_profile(id) {
+        state.apply_active();
     }
 }
 
 /// The daemon has sampled the source on both sides of suspend. Treat its
 /// post-resume value as already debounced so source-specific profile and panel
 /// policies are repaired immediately instead of waiting for the event owner.
-pub fn on_resume(state: &Rc<AppState>, on_battery: bool) {
+pub fn on_resume(state: &Rc<AppState>, debouncer: &Rc<RefCell<PowerDebouncer>>, on_battery: bool) {
     tracing::info!(on_battery, "power source changed during suspend");
-    let resumed = COORDINATOR.with(|coordinator| coordinator.borrow().clone());
-    if let Some(debouncer) = resumed {
-        let action = debouncer.borrow_mut().force_confirm(on_battery);
-        handle_debounce_action(state, &debouncer, action);
-    } else {
-        // This is only reachable if a resume event races application startup.
-        on_confirmed_transition(state, on_battery);
-    }
-}
-
-fn publish(tx: &async_channel::Sender<PowerObservation>, observation: PowerObservation) -> bool {
-    tx.force_send(observation).is_ok()
+    let action = debouncer.borrow_mut().force_confirm(on_battery);
+    handle_debounce_action(state, debouncer, action);
 }
 
 fn upower_watch(tx: async_channel::Sender<PowerObservation>) {
@@ -159,43 +146,44 @@ fn upower_watch(tx: async_channel::Sender<PowerObservation>) {
         match upower_session(&tx) {
             SessionResult::ReceiverClosed => return,
             SessionResult::Disconnected { established, error } => {
-                tracing::warn!(%error, "UPower connection lost; attempting reconnect");
-                if reconnect.should_sample(established) {
-                    let observation = sysfs_on_battery()
-                        .map(PowerObservation::Known)
-                        .unwrap_or(PowerObservation::Unknown);
-                    if !publish(&tx, observation) {
-                        return;
-                    }
+                let delay = reconnect.next_delay(established);
+                if delay == UPOWER_RETRY_MIN {
+                    tracing::warn!(%error, "UPower unavailable; using sysfs until it returns");
+                } else {
+                    tracing::debug!(%error, ?delay, "UPower still unavailable");
                 }
-                if tx.is_closed() {
+                // UPower is the only change notifier, so keep sampling the
+                // read-only fallback until it returns.
+                let observation = sysfs_on_battery()
+                    .map(PowerObservation::Known)
+                    .unwrap_or(PowerObservation::Unknown);
+                if tx.force_send(observation).is_err() {
                     return;
                 }
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(delay);
             }
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+const UPOWER_RETRY_MIN: Duration = Duration::from_secs(1);
+const UPOWER_RETRY_MAX: Duration = Duration::from_secs(15);
+
+#[derive(Default)]
 struct ReconnectState {
-    fallback_sampled: bool,
+    delay: Option<Duration>,
 }
 
 impl ReconnectState {
-    /// Return true exactly once for an outage. A session that was established
-    /// starts a fresh outage; repeated failed reconnect attempts do not turn
-    /// the fallback into a polling loop.
-    fn should_sample(&mut self, established: bool) -> bool {
-        if established {
-            self.fallback_sampled = false;
-        }
-        if self.fallback_sampled {
-            false
-        } else {
-            self.fallback_sampled = true;
-            true
-        }
+    /// Delay before the next UPower attempt. It doubles while UPower stays
+    /// unavailable; an established session starts a fresh outage.
+    fn next_delay(&mut self, established: bool) -> Duration {
+        let delay = match self.delay {
+            Some(delay) if !established => (delay * 2).min(UPOWER_RETRY_MAX),
+            _ => UPOWER_RETRY_MIN,
+        };
+        self.delay = Some(delay);
+        delay
     }
 }
 
@@ -242,19 +230,19 @@ fn upower_session(tx: &async_channel::Sender<PowerObservation>) -> SessionResult
             };
         }
     };
-    if !publish(tx, PowerObservation::Known(initial)) {
+    if tx.force_send(PowerObservation::Known(initial)).is_err() {
         return SessionResult::ReceiverClosed;
     }
 
     for changed in changed {
         match changed.get() {
             Ok(value) => {
-                if !publish(tx, PowerObservation::Known(value)) {
+                if tx.force_send(PowerObservation::Known(value)).is_err() {
                     return SessionResult::ReceiverClosed;
                 }
             }
             Err(error) => {
-                let _ = publish(tx, PowerObservation::Unknown);
+                let _ = tx.force_send(PowerObservation::Unknown);
                 return SessionResult::Disconnected {
                     established: true,
                     error: error.to_string(),
@@ -279,6 +267,7 @@ fn sysfs_on_battery() -> Option<bool> {
             kind: std::fs::read_to_string(path.join("type")).ok(),
             online: std::fs::read_to_string(path.join("online")).ok(),
             status: std::fs::read_to_string(path.join("status")).ok(),
+            scope: std::fs::read_to_string(path.join("scope")).ok(),
         });
     }
     classify_supplies(&supplies)
@@ -289,36 +278,41 @@ struct SupplyReading {
     kind: Option<String>,
     online: Option<String>,
     status: Option<String>,
+    scope: Option<String>,
 }
 
+/// Entries can vanish mid-scan, so a missing `online`/`status` file skips
+/// that supply instead of making the whole sample unknown.
 fn classify_supplies(supplies: &[SupplyReading]) -> Option<bool> {
-    let adapters: Vec<&SupplyReading> = supplies
-        .iter()
-        .filter(|supply| matches!(supply.kind.as_deref().map(str::trim), Some("Mains" | "ADP")))
-        .collect();
-    if !adapters.is_empty() {
-        for adapter in &adapters {
-            match adapter.online.as_deref().map(str::trim) {
-                Some("1") => return Some(false),
-                Some("0") => {}
-                _ => return None,
-            }
+    fn field(value: &Option<String>) -> Option<&str> {
+        value.as_deref().map(str::trim)
+    }
+    let mut found_adapter = false;
+    for supply in supplies {
+        if field(&supply.kind) != Some("Mains") {
+            continue;
         }
+        match field(&supply.online) {
+            Some("1") => return Some(false),
+            Some("0") => found_adapter = true,
+            None => {}
+            _ => return None,
+        }
+    }
+    if found_adapter {
         return Some(true);
     }
 
-    let batteries: Vec<&SupplyReading> = supplies
-        .iter()
-        .filter(|supply| supply.kind.as_deref().map(str::trim) == Some("Battery"))
-        .collect();
-    if batteries.is_empty() {
-        return None;
-    }
     let mut saw_known = false;
-    for battery in batteries {
-        match battery.status.as_deref().map(str::trim) {
+    for supply in supplies {
+        // Peripheral (HID) batteries report scope "Device", not the system.
+        if field(&supply.kind) != Some("Battery") || field(&supply.scope) == Some("Device") {
+            continue;
+        }
+        match field(&supply.status) {
             Some("Discharging") => return Some(true),
             Some("Charging" | "Full" | "Not charging") => saw_known = true,
+            None => {}
             _ => return None,
         }
     }
@@ -327,33 +321,43 @@ fn classify_supplies(supplies: &[SupplyReading]) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReconnectState, SupplyReading, classify_supplies, publish};
-    use z13helper_core::debounce::PowerObservation;
+    use super::{ReconnectState, SupplyReading, classify_supplies};
+    use std::time::Duration;
 
     fn supply(kind: &str, online: Option<&str>, status: Option<&str>) -> SupplyReading {
         SupplyReading {
             kind: Some(kind.into()),
             online: online.map(str::to_owned),
             status: status.map(str::to_owned),
+            scope: None,
         }
     }
 
     #[test]
-    fn signal_delivery_is_bounded_and_keeps_latest_value() {
-        let (tx, rx) = async_channel::bounded(1);
-        assert!(publish(&tx, PowerObservation::Known(false)));
-        assert!(publish(&tx, PowerObservation::Known(true)));
-        assert_eq!(rx.try_recv(), Ok(PowerObservation::Known(true)));
+    fn reconnect_backs_off_until_a_session_is_established() {
+        let mut state = ReconnectState::default();
+        let delays: Vec<u64> = (0..6).map(|_| state.next_delay(false).as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 15, 15]);
+        assert_eq!(state.next_delay(true), Duration::from_secs(1));
+        assert_eq!(state.next_delay(false), Duration::from_secs(2));
     }
 
     #[test]
-    fn reconnect_samples_once_until_a_session_is_established() {
-        let mut state = ReconnectState::default();
-        assert!(state.should_sample(false));
-        assert!(!state.should_sample(false));
-        assert!(!state.should_sample(false));
-        assert!(state.should_sample(true));
-        assert!(!state.should_sample(false));
+    fn sysfs_fake_ignores_peripheral_and_vanished_supplies() {
+        let mut stylus = supply("Battery", None, Some("Discharging"));
+        stylus.scope = Some("Device\n".into());
+        assert_eq!(
+            classify_supplies(&[stylus, supply("Battery", None, Some("Charging"))]),
+            Some(false)
+        );
+        assert_eq!(
+            classify_supplies(&[
+                supply("Mains", None, None),
+                supply("Battery", None, None),
+                supply("Battery", None, Some("Discharging")),
+            ]),
+            Some(true)
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 use tracing::field::{Field, Visit};
+use tracing::level_filters::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
@@ -19,8 +20,13 @@ pub fn init() {
 struct JsonSubscriber;
 
 impl Subscriber for JsonSubscriber {
-    fn enabled(&self, _: &Metadata<'_>) -> bool {
-        true
+    // ponytail: fixed INFO ceiling; add an env override if debug logs are ever needed.
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        *metadata.level() <= LevelFilter::INFO
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(LevelFilter::INFO)
     }
 
     fn new_span(&self, _: &Attributes<'_>) -> Id {
@@ -74,5 +80,19 @@ impl Visit for JsonVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         self.fields
             .insert(field.name().into(), format!("{value:?}").into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tracing::Level;
+
+    #[test]
+    fn debug_and_trace_events_are_not_written() {
+        tracing::subscriber::with_default(super::JsonSubscriber, || {
+            assert!(tracing::enabled!(Level::INFO));
+            assert!(!tracing::enabled!(Level::DEBUG));
+            assert!(!tracing::enabled!(target: "zbus", Level::TRACE));
+        });
     }
 }

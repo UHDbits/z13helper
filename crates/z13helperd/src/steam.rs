@@ -7,37 +7,22 @@ use crate::hidraw::HidrawBlocker;
 
 #[derive(Default)]
 pub struct SteamBlocker {
-    hidraw: Option<HidrawBlocker>,
+    /// Set on first use. A setup failure is kept, so it is warned about once
+    /// and the BPF object is not reloaded on every retry.
+    hidraw: Option<Result<HidrawBlocker, String>>,
 }
 
 impl SteamBlocker {
-    fn ensure_hidraw_blocker(&mut self) -> bool {
-        if self.hidraw.is_some() {
-            return true;
-        }
-        match HidrawBlocker::new() {
-            Ok(hidraw) => {
-                self.hidraw = Some(hidraw);
-                true
-            }
-            Err(error) => {
-                tracing::debug!(
-                    %error,
-                    "Steam hidraw suppression is not available for this overlay"
-                );
-                false
-            }
-        }
-    }
-
     /// Blocks Steam and its descendants from reading hidraw while the overlay
     /// owns controller input. The daemon derives PIDs itself; no socket client
     /// can nominate arbitrary processes for BPF blocking.
     pub fn block(&mut self) {
-        if !self.ensure_hidraw_blocker() {
-            return;
-        }
-        let Some(hidraw) = self.hidraw.as_mut() else {
+        let hidraw = self.hidraw.get_or_insert_with(|| {
+            HidrawBlocker::new().inspect_err(|error| {
+                tracing::warn!(%error, "Steam hidraw suppression is unavailable");
+            })
+        });
+        let Ok(hidraw) = hidraw else {
             return;
         };
         let pids = steam_family();
@@ -47,7 +32,7 @@ impl SteamBlocker {
         if pids.len() > 64 {
             tracing::warn!(
                 count = pids.len(),
-                "Steam process tree exceeds BPF blocker capacity; only the first 64 PIDs are blocked"
+                "Steam process tree exceeds BPF blocker capacity; only the 64 PIDs nearest the root are blocked"
             );
         }
         match hidraw.set_blocked_pids(pids.iter().copied()) {
@@ -56,8 +41,13 @@ impl SteamBlocker {
         }
     }
 
+    /// Whether PIDs remain in the BPF map, including ones a failed unblock left.
+    pub fn has_blocked_pids(&self) -> bool {
+        matches!(&self.hidraw, Some(Ok(hidraw)) if hidraw.has_blocked_pids())
+    }
+
     pub fn unblock(&mut self) {
-        let Some(hidraw) = self.hidraw.as_mut() else {
+        let Some(Ok(hidraw)) = self.hidraw.as_mut() else {
             return;
         };
         if let Err(error) = hidraw.set_blocked_pids([]) {
@@ -79,9 +69,9 @@ struct Process {
     comm: String,
 }
 
-fn steam_family() -> BTreeSet<u32> {
+fn steam_family() -> Vec<u32> {
     let Ok(entries) = fs::read_dir("/proc") else {
-        return BTreeSet::new();
+        return Vec::new();
     };
     let processes: Vec<_> = entries
         .flatten()
@@ -107,7 +97,9 @@ fn read_process(pid: u32) -> Option<Process> {
     Some(Process { pid, parent, comm })
 }
 
-fn steam_family_from_processes(processes: &[Process]) -> BTreeSet<u32> {
+/// Steam roots, then their descendants breadth-first, so truncating to the BPF
+/// map capacity keeps ancestors regardless of PID order.
+fn steam_family_from_processes(processes: &[Process]) -> Vec<u32> {
     let mut children = BTreeMap::<u32, Vec<u32>>::new();
     let mut queue = VecDeque::new();
     for process in processes {
@@ -120,11 +112,13 @@ fn steam_family_from_processes(processes: &[Process]) -> BTreeSet<u32> {
         }
     }
 
-    let mut result = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
     while let Some(pid) = queue.pop_front() {
-        if !result.insert(pid) {
+        if !seen.insert(pid) {
             continue;
         }
+        result.push(pid);
         if let Some(next) = children.get(&pid) {
             queue.extend(next);
         }
@@ -160,9 +154,25 @@ mod tests {
                 comm: "other".into(),
             },
         ];
-        assert_eq!(
-            steam_family_from_processes(&processes),
-            BTreeSet::from([10, 11, 12])
-        );
+        assert_eq!(steam_family_from_processes(&processes), [10, 11, 12]);
+    }
+
+    #[test]
+    fn bpf_capacity_truncation_keeps_the_steam_root_after_pid_wrap() {
+        // After PID wrap the long-lived root outnumbers its children, so an
+        // ascending-PID cut at the 64-entry BPF map would drop it.
+        let processes: Vec<_> = std::iter::once(Process {
+            pid: 50_000,
+            parent: 1,
+            comm: "steam".into(),
+        })
+        .chain((2..=80).map(|pid| Process {
+            pid,
+            parent: 50_000,
+            comm: "steamwebhelper".into(),
+        }))
+        .collect();
+        let family = steam_family_from_processes(&processes);
+        assert!(family.into_iter().take(64).any(|pid| pid == 50_000));
     }
 }

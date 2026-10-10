@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
-use z13helper_core::apply::{Daemon, apply_request};
-use z13helper_core::curve::{Curve, HIGH_POWER_THRESHOLD_W, high_power_curve};
+use z13helper_core::apply::{Daemon, apply_request, set_fans};
+use z13helper_core::curve::{
+    Curve, HIGH_POWER_THRESHOLD_W, fan_protection_required, high_power_curve,
+};
 use z13helper_core::error::DaemonError;
+use z13helper_core::profile::FanControlMode;
 use z13helper_core::protocol::{
     ApplyRequest, ApplyResponse, Capabilities, DaemonState, FanHysteresis, Health, LightingState,
-    OverrideState, ProbeReply, TdpState, Telemetry, UndervoltState, stock_tdp,
+    OverrideState, ProbeReply, TdpState, Telemetry, UndervoltState, stock_tdp, validate_undervolt,
 };
 
 use crate::aura::AuraDevices;
@@ -33,14 +36,6 @@ fn push_warning(warnings: &mut Vec<String>, warning: impl Into<String>) {
     warnings.push(warning);
 }
 
-fn bounded_warnings(warnings: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut bounded = Vec::new();
-    for warning in warnings {
-        push_warning(&mut bounded, warning);
-    }
-    bounded
-}
-
 pub struct PlatformHardware {
     sysfs: Sysfs,
     aura: AuraDevices,
@@ -58,7 +53,7 @@ pub struct PlatformHardware {
 
 impl PlatformHardware {
     fn fan_curves_for_hardware(&self, curves: &[Curve; 2], effective_pl1: u32) -> [Curve; 2] {
-        if effective_pl1 >= HIGH_POWER_THRESHOLD_W && !self.disable_high_power_fan_protection {
+        if fan_protection_required(effective_pl1, self.disable_high_power_fan_protection) {
             [high_power_curve(&curves[0]), high_power_curve(&curves[1])]
         } else {
             *curves
@@ -71,7 +66,8 @@ impl PlatformHardware {
         let undervolt_available = sysfs.probe_undervolt_once();
         let (ppd_profiles, ppd_profile) = Self::read_ppd().unwrap_or_default();
         let mut aura = AuraDevices::default();
-        let _ = aura.refresh();
+        // Startup restore_lighting lights the devices present now.
+        let _ = aura.take_reconnected();
         Ok((
             Self {
                 sysfs,
@@ -98,17 +94,13 @@ impl PlatformHardware {
         temperature_average_seconds: u8,
         disable_high_power: bool,
     ) -> Result<(), String> {
+        // Fields first: Backend restores the committed policy through this
+        // call and must get the override flag back even if the owner fails.
         self.fan_hysteresis = hysteresis;
         self.fan_temperature_average_seconds = temperature_average_seconds;
         self.disable_high_power_fan_protection = disable_high_power;
         self.direct
             .set_policy(hysteresis, temperature_average_seconds)
-    }
-
-    fn prime_direct(&mut self, curves: [Curve; 2]) -> Result<(), String> {
-        let snapshot = self.direct.install_and_prime(curves)?;
-        self.sync_direct_snapshot(snapshot);
-        Ok(())
     }
 
     fn observed_temperature_c(&mut self) -> Option<i32> {
@@ -124,19 +116,17 @@ impl PlatformHardware {
         })
     }
 
-    fn observed_fan_rpms(&mut self) -> Option<[u32; 2]> {
-        sensors::read_fan_rpms().ok()
-    }
-
     pub fn release_direct(&mut self) -> Result<(), String> {
-        let result = self.direct.release();
-        if let Ok(snapshot) = &result {
-            self.sync_direct_snapshot(snapshot.clone());
+        match self.direct.release() {
+            Ok(snapshot) => {
+                self.sync_direct_snapshot(snapshot);
+                Ok(())
+            }
+            Err(error) => {
+                self.direct_release_failure = Some(error.clone());
+                Err(error)
+            }
         }
-        if let Err(error) = &result {
-            self.direct_release_failure = Some(error.clone());
-        }
-        result.map(|_| ())
     }
 
     fn sync_direct_snapshot(&mut self, snapshot: DirectSnapshot) {
@@ -147,28 +137,21 @@ impl PlatformHardware {
         self.direct_snapshot = snapshot;
     }
 
-    fn take_direct_release_failure(&mut self) -> Option<String> {
-        self.direct_release_failure.take()
-    }
-
-    pub fn apply_lighting(&mut self, device: &str, state: &LightingState) -> Result<(), String> {
-        self.aura.apply(device, state)
-    }
-
-    pub fn refresh_aura(&mut self) -> Vec<String> {
-        self.aura.refresh()
+    fn ppd_proxy() -> Result<zbus::blocking::Proxy<'static>, String> {
+        zbus::blocking::Connection::system()
+            .and_then(|connection| {
+                zbus::blocking::Proxy::new(
+                    &connection,
+                    "net.hadess.PowerProfiles",
+                    "/net/hadess/PowerProfiles",
+                    "net.hadess.PowerProfiles",
+                )
+            })
+            .map_err(|error| error.to_string())
     }
 
     fn ppd_set_blocking(profile: &str) -> Result<(), String> {
-        let connection = zbus::blocking::Connection::system().map_err(|error| error.to_string())?;
-        let proxy = zbus::blocking::Proxy::new(
-            &connection,
-            "net.hadess.PowerProfiles",
-            "/net/hadess/PowerProfiles",
-            "net.hadess.PowerProfiles",
-        )
-        .map_err(|error| error.to_string())?;
-        proxy
+        Self::ppd_proxy()?
             .set_property("ActiveProfile", profile)
             .map_err(|error| error.to_string())
     }
@@ -176,14 +159,7 @@ impl PlatformHardware {
     fn read_ppd() -> Result<(Vec<String>, Option<String>), String> {
         use zbus::zvariant::OwnedValue;
 
-        let connection = zbus::blocking::Connection::system().map_err(|error| error.to_string())?;
-        let proxy = zbus::blocking::Proxy::new(
-            &connection,
-            "net.hadess.PowerProfiles",
-            "/net/hadess/PowerProfiles",
-            "net.hadess.PowerProfiles",
-        )
-        .map_err(|error| error.to_string())?;
+        let proxy = Self::ppd_proxy()?;
         let records: Vec<HashMap<String, OwnedValue>> = proxy
             .get_property("Profiles")
             .map_err(|error| error.to_string())?;
@@ -209,6 +185,15 @@ impl PlatformHardware {
                 self.ppd_profile = None;
             }
         }
+    }
+
+    fn check_fan_release_power(&self) -> Result<(), DaemonError> {
+        let actual = self.sysfs.read_tdp().map_err(|error| {
+            DaemonError::Rejected(format!(
+                "cannot prove current PL1 before releasing fan protection: {error}"
+            ))
+        })?;
+        validate_fan_release_power(actual, self.disable_high_power_fan_protection)
     }
 }
 
@@ -274,23 +259,31 @@ impl Daemon for PlatformHardware {
         effective_pl1: u32,
     ) -> Result<(), DaemonError> {
         let written = self.fan_curves_for_hardware(curves, effective_pl1);
-        if let Err(error) = self.prime_direct(written) {
-            let release = self.release_direct().err();
-            return Err(DaemonError::Rejected(match release {
-                Some(release) => format!("{error}; direct EC release failed: {release}"),
-                None => error,
-            }));
+        match self.direct.install_and_prime(written) {
+            Ok(snapshot) => {
+                self.sync_direct_snapshot(snapshot);
+                Ok(())
+            }
+            Err(error) => Err(DaemonError::Rejected(match self.release_direct() {
+                Err(release) => format!("{error}; direct EC release failed: {release}"),
+                Ok(()) => error,
+            })),
         }
-        Ok(())
+    }
+
+    fn current_pl1(&self) -> Result<u32, DaemonError> {
+        self.sysfs
+            .read_tdp()
+            .map(TdpState::pl1_watts)
+            .map_err(|error| {
+                DaemonError::Rejected(format!(
+                    "cannot prove current PL1 before writing fan curves: {error}"
+                ))
+            })
     }
 
     fn fans_release(&mut self) -> Result<(), DaemonError> {
-        let actual = self.sysfs.read_tdp().map_err(|error| {
-            DaemonError::Rejected(format!(
-                "cannot prove current PL1 before releasing fan protection: {error}"
-            ))
-        })?;
-        validate_fan_release_power(actual, self.disable_high_power_fan_protection)?;
+        self.check_fan_release_power()?;
         self.release_direct().map_err(DaemonError::Rejected)?;
         self.sysfs
             .release_firmware_fans()
@@ -365,6 +358,7 @@ struct FanProtectionSnapshot {
 enum PersistenceMode {
     ReadWrite,
     UnsupportedReadOnly { version: u32 },
+    UnreadableReadOnly,
 }
 
 #[derive(Clone, Debug)]
@@ -380,6 +374,10 @@ impl PersistenceMode {
             Self::UnsupportedReadOnly { version } => Err(DaemonError::Rejected(format!(
                 "daemon state version {version} is unsupported; persistent controls are read-only"
             ))),
+            Self::UnreadableReadOnly => Err(DaemonError::Rejected(
+                "daemon state could not be read or preserved; persistent controls are read-only"
+                    .into(),
+            )),
         }
     }
 }
@@ -388,27 +386,7 @@ impl Backend {
     pub fn start() -> Result<Self, String> {
         let (hardware, probe) = PlatformHardware::acquire()?;
         let store = StateStore::default();
-        let (persisted, persistence) = match store.load() {
-            Ok(state) => (state, PersistenceMode::ReadWrite),
-            Err(StateLoadError::Unsupported(version)) => {
-                tracing::warn!(
-                    version,
-                    "unsupported daemon state; starting without overwriting it"
-                );
-                let mut state = PersistedState::default();
-                push_warning(
-                    &mut state.state.warnings,
-                    format!("unsupported state version {version}; expected 1"),
-                );
-                (state, PersistenceMode::UnsupportedReadOnly { version })
-            }
-            Err(error) => {
-                tracing::warn!(%error, "starting from fresh daemon state");
-                let mut state = PersistedState::default();
-                push_warning(&mut state.state.warnings, error.to_string());
-                (state, PersistenceMode::ReadWrite)
-            }
-        };
+        let (persisted, persistence) = loaded_state(store.load());
         let mut backend = Self {
             hardware,
             persisted,
@@ -419,20 +397,16 @@ impl Backend {
         };
         backend.restore_panel_overdrive();
         backend.observe();
-        if let Some(desired) = backend.persisted.desired.clone() {
-            if let Err(error) = backend.apply(desired) {
-                backend.persisted.state.degraded = true;
-                push_warning(
-                    &mut backend.persisted.state.warnings,
-                    format!("startup restore failed: {error}"),
-                );
-            }
+        if backend.persisted.desired.is_some() {
+            backend.restore_desired("startup restore");
         } else {
             backend.persisted.state.fan_curves = Some(z13helper_core::stock_fan_curves(
                 backend.persisted.state.ppd_profile.as_deref(),
             ));
-            if persistence == PersistenceMode::ReadWrite {
-                let _ = backend.save();
+            if persistence == PersistenceMode::ReadWrite
+                && let Err(error) = backend.save()
+            {
+                tracing::warn!(%error, "failed to persist initial daemon state");
             }
         }
         backend.restore_battery_policy();
@@ -456,24 +430,21 @@ impl Backend {
         self.prevalidate(&request)?;
         let previous_persisted = self.persisted.clone();
         let previous = self.persisted.desired.clone();
-        self.hardware
-            .set_fan_policy(
-                request.fan_hysteresis,
-                request.fan_temperature_average_seconds,
-                request.disable_high_power_fan_protection,
-            )
-            .map_err(DaemonError::Rejected)?;
+        if let Err(error) = self.hardware.set_fan_policy(
+            request.fan_hysteresis,
+            request.fan_temperature_average_seconds,
+            request.disable_high_power_fan_protection,
+        ) {
+            self.restore_committed_fan_policy();
+            return Err(DaemonError::Rejected(error));
+        }
         let warnings = match apply_request(&mut self.hardware, &request) {
-            Ok(warnings) => bounded_warnings(warnings),
+            Ok(warnings) => warnings,
             Err(error) => {
                 self.record_direct_release_failure("apply");
+                self.restore_committed_fan_policy();
                 match previous {
                     Some(previous) => {
-                        let _ = self.hardware.set_fan_policy(
-                            previous.fan_hysteresis,
-                            previous.fan_temperature_average_seconds,
-                            previous.disable_high_power_fan_protection,
-                        );
                         if let Err(rollback) = apply_request(&mut self.hardware, &previous) {
                             self.persisted.state.degraded = true;
                             push_warning(
@@ -541,19 +512,14 @@ impl Backend {
         self.record_direct_release_failure("apply");
         self.observe();
         if let Err(error) = self.save() {
-            let rollback = if let Some(previous) = previous_persisted.desired.clone() {
-                let _ = self.hardware.set_fan_policy(
-                    previous.fan_hysteresis,
-                    previous.fan_temperature_average_seconds,
-                    previous.disable_high_power_fan_protection,
-                );
-                apply_request(&mut self.hardware, &previous).map(|_| ())
-            } else {
-                Err(DaemonError::Rejected(
-                    "no known-good hardware state; retained current fan protection".into(),
-                ))
-            };
             self.persisted = previous_persisted;
+            self.restore_committed_fan_policy();
+            let rollback = match previous {
+                Some(previous) => apply_request(&mut self.hardware, &previous).map(|_| ()),
+                None => Err(DaemonError::Rejected(
+                    "no known-good hardware state; retained current fan protection".into(),
+                )),
+            };
             self.persisted.state.degraded = true;
             push_warning(
                 &mut self.persisted.state.warnings,
@@ -693,15 +659,13 @@ impl Backend {
         }
         let previous = self.persisted.clone();
         let mut candidate = previous.clone();
-        candidate.state.generation = next_generation(candidate.state.generation);
-
         let previous_hardware_limit = self
             .hardware
             .sysfs
             .battery_limit()
             .map_err(DaemonError::Rejected)?;
         let target = effective_battery_limit(previous.state.battery_one_time_charge, Some(limit))
-            .expect("normal battery limit is present after validation");
+            .unwrap_or(limit);
         candidate.state.battery_limit = Some(limit);
         self.apply_and_commit_auxiliary(
             previous,
@@ -729,13 +693,12 @@ impl Backend {
             .sysfs
             .battery_limit()
             .map_err(DaemonError::Rejected)?;
-        if candidate.state.battery_limit.is_none() {
-            candidate.state.battery_limit = Some(previous_hardware_limit);
-        }
-        let target = effective_battery_limit(enabled, candidate.state.battery_limit)
-            .expect("normal battery limit was initialized above");
+        let normal_limit = *candidate
+            .state
+            .battery_limit
+            .get_or_insert(previous_hardware_limit);
+        let target = effective_battery_limit(enabled, Some(normal_limit)).unwrap_or(normal_limit);
         candidate.state.battery_one_time_charge = enabled;
-        candidate.state.generation = next_generation(candidate.state.generation);
         self.apply_and_commit_auxiliary(
             previous,
             candidate,
@@ -754,28 +717,22 @@ impl Backend {
         self.persistence.require_writable()?;
         let previous = self.persisted.clone();
         let mut candidate = previous.clone();
-        candidate.state.generation = next_generation(candidate.state.generation);
         let previous_hardware_value = self
             .hardware
             .sysfs
-            .read_armoury_bool("panel_overdrive")
+            .read_panel_overdrive()
             .map_err(DaemonError::Rejected)?;
         candidate.state.panel_overdrive = Some(i32::from(enabled));
         self.apply_and_commit_auxiliary(
             previous,
             candidate,
             "panel overdrive",
+            move |backend| backend.hardware.sysfs.set_panel_overdrive(enabled),
             move |backend| {
                 backend
                     .hardware
                     .sysfs
-                    .set_armoury_bool("panel_overdrive", enabled)
-            },
-            move |backend| {
-                backend
-                    .hardware
-                    .sysfs
-                    .set_armoury_bool("panel_overdrive", previous_hardware_value != 0)
+                    .set_panel_overdrive(previous_hardware_value != 0)
             },
         )
     }
@@ -794,7 +751,6 @@ impl Backend {
             .and_then(|devices| devices.get(&device))
             .cloned();
         let mut candidate = previous.clone();
-        candidate.state.generation = next_generation(candidate.state.generation);
         let apply_device = device.clone();
         let apply_state = state.clone();
         candidate
@@ -806,29 +762,27 @@ impl Backend {
             previous,
             candidate,
             "lighting",
-            move |backend| backend.hardware.apply_lighting(&apply_device, &apply_state),
+            move |backend| backend.hardware.aura.apply(&apply_device, &apply_state),
             move |backend| backend.restore_lighting_device(&device, previous_device_state.as_ref()),
         )
     }
 
     pub fn release_fans(&mut self) -> Result<(), DaemonError> {
         self.persistence.require_writable()?;
-        let actual = self.hardware.sysfs.read_tdp().map_err(|error| {
-            DaemonError::Rejected(format!(
-                "cannot prove current PL1 before releasing fan protection: {error}"
-            ))
-        })?;
-        validate_fan_release_power(actual, self.hardware.disable_high_power_fan_protection)?;
+        // Refuse before the transaction, so a refusal is not "compensated".
+        self.hardware.check_fan_release_power()?;
 
         let previous = self.persisted.clone();
         let snapshot = self.fan_protection_snapshot();
         let mut candidate = previous.clone();
+        // Direct mode requires curves, so releasing them returns to firmware.
         if let Some(desired) = candidate.desired.as_mut() {
             desired.fan_curves = None;
+            desired.fan_mode = FanControlMode::Firmware;
         }
+        candidate.state.fan_control_mode = FanControlMode::Firmware;
         candidate.state.fan_curves = None;
         candidate.state.overrides.fans = false;
-        candidate.state.generation = next_generation(candidate.state.generation);
         let rollback_state = previous.clone();
         self.apply_and_commit_auxiliary(
             previous,
@@ -872,14 +826,7 @@ impl Backend {
             power_source_changed(self.suspended_on_battery, resumed_on_battery);
         self.suspended_on_battery = None;
 
-        if let Some(desired) = self.persisted.desired.clone()
-            && let Err(error) = self.apply(desired)
-        {
-            tracing::error!(%error, "failed to restore volatile hardware state");
-            self.note_restore_failure("resume restore failed", &error.to_string());
-            let _ = self.hardware.release_direct();
-            self.record_direct_release_failure("resume restore");
-        }
+        self.restore_desired("resume restore");
         self.restore_battery_policy();
         self.restore_panel_overdrive();
         self.restore_lighting();
@@ -891,7 +838,7 @@ impl Backend {
     }
 
     pub fn restore_hotplugged_lighting(&mut self) {
-        let connected = self.hardware.refresh_aura();
+        let connected = self.hardware.aura.take_reconnected();
         for device in connected {
             let state = self
                 .persisted
@@ -901,7 +848,7 @@ impl Backend {
                 .and_then(|devices| devices.get(&device))
                 .cloned();
             if let Some(state) = state
-                && let Err(error) = self.hardware.apply_lighting(&device, &state)
+                && let Err(error) = self.hardware.aura.apply(&device, &state)
             {
                 tracing::warn!(%error, %device, "failed to relight hotplugged device");
                 self.note_restore_failure(&format!("{device} lighting restore failed"), &error);
@@ -912,11 +859,23 @@ impl Backend {
     /// Refresh expensive platform and UI telemetry. Direct fan sampling is
     /// intentionally kept separate from the owner cadence. The snapshot is a
     /// read-only handoff from the 250 ms owner loop, not a request to drive it.
-    pub fn observe(&mut self) {
+    /// Returns whether health (degraded or warnings) changed or a state
+    /// change was committed, such as one-time charge completion.
+    pub fn observe(&mut self) -> bool {
+        let generation = self.persisted.state.generation;
         match self.hardware.direct.snapshot() {
             Ok(snapshot) => {
                 self.hardware.sync_direct_snapshot(snapshot.clone());
-                if let Some(error) = snapshot.last_error {
+                // The owner keeps its last error until direct mode is primed
+                // again, so it is only current while direct mode is desired.
+                let direct_desired = self
+                    .persisted
+                    .desired
+                    .as_ref()
+                    .is_some_and(|desired| desired.fan_mode == FanControlMode::Direct);
+                if let Some(error) = snapshot.last_error
+                    && direct_desired
+                {
                     self.persisted.state.degraded = true;
                     push_warning(&mut self.persisted.state.warnings, error);
                 }
@@ -943,16 +902,16 @@ impl Backend {
             self.persisted.state.battery = battery;
         }
         self.complete_one_time_charge_if_full();
-        if let Ok(value) = self.hardware.sysfs.read_armoury_bool("panel_overdrive") {
+        if let Ok(value) = self.hardware.sysfs.read_panel_overdrive() {
             self.persisted.state.panel_overdrive = Some(value);
         }
         if let Some(temperature) = self.hardware.observed_temperature_c() {
             self.persisted.state.temperature = Some(temperature);
         }
-        if let Some(rpms) = self.hardware.observed_fan_rpms() {
+        if let Ok(rpms) = sensors::read_fan_rpms() {
             self.persisted.state.fan_rpms = rpms;
         }
-        let _ = self.hardware.refresh_aura();
+        self.hardware.aura.refresh();
         self.hardware.refresh_ppd();
         self.persisted.state.undervolt_available = self.hardware.undervolt_available;
         self.persisted.state.ppd_profile = self.hardware.ppd_profile.clone();
@@ -969,41 +928,50 @@ impl Backend {
             .persisted
             .state
             .tdp
-            .map(|state| state.pl1_spl.max(0) as u32)
+            .map(TdpState::pl1_watts)
             .unwrap_or(0);
         self.persisted.state.direct_fan_duties = self.hardware.direct_snapshot.last_safe_duty;
         self.persisted.state.high_power_fan_protection =
-            pl1 >= HIGH_POWER_THRESHOLD_W && !self.hardware.disable_high_power_fan_protection;
+            fan_protection_required(pl1, self.hardware.disable_high_power_fan_protection);
         self.persisted.state.telemetry = Telemetry {
             temperature_c: self.persisted.state.temperature,
             fan_rpms: self.persisted.state.fan_rpms,
         };
-        self.persisted.state.health = Health {
+        let health = Health {
             degraded: self.persisted.state.degraded,
             warnings: self.persisted.state.warnings.clone(),
         };
+        let changed =
+            self.persisted.state.health != health || self.persisted.state.generation != generation;
+        self.persisted.state.health = health;
+        changed
     }
 
-    fn save_candidate(&self, candidate: &PersistedState) -> Result<(), String> {
+    fn save_state(&self, state: &PersistedState) -> Result<(), String> {
         self.persistence
             .require_writable()
             .map_err(|error| error.to_string())?;
-        self.store.save(candidate)
+        self.store.save(state)
+    }
+
+    fn save(&self) -> Result<(), String> {
+        self.save_state(&self.persisted)
     }
 
     /// Run an auxiliary mutation as a small transaction. The candidate is
-    /// already complete before this is called; hardware is changed first,
+    /// complete except for its generation bump; hardware is changed first,
     /// then the candidate is published. Every caller supplies an explicit
     /// compensation operation because fan protection cannot use the same
     /// rollback policy as reversible scalar settings.
     fn apply_and_commit_auxiliary(
         &mut self,
         previous: PersistedState,
-        candidate: PersistedState,
+        mut candidate: PersistedState,
         context: &str,
         apply: impl FnOnce(&mut Self) -> Result<(), String>,
-        mut rollback: impl FnMut(&mut Self) -> Result<(), String>,
+        rollback: impl FnOnce(&mut Self) -> Result<(), String>,
     ) -> Result<(), DaemonError> {
+        candidate.state.generation = candidate.state.generation.saturating_add(1);
         if let Err(error) = apply(self) {
             let rollback = rollback(self);
             return Err(self.auxiliary_failure(
@@ -1013,7 +981,7 @@ impl Backend {
                 rollback,
             ));
         }
-        self.commit_auxiliary(previous, candidate, context, |backend| rollback(backend))
+        self.commit_auxiliary(previous, candidate, context, rollback)
     }
 
     fn commit_auxiliary(
@@ -1023,7 +991,7 @@ impl Backend {
         context: &str,
         rollback: impl FnOnce(&mut Self) -> Result<(), String>,
     ) -> Result<(), DaemonError> {
-        if let Err(error) = self.save_candidate(&candidate) {
+        if let Err(error) = self.save_state(&candidate) {
             let rollback = rollback(self);
             // StateStore can report an error after rename (for example when
             // syncing the parent directory). Restore the old durable state
@@ -1080,9 +1048,14 @@ impl Backend {
         device: &str,
         previous: Option<&LightingState>,
     ) -> Result<(), String> {
+        // A detached device holds nothing to restore; hotplug relights it.
+        self.hardware.aura.refresh();
+        if !self.hardware.aura.available(device) {
+            return Ok(());
+        }
         let previous = previous
             .ok_or_else(|| format!("no captured known-good lighting state exists for {device}"))?;
-        self.hardware.apply_lighting(device, previous)
+        self.hardware.aura.apply(device, previous)
     }
 
     fn fan_protection_snapshot(&self) -> FanProtectionSnapshot {
@@ -1106,6 +1079,18 @@ impl Backend {
                 .map(|request| request.disable_high_power_fan_protection)
                 .unwrap_or(self.persisted.state.disable_high_power_fan_protection),
         }
+    }
+
+    /// Point the hardware fan policy, including the high-power override that
+    /// release checks trust, back at the committed request. `set_fan_policy`
+    /// records the fields even when the direct owner rejects the policy.
+    fn restore_committed_fan_policy(&mut self) {
+        let committed = self.fan_protection_snapshot();
+        let _ = self.hardware.set_fan_policy(
+            committed.hysteresis,
+            committed.temperature_average_seconds,
+            committed.disable_high_power_fan_protection,
+        );
     }
 
     /// Reinstall protection without ever releasing direct EC control first.
@@ -1138,8 +1123,8 @@ impl Backend {
         previous: &PersistedState,
         snapshot: FanProtectionSnapshot,
     ) -> Result<(), String> {
-        if let Some(request) = previous.desired.as_ref()
-            && let Some(curves) = request.fan_curves
+        let failure = if let Some(request) = previous.desired.as_ref()
+            && request.fan_curves.is_some()
             && !request.disable_high_power_fan_protection
         {
             self.hardware.set_fan_policy(
@@ -1147,46 +1132,17 @@ impl Backend {
                 request.fan_temperature_average_seconds,
                 request.disable_high_power_fan_protection,
             )?;
-            let restored = match request.fan_mode {
-                z13helper_core::profile::FanControlMode::Firmware => self
-                    .hardware
-                    .firmware_fans_set(&curves, request.effective_pl1())
-                    .map_err(|error| error.to_string()),
-                z13helper_core::profile::FanControlMode::Direct => self
-                    .hardware
-                    .direct_fans_set(&curves, request.effective_pl1())
-                    .map_err(|error| error.to_string()),
-            };
-            if restored.is_ok() {
+            let Err(error) = set_fans(&mut self.hardware, request) else {
                 return Ok(());
-            }
-            let restore_error = restored.unwrap_err();
-            return match self.reinstall_safe_firmware_protection(snapshot) {
-                Ok(()) => Err(format!(
-                    "previous fan control restoration failed ({restore_error}); safer firmware protection installed"
-                )),
-                Err(fallback_error) => Err(format!(
-                    "previous fan control restoration failed ({restore_error}); safer protection reinstall failed ({fallback_error})"
-                )),
             };
-        }
-
-        match self.reinstall_safe_firmware_protection(snapshot) {
-            Ok(()) => Err(
-                "no safe known-good fan request was available; safer firmware protection installed"
-                    .into(),
-            ),
-            Err(error) => Err(format!(
-                "no safe known-good fan request was available; safer protection reinstall failed ({error})"
-            )),
-        }
-    }
-
-    fn save(&self) -> Result<(), String> {
-        self.persistence
-            .require_writable()
-            .map_err(|error| error.to_string())?;
-        self.store.save(&self.persisted)
+            format!("previous fan control restoration failed ({error})")
+        } else {
+            "no safe known-good fan request was available".to_owned()
+        };
+        Err(match self.reinstall_safe_firmware_protection(snapshot) {
+            Ok(()) => format!("{failure}; safer firmware protection installed"),
+            Err(error) => format!("{failure}; safer protection reinstall failed ({error})"),
+        })
     }
 
     fn restore_battery_policy(&mut self) {
@@ -1206,11 +1162,7 @@ impl Backend {
         let Some(value) = self.persisted.state.panel_overdrive else {
             return;
         };
-        if let Err(error) = self
-            .hardware
-            .sysfs
-            .set_armoury_bool("panel_overdrive", value != 0)
-        {
+        if let Err(error) = self.hardware.sysfs.set_panel_overdrive(value != 0) {
             tracing::warn!(%error, value, "failed to restore panel overdrive");
             self.note_restore_failure("panel overdrive restore failed", &error);
         }
@@ -1237,7 +1189,6 @@ impl Backend {
         };
         let mut candidate = self.persisted.clone();
         candidate.state.battery_one_time_charge = false;
-        candidate.state.generation = next_generation(candidate.state.generation);
         if let Err(error) = self.apply_and_commit_auxiliary(
             previous,
             candidate,
@@ -1257,10 +1208,24 @@ impl Backend {
     fn restore_lighting(&mut self) {
         let lighting = self.persisted.state.devices.clone().unwrap_or_default();
         for (device, state) in lighting {
-            if let Err(error) = self.hardware.apply_lighting(&device, &state) {
+            if let Err(error) = self.restore_lighting_device(&device, Some(&state)) {
                 tracing::warn!(%error, %device, "failed to restore lighting");
                 self.note_restore_failure(&format!("{device} lighting restore failed"), &error);
             }
+        }
+    }
+
+    /// Reapply the committed request at startup or resume. A failed restore
+    /// releases direct EC control, since rollback replays the same request.
+    fn restore_desired(&mut self, context: &str) {
+        let Some(desired) = self.persisted.desired.clone() else {
+            return;
+        };
+        if let Err(error) = self.apply(desired) {
+            tracing::error!(%error, context, "failed to restore desired hardware state");
+            self.note_restore_failure(&format!("{context} failed"), &error.to_string());
+            let _ = self.hardware.release_direct();
+            self.record_direct_release_failure(context);
         }
     }
 
@@ -1273,7 +1238,7 @@ impl Backend {
     }
 
     fn record_direct_release_failure(&mut self, context: &str) -> bool {
-        let Some(error) = self.hardware.take_direct_release_failure() else {
+        let Some(error) = self.hardware.direct_release_failure.take() else {
             return false;
         };
         self.note_restore_failure(&format!("{context}: direct EC release failed"), &error);
@@ -1298,16 +1263,45 @@ impl Backend {
     }
 }
 
+fn loaded_state(
+    loaded: Result<PersistedState, StateLoadError>,
+) -> (PersistedState, PersistenceMode) {
+    match loaded {
+        Ok(state) => (state, PersistenceMode::ReadWrite),
+        Err(StateLoadError::Unsupported(version)) => {
+            tracing::warn!(
+                version,
+                "unsupported daemon state; starting without overwriting it"
+            );
+            let mut state = PersistedState::default();
+            push_warning(
+                &mut state.state.warnings,
+                format!("unsupported state version {version}; expected 1"),
+            );
+            (state, PersistenceMode::UnsupportedReadOnly { version })
+        }
+        // Only a corrupt file that was preserved may be replaced.
+        Err(StateLoadError::Corrupt(error)) => {
+            tracing::warn!(%error, "starting from fresh daemon state");
+            let mut state = PersistedState::default();
+            push_warning(&mut state.state.warnings, error);
+            (state, PersistenceMode::ReadWrite)
+        }
+        Err(StateLoadError::Io(error)) => {
+            tracing::warn!(%error, "unreadable daemon state; starting without overwriting it");
+            let mut state = PersistedState::default();
+            push_warning(&mut state.state.warnings, error);
+            (state, PersistenceMode::UnreadableReadOnly)
+        }
+    }
+}
+
 fn power_source_changed(before: Option<bool>, after: Option<bool>) -> Option<bool> {
     match (before, after) {
         (Some(before), Some(after)) if before != after => Some(after),
         (None, Some(after)) => Some(after),
         _ => None,
     }
-}
-
-fn next_generation(generation: u64) -> u64 {
-    generation.saturating_add(1)
 }
 
 fn factory_query_restore_plan(
@@ -1335,7 +1329,7 @@ fn effective_battery_limit(one_time_charge: bool, normal_limit: Option<i32>) -> 
 }
 
 fn validate_factory_curve_query_power(tdp: TdpState) -> Result<(), DaemonError> {
-    let pl1 = tdp.pl1_spl.max(0) as u32;
+    let pl1 = tdp.pl1_watts();
     if pl1 >= HIGH_POWER_THRESHOLD_W {
         return Err(DaemonError::Rejected(format!(
             "factory fan curves cannot be read while PL1 is {pl1} W; lower power first"
@@ -1348,8 +1342,8 @@ fn validate_fan_release_power(
     tdp: TdpState,
     disable_high_power_fan_protection: bool,
 ) -> Result<(), DaemonError> {
-    let pl1 = tdp.pl1_spl.max(0) as u32;
-    if pl1 >= HIGH_POWER_THRESHOLD_W && !disable_high_power_fan_protection {
+    let pl1 = tdp.pl1_watts();
+    if fan_protection_required(pl1, disable_high_power_fan_protection) {
         return Err(DaemonError::Rejected(format!(
             "lower PL1 below {HIGH_POWER_THRESHOLD_W} W before releasing fan protection; current PL1 is {pl1} W"
         )));
@@ -1385,11 +1379,7 @@ fn one_time_charge_is_complete(one_time_charge: bool, charge_percent: Option<u8>
 }
 
 fn validate_manual_undervolt(offset: i32, available: bool) -> Result<(), DaemonError> {
-    if !(-40..=0).contains(&offset) {
-        return Err(DaemonError::Rejected(
-            "Curve Optimizer offset must be between -40 and 0".into(),
-        ));
-    }
+    validate_undervolt(offset).map_err(DaemonError::Rejected)?;
     if !available {
         return Err(DaemonError::Rejected(
             "ryzen_smu is unavailable; undervolt cannot be applied".into(),
@@ -1402,8 +1392,8 @@ fn validate_manual_undervolt(offset: i32, available: bool) -> Result<(), DaemonE
 mod tests {
     use super::{
         Backend, FactoryQueryRestore, MAX_WARNINGS, PersistenceMode, PlatformHardware,
-        ShutdownHardware, StateWriter, bounded_warnings, effective_battery_limit,
-        factory_query_restore_plan, firmware_transition, normalize_factory_curve_profiles,
+        ShutdownHardware, StateWriter, effective_battery_limit, factory_query_restore_plan,
+        firmware_transition, loaded_state, normalize_factory_curve_profiles,
         one_time_charge_is_complete, power_source_changed, push_warning, shutdown_hardware_actions,
         stock_tdp, validate_factory_curve_query_power, validate_fan_release_power,
         validate_manual_undervolt,
@@ -1411,16 +1401,19 @@ mod tests {
     use crate::aura::AuraDevices;
     use crate::direct_runtime::DirectRuntime;
     use crate::ec::{EcMailbox, PortIo};
-    use crate::state::PersistedState;
+    use crate::state::{PersistedState, StateLoadError};
     use crate::sysfs::Sysfs;
     use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::fs;
     use std::io;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use z13helper_core::curve::Curve;
     use z13helper_core::error::DaemonError;
-    use z13helper_core::profile::Profile;
-    use z13helper_core::protocol::{ApplyRequest, TdpState};
+    use z13helper_core::profile::{FanControlMode, Profile};
+    use z13helper_core::protocol::{ApplyRequest, LightingState, TdpState};
 
     #[derive(Clone, Default)]
     struct TransitionIo {
@@ -1506,11 +1499,7 @@ mod tests {
     ) -> (PersistedState, PersistedState, i32, Result<(), DaemonError>) {
         let mut previous = PersistedState::default();
         previous.state.generation = 7;
-        let candidate = {
-            let mut candidate = previous.clone();
-            candidate.state.generation = 8;
-            candidate
-        };
+        let candidate = previous.clone();
         let durable = Arc::new(Mutex::new(previous.clone()));
         let fault = Arc::new(Mutex::new(store_fault));
         let store = FakeStateStore {
@@ -1548,14 +1537,205 @@ mod tests {
         (persisted, durable, hardware, result)
     }
 
+    fn memory_store() -> Box<dyn StateWriter> {
+        Box::new(FakeStateStore {
+            durable: Default::default(),
+            fault: Default::default(),
+        })
+    }
+
+    /// 90 W direct-mode request without PPD, so no D-Bus write is attempted.
+    /// The test sysfs root does not exist, so the PPT write always fails.
+    fn high_power_request(disable_high_power_fan_protection: bool) -> ApplyRequest {
+        let pl1 = 90;
+        ApplyRequest {
+            ppd_profile: None,
+            power_limits: Some(TdpState {
+                pl1_spl: pl1,
+                pl2_sppt: pl1,
+                fppt: pl1,
+                apu_sppt: pl1,
+                platform_sppt: pl1,
+            }),
+            fan_mode: FanControlMode::Direct,
+            fan_curves: Some(z13helper_core::stock_fan_curves(None)),
+            undervolt: None,
+            cpu_temp_limit: z13helper_core::profile::default_cpu_temp_limit(),
+            fan_hysteresis: Default::default(),
+            fan_temperature_average_seconds:
+                z13helper_core::profile::default_fan_temperature_average_seconds(),
+            disable_high_power_fan_protection,
+        }
+    }
+
     #[test]
-    fn auxiliary_hardware_failure_restores_candidate_and_durable_state() {
-        let (persisted, durable, hardware, result) =
-            auxiliary_transaction_fixture(None, true, false);
-        assert!(result.is_err());
-        assert_eq!(persisted.state.generation, 7);
-        assert_eq!(durable.state.generation, 7);
-        assert_eq!(hardware, 0);
+    fn executor_rejects_socket_only_commands_without_panicking() {
+        use z13helper_core::error::ErrorCode;
+        use z13helper_core::protocol::{ClientId, Command, RequestId};
+        let mut backend = test_backend(PersistedState::default(), memory_store());
+        let request_id = RequestId::new(1).unwrap();
+        for command in [
+            Command::SetControllerCapture { enabled: true },
+            Command::Subscribe { events: vec![] },
+            Command::GetOutcome {
+                target_client_id: ClientId::new(1).unwrap(),
+                target_request_id: request_id,
+            },
+        ] {
+            let response = crate::protocol::execute(&mut backend, request_id, command);
+            assert_eq!(response.error.unwrap().code, ErrorCode::Protocol);
+        }
+    }
+
+    #[test]
+    fn rejected_override_apply_keeps_committed_fan_protection() {
+        let mut backend = test_backend(PersistedState::default(), memory_store());
+        assert!(backend.apply(high_power_request(true)).is_err());
+        assert!(!backend.hardware.disable_high_power_fan_protection);
+    }
+
+    #[test]
+    fn failed_restore_releases_direct_ec_control() {
+        let persisted = PersistedState {
+            desired: Some(high_power_request(false)),
+            ..Default::default()
+        };
+        let mut backend = test_backend(persisted, memory_store());
+        backend.restore_desired("startup restore");
+        assert!(backend.persisted.state.degraded);
+        assert!(!backend.hardware.direct.snapshot().unwrap().enabled);
+    }
+
+    #[test]
+    fn direct_failure_degrades_only_while_direct_mode_is_desired() {
+        let persisted = PersistedState {
+            desired: Some(high_power_request(false)),
+            ..Default::default()
+        };
+        let mut backend = test_backend(persisted, memory_store());
+        let fail = Arc::new(AtomicBool::new(false));
+        let sensor_fail = Arc::clone(&fail);
+        let controller = crate::service::Controller::new(EcMailbox::new(TransitionIo::default()));
+        (backend.hardware.direct, _) = DirectRuntime::fake(controller, move || {
+            if sensor_fail.load(Ordering::SeqCst) {
+                Err("fake sensor failed".into())
+            } else {
+                Ok(60_000)
+            }
+        });
+        backend
+            .hardware
+            .direct
+            .install_and_prime([transition_curve(), transition_curve()])
+            .unwrap();
+        fail.store(true, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(350));
+
+        assert!(backend.observe(), "a new direct failure changes health");
+        assert!(backend.persisted.state.degraded);
+        assert!(!backend.observe(), "unchanged health is not republished");
+
+        // What a later successful firmware-mode apply leaves behind.
+        backend.persisted.desired.as_mut().unwrap().fan_mode = FanControlMode::Firmware;
+        backend.persisted.state.degraded = false;
+        backend.persisted.state.warnings.clear();
+        backend.observe();
+        assert!(!backend.persisted.state.degraded);
+        assert!(backend.persisted.state.warnings.is_empty());
+    }
+
+    #[test]
+    fn observe_reports_committed_one_time_charge_completion() {
+        let root = std::env::temp_dir().join(format!(
+            "z13helper-one-time-charge-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let battery = root.join("class/power_supply/BAT0");
+        fs::create_dir_all(&battery).unwrap();
+        fs::write(battery.join("capacity"), "100\n").unwrap();
+        fs::write(battery.join("status"), "Full\n").unwrap();
+        fs::write(battery.join("charge_control_end_threshold"), "100\n").unwrap();
+        let mut persisted = PersistedState::default();
+        persisted.state.battery_one_time_charge = true;
+        persisted.state.battery_limit = Some(80);
+        let mut backend = test_backend(persisted, memory_store());
+        backend.hardware.sysfs = Sysfs::new(&root);
+
+        assert!(backend.observe(), "completion changes persisted state");
+        assert!(!backend.persisted.state.battery_one_time_charge);
+        assert_eq!(backend.hardware.sysfs.battery_limit(), Ok(80));
+        assert!(!backend.observe(), "nothing new is not republished");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unreadable_or_unpreserved_state_is_never_overwritten() {
+        let (_, mode) = loaded_state(Err(StateLoadError::Io("read state.json: EIO".into())));
+        assert!(mode.require_writable().is_err());
+        let (state, mode) = loaded_state(Err(StateLoadError::Corrupt("preserved".into())));
+        assert!(mode.require_writable().is_ok());
+        assert_eq!(state.state.warnings, ["preserved"]);
+        let (_, mode) = loaded_state(Err(StateLoadError::Unsupported(99)));
+        assert!(mode.require_writable().is_err());
+    }
+
+    #[test]
+    fn detached_lighting_device_is_not_reported_degraded() {
+        let mut backend = test_backend(PersistedState::default(), memory_store());
+        let state = LightingState::default();
+        assert!(
+            backend
+                .set_lighting("keyboard".into(), state.clone())
+                .is_err()
+        );
+        assert!(!backend.persisted.state.degraded);
+        backend.persisted.state.devices = Some(HashMap::from([("keyboard".into(), state)]));
+        backend.restore_lighting();
+        assert!(!backend.persisted.state.degraded);
+    }
+
+    #[test]
+    fn released_fans_return_the_desired_request_to_firmware_mode() {
+        let root = std::env::temp_dir().join(format!(
+            "z13helper-release-fans-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let ppt = root.join("devices/platform/asus-nb-wmi");
+        let hwmon = root.join("class/hwmon/hwmon0");
+        fs::create_dir_all(&ppt).unwrap();
+        fs::create_dir_all(&hwmon).unwrap();
+        for name in [
+            "ppt_pl1_spl",
+            "ppt_pl2_sppt",
+            "ppt_fppt",
+            "ppt_apu_sppt",
+            "ppt_platform_sppt",
+        ] {
+            fs::write(ppt.join(name), "50\n").unwrap();
+        }
+        fs::write(hwmon.join("name"), "asus_custom_fan_curve\n").unwrap();
+        let mut request = high_power_request(false);
+        request.power_limits = None;
+        let mut persisted = PersistedState {
+            desired: Some(request),
+            ..Default::default()
+        };
+        persisted.state.fan_control_mode = FanControlMode::Direct;
+        let mut backend = test_backend(persisted, memory_store());
+        backend.hardware.sysfs = Sysfs::new(&root);
+
+        backend.release_fans().unwrap();
+
+        assert_eq!(
+            backend.persisted.state.fan_control_mode,
+            FanControlMode::Firmware
+        );
+        let desired = backend.persisted.desired.clone().unwrap();
+        assert_eq!(desired.fan_mode, FanControlMode::Firmware);
+        assert!(desired.validate().is_ok());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1572,11 +1752,7 @@ mod tests {
     fn partial_auxiliary_write_is_compensated_at_each_failure_index() {
         for fail_at in 0..5 {
             let previous = PersistedState::default();
-            let candidate = {
-                let mut candidate = previous.clone();
-                candidate.state.generation = 1;
-                candidate
-            };
+            let candidate = previous.clone();
             let durable = Arc::new(Mutex::new(previous.clone()));
             let store = FakeStateStore {
                 durable: Arc::clone(&durable),
@@ -1663,16 +1839,6 @@ mod tests {
                 if profile == "balanced" && tdp == stock_tdp(Some("balanced")).unwrap()
         ));
         assert!(factory_query_restore_plan(None, None).is_err());
-    }
-
-    #[test]
-    fn unsupported_state_keeps_persistent_controls_read_only() {
-        assert!(PersistenceMode::ReadWrite.require_writable().is_ok());
-        assert!(
-            PersistenceMode::UnsupportedReadOnly { version: 99 }
-                .require_writable()
-                .is_err()
-        );
     }
 
     #[test]
@@ -1804,7 +1970,6 @@ mod tests {
         push_warning(&mut warnings, "warning 99");
         push_warning(&mut warnings, "warning 99");
         assert_eq!(warnings.len(), MAX_WARNINGS);
-        assert_eq!(bounded_warnings(warnings.clone()), warnings);
         push_warning(&mut warnings, "x".repeat(2_048));
         assert_eq!(warnings.last().unwrap().chars().count(), 1_024);
     }

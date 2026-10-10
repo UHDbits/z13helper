@@ -16,6 +16,11 @@ pub const HIGH_POWER_FINAL_TEMP_C: i32 = 90;
 
 pub type Curve = [[i32; 2]; POINT_COUNT]; // [temp, pwm]
 
+/// Whether the hardware copy of the fan curves carries the high-power lock.
+pub fn fan_protection_required(pl1: u32, disable_override: bool) -> bool {
+    pl1 >= HIGH_POWER_THRESHOLD_W && !disable_override
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CurveError {
     #[error("temp {temp} in point {index} out of range 0–120")]
@@ -63,12 +68,12 @@ pub fn enforce_curve(curve: &mut Curve, idx: usize) {
         return;
     }
 
-    let clamp_point = |p: &mut [i32; 2], min_pwm: i32| {
+    let clamp_point = |p: &mut [i32; 2]| {
         p[0] = p[0].clamp(TEMP_MIN, TEMP_MAX);
-        p[1] = p[1].clamp(min_pwm, PWM_MAX);
+        p[1] = p[1].clamp(PWM_MIN, PWM_MAX);
     };
 
-    clamp_point(&mut curve[idx], PWM_MIN);
+    clamp_point(&mut curve[idx]);
 
     // Index-based temp bounds leave room for neighbours.
     let lo = TEMP_MIN + idx as i32;
@@ -83,7 +88,7 @@ pub fn enforce_curve(curve: &mut Curve, idx: usize) {
         if curve[i][1] < curve[i - 1][1] {
             curve[i][1] = curve[i - 1][1];
         }
-        clamp_point(&mut curve[i], PWM_MIN);
+        clamp_point(&mut curve[i]);
     }
 
     // Backward cascade.
@@ -94,12 +99,12 @@ pub fn enforce_curve(curve: &mut Curve, idx: usize) {
         if curve[i][1] > curve[i + 1][1] {
             curve[i][1] = curve[i + 1][1];
         }
-        clamp_point(&mut curve[i], PWM_MIN);
+        clamp_point(&mut curve[i]);
     }
 
     // Final pass: re-clamp everything and fix any residual collisions.
     for p in curve.iter_mut() {
-        clamp_point(p, PWM_MIN);
+        clamp_point(p);
     }
     for i in 1..POINT_COUNT {
         if curve[i][0] <= curve[i - 1][0] {
@@ -122,7 +127,13 @@ pub fn high_power_curve(authored: &Curve) -> Curve {
     curve[7] = [HIGH_POWER_FINAL_TEMP_C, PWM_MAX];
     for index in (0..6).rev() {
         curve[index][0] = curve[index][0].min(curve[index + 1][0]);
-        curve[index][1] = curve[index][1].min(curve[index + 1][1]);
+        // A point pulled onto the 80°C lock takes the locked duty, so no table
+        // entry (or first-match lookup) reports less than 80% at 80°C.
+        curve[index][1] = if curve[index][0] == HIGH_POWER_POINT_TEMP_C {
+            curve[6][1]
+        } else {
+            curve[index][1].min(curve[index + 1][1])
+        };
     }
     curve
 }
@@ -153,27 +164,24 @@ mod tests {
     }
 
     #[test]
-    fn default_curve_valid() {
-        let c = default_fan_curve();
-        validate(&c).unwrap();
-    }
-
-    #[test]
     fn firmware_table_may_repeat_a_temperature_breakpoint() {
         let mut curve = default_fan_curve();
+        validate(&curve).unwrap();
         curve[7] = curve[6];
         validate(&curve).unwrap();
     }
 
     #[test]
-    fn enforce_pushes_neighbours() {
-        let mut c = default_fan_curve();
-        // Drag point 3's temp above point 4's.
-        c[3][0] = 70;
-        enforce_curve(&mut c, 3);
-        for i in 1..POINT_COUNT {
-            assert!(c[i][0] > c[i - 1][0], "temp not increasing at {i}: {:?}", c);
-            assert!(c[i][1] >= c[i - 1][1], "pwm decreasing at {i}: {:?}", c);
+    fn enforce_pushes_neighbours_and_keeps_temps_distinct() {
+        // Drag point 3's temp above point 4's, and point 0 to the far left.
+        for (idx, temp) in [(3, 70), (0, TEMP_MIN)] {
+            let mut c = default_fan_curve();
+            c[idx][0] = temp;
+            enforce_curve(&mut c, idx);
+            for i in 1..POINT_COUNT {
+                assert!(c[i][0] > c[i - 1][0], "temp not increasing at {i}: {:?}", c);
+                assert!(c[i][1] >= c[i - 1][1], "pwm decreasing at {i}: {:?}", c);
+            }
         }
     }
 
@@ -197,15 +205,17 @@ mod tests {
     }
 
     #[test]
-    fn no_edge_collapse() {
-        let mut c = default_fan_curve();
-        // Drag first point to far left.
-        c[0][0] = TEMP_MIN;
-        enforce_curve(&mut c, 0);
-        // All temps must remain distinct.
-        let mut seen = std::collections::HashSet::new();
-        for pt in &c {
-            assert!(seen.insert(pt[0]), "duplicate temp {}", pt[0]);
+    fn high_power_copy_never_lists_the_lock_temperature_below_the_locked_duty() {
+        // Turbo stock curves put point 6 at 80°C with less than 80% duty.
+        for authored in crate::profile::stock_fan_curves(Some("performance")) {
+            let protected = high_power_curve(&authored);
+            validate(&protected).unwrap();
+            for [temp, pwm] in protected {
+                assert!(
+                    temp < HIGH_POWER_POINT_TEMP_C || pwm >= HIGH_POWER_POINT_PWM,
+                    "{protected:?}"
+                );
+            }
         }
     }
 

@@ -126,11 +126,11 @@ pub fn parse_line(line: &str) -> Dispatch {
             target,
         };
     }
-    if let Command::SetControllerCapture { enabled } = &request.command {
+    if matches!(request.command, Command::SetControllerCapture { .. }) {
         return Dispatch::Reply(Box::new(Reply {
             client_id: Some(request.client_id),
             response: WireResponse::success(request.request_id),
-            effects: vec![Effect::ControllerCapture(*enabled)],
+            effects: command_effects(&request.command),
         }));
     }
     let request_id = request.request_id;
@@ -143,19 +143,24 @@ pub fn parse_line(line: &str) -> Dispatch {
 }
 
 fn parse_request(line: &str) -> Result<WireRequest, Box<WireResponse>> {
-    let request: WireRequest = serde_json::from_str(line)
-        .map_err(|error| Box::new(failure(None, ErrorCode::Protocol, error.to_string())))?;
-    if request.version != PROTOCOL_VERSION {
+    let protocol_error =
+        |error: serde_json::Error| Box::new(failure(None, ErrorCode::Protocol, error.to_string()));
+    let value: serde_json::Value = serde_json::from_str(line).map_err(protocol_error)?;
+    // Check the version before the strict v3 envelope so other versions get
+    // the version error rather than a field error for their own layout.
+    if let Some(version) = value.get("version").and_then(serde_json::Value::as_u64)
+        && version != u64::from(PROTOCOL_VERSION)
+    {
+        let request_id = value
+            .get("request_id")
+            .and_then(|id| serde_json::from_value(id.clone()).ok());
         return Err(Box::new(failure(
-            Some(request.request_id),
+            request_id,
             ErrorCode::Protocol,
-            format!(
-                "unsupported protocol version {}; expected {PROTOCOL_VERSION}",
-                request.version
-            ),
+            format!("unsupported protocol version {version}; expected {PROTOCOL_VERSION}"),
         )));
     }
-    Ok(request)
+    serde_json::from_value(value).map_err(protocol_error)
 }
 
 fn validate_subscription_events(events: &[EventTopic]) -> Result<Vec<EventTopic>, String> {
@@ -172,7 +177,11 @@ fn validate_subscription_events(events: &[EventTopic]) -> Result<Vec<EventTopic>
 
 fn command_effects(command: &Command) -> Vec<Effect> {
     match command {
-        Command::GetState | Command::Probe | Command::GetFactoryFanCurves { .. } => vec![],
+        Command::GetState
+        | Command::Probe
+        | Command::GetFactoryFanCurves { .. }
+        | Command::Subscribe { .. }
+        | Command::GetOutcome { .. } => vec![],
         Command::Apply { .. }
         | Command::ApplyUndervoltOnce { .. }
         | Command::SetBatteryLimit { .. }
@@ -181,8 +190,6 @@ fn command_effects(command: &Command) -> Vec<Effect> {
         | Command::SetLighting { .. }
         | Command::ReleaseFans => vec![Effect::StateChanged],
         Command::SetControllerCapture { enabled } => vec![Effect::ControllerCapture(*enabled)],
-        Command::Subscribe { .. } => vec![],
-        Command::GetOutcome { .. } => vec![],
     }
 }
 
@@ -192,53 +199,50 @@ pub fn execute(
     command: Command,
 ) -> WireResponse {
     let mut response = WireResponse::success(request_id);
-    let result: Result<(), DaemonError> = (|| {
-        match command {
-            Command::GetState => response.state = Some(wire_status(&backend.state())),
-            Command::Probe => response.probe = Some(backend.probe()),
-            Command::GetFactoryFanCurves { ppd_profiles } => {
-                response.factory_fan_curves = Some(backend.factory_fan_curves(ppd_profiles)?)
-            }
-            Command::Apply { request } => response.apply = Some(backend.apply(request)?),
-            Command::ApplyUndervoltOnce { offset } => backend.apply_undervolt_once(offset)?,
-            Command::SetBatteryLimit { limit } => backend.set_battery_limit(limit)?,
-            Command::SetBatteryOneTimeCharge { enabled } => {
-                backend.set_battery_one_time_charge(enabled)?
-            }
-            Command::SetPanelOverdrive { enabled } => backend.set_panel_overdrive(enabled)?,
-            Command::SetLighting { device, state } => backend.set_lighting(device, state)?,
-            Command::ReleaseFans => backend.release_fans()?,
-            Command::SetControllerCapture { .. } | Command::GetOutcome { .. } => unreachable!(),
-            Command::Subscribe { .. } => unreachable!(),
-        }
-        Ok(())
-    })();
-    match result {
+    match run_command(backend, command, &mut response) {
         Ok(()) => response,
         Err(error) => from_error(request_id, error),
     }
 }
 
+fn run_command(
+    backend: &mut crate::backend::Backend,
+    command: Command,
+    response: &mut WireResponse,
+) -> Result<(), DaemonError> {
+    match command {
+        Command::GetState => response.state = Some(wire_status(&backend.state())),
+        Command::Probe => response.probe = Some(backend.probe()),
+        Command::GetFactoryFanCurves { ppd_profiles } => {
+            response.factory_fan_curves = Some(backend.factory_fan_curves(ppd_profiles)?)
+        }
+        Command::Apply { request } => response.apply = Some(backend.apply(request)?),
+        Command::ApplyUndervoltOnce { offset } => backend.apply_undervolt_once(offset)?,
+        Command::SetBatteryLimit { limit } => backend.set_battery_limit(limit)?,
+        Command::SetBatteryOneTimeCharge { enabled } => {
+            backend.set_battery_one_time_charge(enabled)?
+        }
+        Command::SetPanelOverdrive { enabled } => backend.set_panel_overdrive(enabled)?,
+        Command::SetLighting { device, state } => backend.set_lighting(device, state)?,
+        Command::ReleaseFans => backend.release_fans()?,
+        // parse_line answers these on the socket thread; never panic the owner.
+        Command::SetControllerCapture { .. }
+        | Command::GetOutcome { .. }
+        | Command::Subscribe { .. } => {
+            return Err(DaemonError::Protocol(
+                "command is not executed by the hardware owner".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// The daemon only constructs Rejected and Protocol errors; the remaining
+// variants are client-side transport states.
 fn from_error(request_id: RequestId, error: DaemonError) -> WireResponse {
     match error {
-        DaemonError::NotRunning => failure(
-            Some(request_id),
-            ErrorCode::NotRunning,
-            "daemon is not running",
-        ),
-        DaemonError::PermissionDenied => failure(
-            Some(request_id),
-            ErrorCode::PermissionDenied,
-            error.to_string(),
-        ),
-        DaemonError::Timeout => failure(Some(request_id), ErrorCode::Timeout, error.to_string()),
-        DaemonError::OutcomeUnknown { request_id, .. } => failure(
-            RequestId::new(request_id),
-            ErrorCode::Timeout,
-            "request outcome is unknown",
-        ),
-        DaemonError::Rejected(message) => failure(Some(request_id), ErrorCode::Rejected, message),
         DaemonError::Protocol(message) => failure(Some(request_id), ErrorCode::Protocol, message),
+        other => failure(Some(request_id), ErrorCode::Rejected, other.to_string()),
     }
 }
 
@@ -377,26 +381,23 @@ mod tests {
     }
 
     #[test]
-    fn request_parser_accepts_whitespace_without_text_classification() {
-        let line = r#"  { "version": 3, "client_id": "00000000000000000000000000000001", "request_id": 1, "cmd": "get-state" }  "#;
-        let request = parse_request(line).unwrap();
-        assert!(matches!(request.command, Command::GetState));
-    }
-
-    #[test]
-    fn nested_strings_do_not_change_typed_effect_classification() {
-        let request = WireRequest {
-            version: PROTOCOL_VERSION,
-            client_id: z13helper_core::protocol::ClientId::new(1).unwrap(),
-            request_id: RequestId::new(6).unwrap(),
-            command: Command::SetLighting {
-                device: "keyboard \"cmd\":\"get-state\"".into(),
-                state: LightingState::default(),
-            },
-        };
-        let line = format!("  {}  ", serde_json::to_string(&request).unwrap());
-        let parsed = parse_request(&line).unwrap();
-        assert_eq!(command_effects(&parsed.command), vec![Effect::StateChanged]);
+    fn version_mismatch_is_reported_before_strict_field_validation() {
+        for line in [
+            r#"{"version":2,"request_id":5,"cmd":"get-state"}"#,
+            r#"{"version":4,"client_id":"00000000000000000000000000000001","request_id":5,"cmd":"future-command","future":1}"#,
+        ] {
+            let Dispatch::Reply(reply) = parse_line(line) else {
+                panic!("version-mismatched frame was dispatched");
+            };
+            assert_eq!(reply.response.request_id, RequestId::new(5));
+            let error = reply.response.error.unwrap();
+            assert_eq!(error.code, ErrorCode::Protocol);
+            assert!(
+                error.message.contains("unsupported protocol version"),
+                "{}",
+                error.message
+            );
+        }
     }
 
     #[test]

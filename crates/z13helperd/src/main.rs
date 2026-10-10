@@ -27,16 +27,16 @@ use z13helperd::input::{
 };
 use z13helperd::protocol::{Dispatch, Effect, Reply, failure, parse_line};
 use z13helperd::resume::{SleepEvent, spawn_resume_watcher};
-use z13helperd::service::Controller;
+use z13helperd::service::{Controller, MODEL};
 use z13helperd::steam::SteamBlocker;
 
 mod logging;
 
-const EXPECTED_MODEL: &str = "GZ302EA";
 const DMI_PRODUCT_NAME: &str = "/sys/class/dmi/id/product_name";
 const SOCKET_PATH: &str = "/run/z13helper/z13helperd.sock";
 const LOCK_PATH: &str = "/run/z13helper/z13helperd.lock";
 const MAX_ACTIVE_CLIENTS: usize = 64;
+const REQUEST_READ_BUDGET: Duration = Duration::from_secs(2);
 const MAX_ACCEPTS_PER_PUMP: usize = 8;
 const BACKEND_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SUBSCRIBERS: usize = 64;
@@ -50,13 +50,7 @@ const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 struct Subscriber {
     events: Vec<EventTopic>,
     stream: UnixStream,
-    count: Arc<AtomicUsize>,
-}
-
-impl Drop for Subscriber {
-    fn drop(&mut self) {
-        self.count.fetch_sub(1, Ordering::AcqRel);
-    }
+    _slot: ClientSlot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,9 +65,22 @@ enum CapturePhase {
     Released,
     Enabling { sequence: u64, deadline: Instant },
     Captured { sequence: u64 },
-    Partial { sequence: u64, requested: bool },
+    Partial { sequence: u64 },
     ReleasePending { sequence: u64 },
     Releasing { sequence: u64, deadline: Instant },
+}
+
+impl CapturePhase {
+    fn sequence(self) -> Option<u64> {
+        match self {
+            Self::Released => None,
+            Self::Enabling { sequence, .. }
+            | Self::Captured { sequence }
+            | Self::Partial { sequence }
+            | Self::ReleasePending { sequence }
+            | Self::Releasing { sequence, .. } => Some(sequence),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,8 +113,27 @@ impl CaptureCoordinator {
         }
         self.desired = desired;
         self.retry_at = desired.then_some(now);
-        if !desired && self.bpf_blocked {
-            self.bpf_blocked = false;
+        if desired {
+            BpfAction::None
+        } else {
+            self.release_bpf()
+        }
+    }
+
+    fn release_bpf(&mut self) -> BpfAction {
+        if std::mem::take(&mut self.bpf_blocked) {
+            BpfAction::Unblock
+        } else {
+            BpfAction::None
+        }
+    }
+
+    /// BPF work due on the periodic Steam retry: refresh the blocked PID set
+    /// while capture holds the block, or retry PIDs a partial unblock left.
+    fn bpf_retry(&self, pids_blocked: bool) -> BpfAction {
+        if self.desired && self.bpf_blocked {
+            BpfAction::Block
+        } else if !self.bpf_blocked && pids_blocked {
             BpfAction::Unblock
         } else {
             BpfAction::None
@@ -145,15 +171,7 @@ impl CaptureCoordinator {
 
     fn request_failed(&mut self, enabled: bool, now: Instant) {
         self.retry_at = Some(now + CAPTURE_RETRY_INTERVAL);
-        if !enabled {
-            let sequence = match self.phase {
-                CapturePhase::Enabling { sequence, .. }
-                | CapturePhase::Captured { sequence }
-                | CapturePhase::Partial { sequence, .. }
-                | CapturePhase::ReleasePending { sequence, .. }
-                | CapturePhase::Releasing { sequence, .. } => sequence,
-                CapturePhase::Released => return,
-            };
+        if !enabled && let Some(sequence) = self.phase.sequence() {
             self.phase = CapturePhase::ReleasePending { sequence };
         }
     }
@@ -164,14 +182,10 @@ impl CaptureCoordinator {
                 tracing::warn!("controller capture acknowledgement timed out; releasing");
                 Some(false)
             }
-            CapturePhase::Releasing { deadline, .. } if deadline <= now => {
+            CapturePhase::Releasing { sequence, deadline } if deadline <= now => {
                 tracing::warn!(
                     "controller release acknowledgement timed out; retaining unblocked state"
                 );
-                let sequence = match self.phase {
-                    CapturePhase::Releasing { sequence, .. } => sequence,
-                    _ => unreachable!(),
-                };
                 self.phase = CapturePhase::ReleasePending { sequence };
                 self.retry_at = Some(now);
                 Some(false)
@@ -181,64 +195,27 @@ impl CaptureCoordinator {
     }
 
     fn status(&mut self, status: CaptureStatus, now: Instant) -> BpfAction {
-        let (sequence, requested) = match status {
-            CaptureStatus::Captured { sequence, .. } => (sequence, true),
-            CaptureStatus::Released { sequence, .. } => (sequence, false),
-            CaptureStatus::PartialGrab {
-                sequence,
-                requested,
-                ..
-            } => (sequence, requested),
-        };
-        let current_sequence = match self.phase {
-            CapturePhase::Enabling { sequence, .. }
-            | CapturePhase::Captured { sequence }
-            | CapturePhase::Partial { sequence, .. }
-            | CapturePhase::ReleasePending { sequence, .. }
-            | CapturePhase::Releasing { sequence, .. } => Some(sequence),
-            CapturePhase::Released => None,
-        };
-        if current_sequence != Some(sequence) {
+        let sequence = status.sequence;
+        if self.phase.sequence() != Some(sequence) {
             return BpfAction::None;
         }
 
-        match status {
-            CaptureStatus::Captured { grabbed, total, .. }
-                if self.desired && total > 0 && grabbed == total =>
-            {
-                self.phase = CapturePhase::Captured { sequence };
-                if !self.bpf_blocked {
-                    self.bpf_blocked = true;
-                    BpfAction::Block
-                } else {
-                    BpfAction::None
-                }
+        if self.desired && status.captured() {
+            self.phase = CapturePhase::Captured { sequence };
+            if !self.bpf_blocked {
+                self.bpf_blocked = true;
+                BpfAction::Block
+            } else {
+                BpfAction::None
             }
-            CaptureStatus::Released { grabbed: 0, .. } => {
-                self.phase = CapturePhase::Released;
-                self.retry_at = self.desired.then_some(now);
-                if self.bpf_blocked {
-                    self.bpf_blocked = false;
-                    BpfAction::Unblock
-                } else {
-                    BpfAction::None
-                }
-            }
-            CaptureStatus::PartialGrab { .. }
-            | CaptureStatus::Captured { .. }
-            | CaptureStatus::Released { .. } => {
-                self.phase = CapturePhase::Partial {
-                    sequence,
-                    requested,
-                };
-                self.retry_at = (!self.desired).then_some(now + CAPTURE_RETRY_INTERVAL);
-                if self.bpf_blocked {
-                    self.bpf_blocked = false;
-                    BpfAction::Unblock
-                } else {
-                    BpfAction::None
-                }
-            }
+        } else if status.released() {
+            self.phase = CapturePhase::Released;
+            self.retry_at = self.desired.then_some(now);
+            self.release_bpf()
+        } else {
+            self.phase = CapturePhase::Partial { sequence };
+            self.retry_at = (!self.desired).then_some(now + CAPTURE_RETRY_INTERVAL);
+            self.release_bpf()
         }
     }
 }
@@ -288,25 +265,19 @@ fn drive_capture(
     }
     apply_bpf_action(desired_action, steam_blocker);
 
-    loop {
-        match handle.poll_status() {
-            Ok(Some(status)) => {
-                apply_bpf_action(capture.status(status, now), steam_blocker);
-                if capture.bpf_blocked {
-                    *next_steam_retry = now + Duration::from_secs(2);
-                }
-            }
-            Ok(None) => break,
-            Err(error) => {
-                tracing::warn!(%error, "could not read controller capture status");
-                break;
-            }
+    while let Ok(status) = handle.status.try_recv() {
+        apply_bpf_action(capture.status(status, now), steam_blocker);
+        if capture.bpf_blocked {
+            *next_steam_retry = now + Duration::from_secs(2);
         }
     }
 
-    if desired && capture.bpf_blocked && now >= *next_steam_retry {
-        steam_blocker.block();
-        *next_steam_retry = now + Duration::from_secs(2);
+    if now >= *next_steam_retry {
+        let action = capture.bpf_retry(steam_blocker.has_blocked_pids());
+        if action != BpfAction::None {
+            apply_bpf_action(action, steam_blocker);
+            *next_steam_retry = now + Duration::from_secs(2);
+        }
     }
 }
 
@@ -341,16 +312,16 @@ impl SingletonLock {
 fn verify_model() -> Result<()> {
     let model = fs::read_to_string(DMI_PRODUCT_NAME)
         .with_context(|| format!("read DMI product name from {DMI_PRODUCT_NAME}"))?;
-    if !model.to_ascii_uppercase().contains(EXPECTED_MODEL) {
+    if !model.to_ascii_uppercase().contains(MODEL) {
         bail!(
-            "unsupported DMI product {:?}; expected a {EXPECTED_MODEL} model",
+            "unsupported DMI product {:?}; expected a {MODEL} model",
             model.trim()
         );
     }
     Ok(())
 }
 
-fn bind_socket(path: &Path, _singleton: &SingletonLock) -> Result<UnixListener> {
+fn bind_socket(path: &Path, _singleton: &SingletonLock) -> Result<(UnixListener, OwnedSocket)> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if !metadata.file_type().is_socket() {
             bail!("refusing to replace non-socket {}", path.display());
@@ -360,68 +331,39 @@ fn bind_socket(path: &Path, _singleton: &SingletonLock) -> Result<UnixListener> 
     let parent = path.parent().context("daemon socket has no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let listener = UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
-    let identity = socket_identity(path)?;
-    if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o660)) {
-        drop(listener);
-        remove_owned_socket(path, identity);
-        return Err(error).with_context(|| format!("chmod {}", path.display()));
-    }
-    if let Err(error) = listener.set_nonblocking(true) {
-        drop(listener);
-        remove_owned_socket(path, identity);
-        return Err(error.into());
-    }
-    Ok(listener)
-}
-
-#[derive(Clone, Copy)]
-struct SocketIdentity {
-    device: u64,
-    inode: u64,
-}
-
-struct OwnedSocket {
-    path: PathBuf,
-    identity: SocketIdentity,
-}
-
-fn socket_identity(path: &Path) -> Result<SocketIdentity> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("stat bound socket {}", path.display()))?;
     if !metadata.file_type().is_socket() {
         bail!("bound path {} is not a socket", path.display());
     }
-    Ok(SocketIdentity {
+    // From here on, any error unlinks the socket we just bound.
+    let owner = OwnedSocket {
+        path: path.to_owned(),
         device: metadata.dev(),
         inode: metadata.ino(),
-    })
-}
-
-fn remove_owned_socket(path: &Path, identity: SocketIdentity) {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return;
     };
-    if metadata.file_type().is_socket()
-        && metadata.dev() == identity.device
-        && metadata.ino() == identity.inode
-    {
-        let _ = fs::remove_file(path);
-    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o660))
+        .with_context(|| format!("chmod {}", path.display()))?;
+    listener.set_nonblocking(true)?;
+    Ok((listener, owner))
 }
 
-impl OwnedSocket {
-    fn from_bound(path: &Path) -> Result<Self> {
-        let identity = socket_identity(path)?;
-        Ok(Self {
-            path: path.to_owned(),
-            identity,
-        })
-    }
+/// Unlinks the socket path on drop, unless it now names a replacement.
+struct OwnedSocket {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
 }
 
 impl Drop for OwnedSocket {
     fn drop(&mut self) {
-        remove_owned_socket(&self.path, self.identity);
+        if let Ok(metadata) = fs::symlink_metadata(&self.path)
+            && metadata.file_type().is_socket()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -438,6 +380,24 @@ fn encode_frame(response: &WireResponse) -> Result<Vec<u8>> {
 fn write_response(stream: &mut UnixStream, response: &WireResponse) -> Result<()> {
     stream.write_all(&encode_frame(response)?)?;
     Ok(())
+}
+
+/// Bounds the whole request frame, not each read(): a client trickling one
+/// byte per second must not hold a client slot for hours.
+struct DeadlineReader<'a> {
+    stream: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        (&*self.stream).read(buf)
+    }
 }
 
 fn read_request_frame(reader: &mut impl BufRead) -> Result<Option<String>> {
@@ -462,18 +422,16 @@ fn handle_client(
     controller_capture_deadline: Arc<Mutex<Option<Instant>>>,
     lifecycle: Arc<Mutex<Lifecycle>>,
 ) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    let mut reader = BufReader::new(&stream);
+    let mut reader = BufReader::new(DeadlineReader {
+        stream: &stream,
+        deadline: Instant::now() + REQUEST_READ_BUDGET,
+    });
     let Some(line) = read_request_frame(&mut reader)? else {
         return Ok(());
     };
     let dispatch = parse_line(line.trim_end());
-    let active = {
-        let lifecycle = lifecycle.lock().unwrap();
-        *lifecycle == Lifecycle::Active
-    };
-    if !active {
+    if !lifecycle_is_active(&lifecycle) {
         let request_id = match &dispatch {
             Dispatch::Reply(reply) => reply.response.request_id,
             Dispatch::Subscribe { request_id, .. }
@@ -508,8 +466,6 @@ fn handle_client(
                 }
                 commit_effects(&effects, &subscribers, &controller_capture_deadline);
                 executor.complete_immediate(key, response.clone());
-            } else {
-                commit_effects(&effects, &subscribers, &controller_capture_deadline);
             }
             write_response(&mut stream, &response)?;
         }
@@ -529,19 +485,15 @@ fn handle_client(
                 )?;
                 return Ok(());
             }
-            if let Err(error) = write_response(&mut stream, &WireResponse::success(request_id)) {
-                subscriber_count.fetch_sub(1, Ordering::AcqRel);
-                return Err(error);
-            }
+            // Released on every early return below, or when the subscriber drops.
+            let slot = ClientSlot(subscriber_count);
+            write_response(&mut stream, &WireResponse::success(request_id))?;
             stream.set_read_timeout(None)?;
-            if let Err(error) = stream.set_nonblocking(true) {
-                subscriber_count.fetch_sub(1, Ordering::AcqRel);
-                return Err(error.into());
-            }
+            stream.set_nonblocking(true)?;
             subscribers.lock().unwrap().push(Subscriber {
                 events,
                 stream,
-                count: subscriber_count,
+                _slot: slot,
             });
         }
         Dispatch::OutcomeQuery {
@@ -742,6 +694,39 @@ fn reconcile_failed_suspend(lifecycle: &Arc<Mutex<Lifecycle>>) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Barrier {
+    Suspend,
+    Resume,
+}
+
+/// Every logind signal (`finished: None`) and every finished barrier
+/// (`finished: Some(resumed)`) routes through here. Only the latest logind
+/// intent counts, so a signal that lands while a barrier is in flight is
+/// honoured when that barrier finishes.
+fn next_barrier(
+    lifecycle: &Mutex<Lifecycle>,
+    awake_wanted: bool,
+    finished: Option<bool>,
+) -> Option<Barrier> {
+    let mut lifecycle = lifecycle.lock().unwrap();
+    match (finished, awake_wanted, *lifecycle) {
+        (None, false, Lifecycle::Active) => {
+            *lifecycle = Lifecycle::Suspended;
+            Some(Barrier::Suspend)
+        }
+        // Refused while a barrier is in flight; its completion retries.
+        (None, true, Lifecycle::Suspended) | (Some(false), true, _) => Some(Barrier::Resume),
+        (Some(true), true, _) => {
+            *lifecycle = Lifecycle::Active;
+            None
+        }
+        // Sleep arrived during restore_volatile: release direct EC again.
+        (Some(true), false, _) => Some(Barrier::Suspend),
+        _ => None,
+    }
+}
+
 fn release_ec_only(_singleton: &SingletonLock) -> Result<()> {
     verify_model()?;
     let io = LinuxPortIo::acquire().context("acquire EC mailbox ports")?;
@@ -759,22 +744,8 @@ fn main() -> Result<()> {
         return release_ec_only(&singleton);
     }
     verify_model()?;
-    let listener = bind_socket(Path::new(SOCKET_PATH), &singleton)?;
-    let socket_owner = match OwnedSocket::from_bound(Path::new(SOCKET_PATH)) {
-        Ok(owner) => owner,
-        Err(error) => {
-            drop(listener);
-            return Err(error);
-        }
-    };
-    let executor = Arc::new(match BackendExecutor::start() {
-        Ok(executor) => executor,
-        Err(error) => {
-            drop(listener);
-            drop(socket_owner);
-            return Err(anyhow::Error::msg(error));
-        }
-    });
+    let (listener, socket_owner) = bind_socket(Path::new(SOCKET_PATH), &singleton)?;
+    let executor = Arc::new(BackendExecutor::start().map_err(anyhow::Error::msg)?);
     let subscribers = Arc::new(Mutex::new(Vec::new()));
     let subscriber_count = Arc::new(AtomicUsize::new(0));
     let active_clients = Arc::new(AtomicUsize::new(0));
@@ -804,7 +775,7 @@ fn main() -> Result<()> {
     let mut next_steam_retry = Instant::now();
     let mut capture = CaptureCoordinator::new();
     let mut steam_blocker = SteamBlocker::default();
-    let mut resume_pending = false;
+    let mut awake_wanted = true;
     tracing::info!(
         socket = SOCKET_PATH,
         protocol = PROTOCOL_VERSION,
@@ -814,26 +785,26 @@ fn main() -> Result<()> {
     while !terminate.load(Ordering::Relaxed) {
         for _ in 0..MAX_ACCEPTS_PER_PUMP {
             match listener.accept() {
-                Ok((stream, _)) => {
+                Ok((mut stream, _)) => {
                     if !reserve_slot(&active_clients, MAX_ACTIVE_CLIENTS) {
                         tracing::warn!("active client limit reached; rejecting connection");
-                        let mut stream = stream;
                         let _ = write_response(
                             &mut stream,
                             &failure(None, ErrorCode::Rejected, "too many active clients"),
                         );
                         continue;
                     }
+                    // Moves into the handler; a failed spawn drops it with the closure.
+                    let slot = ClientSlot(Arc::clone(&active_clients));
                     let executor = Arc::clone(&executor);
                     let subscribers = Arc::clone(&subscribers);
                     let subscriber_count = Arc::clone(&subscriber_count);
-                    let thread_active_clients = Arc::clone(&active_clients);
                     let controller_capture_deadline = Arc::clone(&controller_capture_deadline);
                     let lifecycle = Arc::clone(&lifecycle);
                     let spawn = thread::Builder::new()
                         .name("z13helper-client".into())
                         .spawn(move || {
-                            let _slot = ClientSlot(thread_active_clients);
+                            let _slot = slot;
                             if let Err(error) = handle_client(
                                 stream,
                                 executor,
@@ -846,7 +817,6 @@ fn main() -> Result<()> {
                             }
                         });
                     if let Err(error) = spawn {
-                        active_clients.fetch_sub(1, Ordering::AcqRel);
                         tracing::warn!(%error, "could not start bounded client handler");
                     }
                 }
@@ -877,70 +847,49 @@ fn main() -> Result<()> {
                 None,
             );
         }
-        while let Ok(event) = sleep_rx.try_recv() {
-            match event {
-                SleepEvent::Sleeping => {
-                    let suspend = {
-                        let mut lifecycle = lifecycle.lock().unwrap();
-                        if *lifecycle == Lifecycle::Active {
-                            *lifecycle = Lifecycle::Suspended;
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if suspend {
-                        *controller_capture_deadline.lock().unwrap() = None;
-                        drive_capture(
-                            &mut capture,
-                            &controller_capture,
-                            &mut steam_blocker,
-                            false,
-                            Instant::now(),
-                            &mut next_steam_retry,
-                        );
-                        if let Err(error) = executor.begin_suspend() {
-                            tracing::warn!(?error, "could not enqueue suspend barrier");
-                            // Admission closes before this call so clients
-                            // cannot observe a half-suspended state. If the
-                            // barrier itself cannot be admitted, reconcile
-                            // the external lifecycle state with the active
-                            // backend immediately.
-                            reconcile_failed_suspend(&lifecycle);
-                        }
-                    }
-                }
-                SleepEvent::Resumed => {
-                    let lifecycle_state = lifecycle.lock().unwrap();
-                    if *lifecycle_state != Lifecycle::Suspended {
-                        continue;
-                    }
-                    drop(lifecycle_state);
-                    match executor.begin_resume() {
-                        Ok(()) => {}
-                        Err(error) => {
-                            resume_pending = true;
-                            tracing::debug!(?error, "resume waits for suspend barrier");
-                        }
-                    }
+        let start_barrier = |barrier| match barrier {
+            Barrier::Suspend => {
+                if let Err(error) = executor.begin_suspend() {
+                    tracing::warn!(?error, "could not enqueue suspend barrier");
+                    // Admission closes before this call so clients cannot
+                    // observe a half-suspended state. If the barrier itself
+                    // cannot be admitted, reconcile the external lifecycle
+                    // state with the active backend immediately.
+                    reconcile_failed_suspend(&lifecycle);
                 }
             }
+            Barrier::Resume => {
+                if let Err(error) = executor.begin_resume() {
+                    tracing::debug!(?error, "resume waits for in-flight barrier");
+                }
+            }
+        };
+        while let Ok(event) = sleep_rx.try_recv() {
+            awake_wanted = event == SleepEvent::Resumed;
+            let Some(barrier) = next_barrier(&lifecycle, awake_wanted, None) else {
+                continue;
+            };
+            if barrier == Barrier::Suspend {
+                *controller_capture_deadline.lock().unwrap() = None;
+                drive_capture(
+                    &mut capture,
+                    &controller_capture,
+                    &mut steam_blocker,
+                    false,
+                    Instant::now(),
+                    &mut next_steam_retry,
+                );
+            }
+            start_barrier(barrier);
         }
         for event in executor.drain_events() {
-            match event {
+            let resumed = match event {
                 ExecutorEvent::StateChanged => {
                     broadcast(&subscribers, DaemonEventKind::StateChanged, None, None);
+                    continue;
                 }
-                ExecutorEvent::Suspended => {
-                    if resume_pending {
-                        resume_pending = false;
-                        if let Err(error) = executor.begin_resume() {
-                            tracing::warn!(?error, "could not enqueue deferred resume barrier");
-                        }
-                    }
-                }
+                ExecutorEvent::Suspended => false,
                 ExecutorEvent::Resumed(on_battery) => {
-                    *lifecycle.lock().unwrap() = Lifecycle::Active;
                     if let Some(on_battery) = on_battery {
                         broadcast(
                             &subscribers,
@@ -949,7 +898,11 @@ fn main() -> Result<()> {
                             Some(on_battery),
                         );
                     }
+                    true
                 }
+            };
+            if let Some(barrier) = next_barrier(&lifecycle, awake_wanted, Some(resumed)) {
+                start_barrier(barrier);
             }
         }
         let capture_requested = lifecycle_is_active(&lifecycle)
@@ -991,10 +944,10 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BpfAction, CaptureCoordinator, CapturePhase, CaptureStatus, Lifecycle, MAX_ACTIVE_CLIENTS,
-        MAX_FRAME_BYTES, MAX_SUBSCRIBERS, OwnedSocket, SingletonLock, bind_socket, encode_frame,
-        lifecycle_is_active, read_request_frame, reconcile_failed_suspend, reserve_slot,
-        subscriber_alive,
+        Barrier, BpfAction, CaptureCoordinator, CapturePhase, CaptureStatus, DeadlineReader,
+        Lifecycle, MAX_ACTIVE_CLIENTS, MAX_FRAME_BYTES, MAX_SUBSCRIBERS, SingletonLock,
+        bind_socket, encode_frame, lifecycle_is_active, next_barrier, read_request_frame,
+        reconcile_failed_suspend, reserve_slot, subscriber_alive,
     };
     use std::fs;
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -1079,6 +1032,32 @@ mod tests {
     }
 
     #[test]
+    fn request_frame_read_has_one_absolute_deadline() {
+        use std::io::Write;
+        let (mut client, server) = UnixStream::pair().unwrap();
+        // A trickling client keeps every individual read() well inside the
+        // budget; only an absolute deadline ends the frame read early.
+        let writer = std::thread::spawn(move || {
+            for _ in 0..20 {
+                if client.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let started = Instant::now();
+        let mut reader = std::io::BufReader::new(DeadlineReader {
+            stream: &server,
+            deadline: started + Duration::from_millis(200),
+        });
+        assert!(read_request_frame(&mut reader).is_err());
+        assert!(started.elapsed() < Duration::from_millis(800));
+        drop(reader);
+        drop(server);
+        writer.join().unwrap();
+    }
+
+    #[test]
     fn lifecycle_only_allows_hardware_requests_when_active() {
         let lifecycle = Arc::new(Mutex::new(Lifecycle::Suspended));
         assert!(!lifecycle_is_active(&lifecycle));
@@ -1096,6 +1075,29 @@ mod tests {
     }
 
     #[test]
+    fn sleep_during_in_flight_resume_suspends_again() {
+        let lifecycle = Mutex::new(Lifecycle::Active);
+        assert_eq!(
+            next_barrier(&lifecycle, false, None),
+            Some(Barrier::Suspend)
+        );
+        assert_eq!(next_barrier(&lifecycle, false, Some(false)), None);
+        assert_eq!(next_barrier(&lifecycle, true, None), Some(Barrier::Resume));
+        // logind sleeps again before restore_volatile finishes.
+        assert_eq!(next_barrier(&lifecycle, false, None), None);
+        assert_eq!(
+            next_barrier(&lifecycle, false, Some(true)),
+            Some(Barrier::Suspend)
+        );
+        assert_eq!(*lifecycle.lock().unwrap(), Lifecycle::Suspended);
+        assert_eq!(next_barrier(&lifecycle, false, Some(false)), None);
+        // Awake again: a resume deferred behind the suspend barrier reopens.
+        assert_eq!(next_barrier(&lifecycle, true, None), Some(Barrier::Resume));
+        assert_eq!(next_barrier(&lifecycle, true, Some(true)), None);
+        assert_eq!(*lifecycle.lock().unwrap(), Lifecycle::Active);
+    }
+
+    #[test]
     fn zero_device_capture_is_partial_and_never_authorizes_bpf() {
         let now = Instant::now();
         let mut capture = CaptureCoordinator::new();
@@ -1103,7 +1105,7 @@ mod tests {
         capture.request_sent(true, 1, now);
         assert_eq!(
             capture.status(
-                CaptureStatus::PartialGrab {
+                CaptureStatus {
                     sequence: 1,
                     requested: true,
                     grabbed: 0,
@@ -1113,13 +1115,7 @@ mod tests {
             ),
             BpfAction::None
         );
-        assert_eq!(
-            capture.phase,
-            CapturePhase::Partial {
-                sequence: 1,
-                requested: true
-            }
-        );
+        assert_eq!(capture.phase, CapturePhase::Partial { sequence: 1 });
         assert!(!capture.bpf_blocked);
     }
 
@@ -1131,8 +1127,9 @@ mod tests {
         capture.request_sent(true, 1, now);
         assert_eq!(
             capture.status(
-                CaptureStatus::Captured {
+                CaptureStatus {
                     sequence: 1,
+                    requested: true,
                     grabbed: 1,
                     total: 1,
                 },
@@ -1156,14 +1153,27 @@ mod tests {
 
         assert_eq!(
             capture.status(
-                CaptureStatus::Released {
+                CaptureStatus {
                     sequence: 2,
+                    requested: false,
                     grabbed: 1,
                     total: 1,
                 },
                 timed_out + Duration::from_millis(1),
             ),
             BpfAction::None
+        );
+        // A partial release status schedules the next ungrab attempt: not due
+        // yet, due exactly one retry interval later.
+        assert_eq!(
+            capture.request_needed(timed_out + Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(
+            capture.request_needed(
+                timed_out + Duration::from_millis(1) + super::CAPTURE_RETRY_INTERVAL
+            ),
+            Some(false)
         );
         assert_eq!(
             capture.request_needed(timed_out + Duration::from_secs(1),),
@@ -1172,8 +1182,9 @@ mod tests {
 
         assert_eq!(
             capture.status(
-                CaptureStatus::Released {
+                CaptureStatus {
                     sequence: 2,
+                    requested: false,
                     grabbed: 0,
                     total: 1,
                 },
@@ -1186,30 +1197,22 @@ mod tests {
     }
 
     #[test]
-    fn partial_release_status_schedules_another_ungrab_attempt() {
+    fn periodic_bpf_retry_refreshes_block_or_clears_leftover_pids() {
         let now = Instant::now();
         let mut capture = CaptureCoordinator::new();
+        assert_eq!(capture.bpf_retry(false), BpfAction::None);
+        // A partial unblock left PIDs in the map after release.
+        assert_eq!(capture.bpf_retry(true), BpfAction::Unblock);
         capture.set_desired(true, now);
         capture.request_sent(true, 1, now);
-        capture.set_desired(false, now);
-        capture.request_sent(false, 2, now);
-        assert_eq!(
-            capture.status(
-                CaptureStatus::PartialGrab {
-                    sequence: 2,
-                    requested: false,
-                    grabbed: 1,
-                    total: 1,
-                },
-                now,
-            ),
-            BpfAction::None
-        );
-        assert_eq!(capture.request_needed(now), None);
-        assert_eq!(
-            capture.request_needed(now + super::CAPTURE_RETRY_INTERVAL),
-            Some(false)
-        );
+        let status = CaptureStatus {
+            sequence: 1,
+            requested: true,
+            grabbed: 1,
+            total: 1,
+        };
+        assert_eq!(capture.status(status, now), BpfAction::Block);
+        assert_eq!(capture.bpf_retry(true), BpfAction::Block);
     }
 
     #[test]
@@ -1227,12 +1230,12 @@ mod tests {
         let lock_path = directory.path("z13helperd.lock");
         let socket_path = directory.path("z13helperd.sock");
         let owner = SingletonLock::acquire(&lock_path).unwrap();
-        let listener = bind_socket(&socket_path, &owner).unwrap();
+        let bound = bind_socket(&socket_path, &owner).unwrap();
 
         assert!(SingletonLock::acquire(&lock_path).is_err());
         assert!(socket_path.exists());
 
-        drop(listener);
+        drop(bound);
         drop(owner);
     }
 
@@ -1246,10 +1249,11 @@ mod tests {
         assert!(socket_path.exists());
 
         let owner = SingletonLock::acquire(&lock_path).unwrap();
-        let listener = bind_socket(&socket_path, &owner).unwrap();
+        let (listener, socket_owner) = bind_socket(&socket_path, &owner).unwrap();
         assert!(listener.local_addr().is_ok());
 
         drop(listener);
+        drop(socket_owner);
         drop(owner);
     }
 
@@ -1259,14 +1263,12 @@ mod tests {
         let socket_path = directory.path("z13helperd.sock");
         let owner = SingletonLock::acquire(&directory.path("z13helperd.lock")).unwrap();
 
-        let listener = bind_socket(&socket_path, &owner).unwrap();
-        let socket_owner = OwnedSocket::from_bound(&socket_path).unwrap();
+        let (listener, socket_owner) = bind_socket(&socket_path, &owner).unwrap();
         drop(listener);
         drop(socket_owner);
         assert!(!socket_path.exists());
 
-        let listener = bind_socket(&socket_path, &owner).unwrap();
-        let socket_owner = OwnedSocket::from_bound(&socket_path).unwrap();
+        let (listener, socket_owner) = bind_socket(&socket_path, &owner).unwrap();
         let replacement_path = directory.path("replacement.sock");
         let replacement = UnixListener::bind(&replacement_path).unwrap();
         fs::rename(&replacement_path, &socket_path).unwrap();

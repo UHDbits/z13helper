@@ -9,10 +9,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, TryLockError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result};
@@ -33,6 +34,10 @@ const MAX_WINDOWS: usize = 32;
 const X11_SOCKET_DIRECTORY: &str = "/tmp/.X11-unix";
 const XWAYLAND_SERVER_ID_ATOM: &[u8] = b"GAMESCOPE_XWAYLAND_SERVER_ID";
 
+/// Set once `select_gdk_backend` validated gamescope's displays; overlay mode
+/// follows that single decision instead of re-reading the environment.
+static GAMESCOPE_SELECTED: AtomicBool = AtomicBool::new(false);
+
 #[derive(Debug, Eq, PartialEq)]
 struct GamescopeDisplays {
     wayland: OsString,
@@ -51,6 +56,7 @@ pub fn select_gdk_backend() {
         session_is_gamescope(),
         discover_gamescope_wayland,
         discover_primary_gamescope_x11,
+        is_primary_gamescope_x11,
     );
     if let Some(displays) = displays {
         // SAFETY: this runs before GTK or any worker threads are initialized.
@@ -59,20 +65,23 @@ pub fn select_gdk_backend() {
             std::env::set_var("DISPLAY", displays.x11);
             std::env::set_var("GDK_BACKEND", "x11");
         }
+        GAMESCOPE_SELECTED.store(true, Ordering::Relaxed);
     }
 }
 
-fn resolve_gamescope_displays<F, G>(
+fn resolve_gamescope_displays<F, G, H>(
     runtime: Option<&Path>,
     advertised_wayland: Option<&OsStr>,
     advertised_x11: Option<&OsStr>,
     session_is_gamescope: bool,
     discover_wayland: F,
     discover_x11: G,
+    is_primary_x11: H,
 ) -> Option<GamescopeDisplays>
 where
     F: FnOnce(&Path) -> Option<OsString>,
     G: FnOnce() -> Option<OsString>,
+    H: FnOnce(&OsStr) -> bool,
 {
     let runtime = runtime?;
     let advertised_wayland = advertised_wayland
@@ -84,7 +93,9 @@ where
         None => return None,
     };
     let x11 = if wayland_was_advertised {
+        // The advertised DISPLAY may also be stale desktop state.
         advertised_x11
+            .filter(|display| is_primary_x11(display))
             .map(OsStr::to_os_string)
             .or_else(discover_x11)?
     } else {
@@ -196,19 +207,12 @@ where
     values.next().is_none().then_some(value)
 }
 
+/// A non-symlink socket that accepts connections; a crashed server leaves a
+/// socket file behind that refuses them.
 fn is_socket(path: &Path) -> bool {
     path.symlink_metadata()
         .is_ok_and(|metadata| metadata.file_type().is_socket())
-}
-
-fn validated_socket_from_env() -> Option<PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
-    let display = std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY")?;
-    let path = socket_path(Path::new(&runtime), &display)?;
-    path.symlink_metadata()
-        .ok()
-        .filter(|metadata| metadata.file_type().is_socket())
-        .map(|_| path)
+        && UnixStream::connect(path).is_ok()
 }
 
 fn socket_path(runtime: &Path, display: &OsStr) -> Option<PathBuf> {
@@ -228,30 +232,38 @@ struct Atoms {
     opacity: Atom,
 }
 
+/// GTK keeps Gamescope windows mapped; hidden state is represented by opacity
+/// and input properties instead of unmapping the surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WindowState {
     xid: Window,
     /// Interactive windows use this for active/current. HUD windows use it
     /// for visible external-overlay presentation and never receive focus.
     active: bool,
-    /// GTK keeps Gamescope windows mapped; hidden state is represented by
-    /// opacity and input properties instead of unmapping the surface.
-    mapped: bool,
     external_overlay: bool,
 }
 
 #[derive(Default)]
+struct MailboxState {
+    latest: Option<Vec<WindowState>>,
+    last_submitted: HashMap<Window, WindowState>,
+    forced_hidden: HashSet<Window>,
+    closed: bool,
+}
+
+#[derive(Default)]
 struct StateMailbox {
-    latest: Mutex<Option<Vec<WindowState>>>,
-    last_submitted: Mutex<HashMap<Window, WindowState>>,
-    forced_hidden: Mutex<HashSet<Window>>,
-    wake: Mutex<Option<mpsc::SyncSender<()>>>,
-    closed: AtomicBool,
+    state: Mutex<MailboxState>,
+    changed: Condvar,
 }
 
 impl StateMailbox {
     fn submit(&self, states: &[WindowState]) -> bool {
-        if self.closed.load(Ordering::Acquire) {
+        let Ok(mut guard) = self.state.lock() else {
+            return false;
+        };
+        let mailbox = &mut *guard;
+        if mailbox.closed {
             return false;
         }
         let states = states.iter().copied().take(MAX_WINDOWS).collect::<Vec<_>>();
@@ -260,57 +272,41 @@ impl StateMailbox {
             .copied()
             .map(|state| (state.xid, state))
             .collect::<HashMap<_, _>>();
-        let Ok(mut latest) = self.latest.lock() else {
-            return false;
-        };
-        let Ok(mut last_submitted) = self.last_submitted.lock() else {
-            return false;
-        };
-        let Ok(mut forced_hidden) = self.forced_hidden.lock() else {
-            return false;
-        };
-        for (xid, old) in last_submitted.iter() {
-            let remains_visible = next.get(xid).is_some_and(|new| new.active && new.mapped);
-            if old.active && old.mapped && !remains_visible {
+        for (xid, old) in &mailbox.last_submitted {
+            if old.active && !next.get(xid).is_some_and(|new| new.active) {
                 // Preserve the safety edge even when a newer snapshot replaces
                 // the hidden snapshot before the owner wakes up.
-                forced_hidden.insert(*xid);
+                mailbox.forced_hidden.insert(*xid);
             }
         }
-        *last_submitted = next;
-        *latest = Some(states);
-        drop(latest);
-        let Ok(wake) = self.wake.lock() else {
-            return false;
-        };
-        let Some(wake) = wake.as_ref() else {
-            return false;
-        };
-        match wake.try_send(()) {
-            Ok(()) | Err(mpsc::TrySendError::Full(())) => true,
-            Err(mpsc::TrySendError::Disconnected(())) => false,
-        }
+        mailbox.last_submitted = next;
+        mailbox.latest = Some(states);
+        self.changed.notify_one();
+        true
     }
 
-    fn take(&self) -> Option<PendingSnapshot> {
-        let states = self.latest.lock().ok()?.take();
-        let forced_hidden: HashSet<Window> = self.forced_hidden.lock().ok()?.drain().collect();
-        if states.is_none() && forced_hidden.is_empty() {
+    /// Blocks until a snapshot or hidden edge is pending; `None` once closed.
+    fn wait(&self) -> Option<PendingSnapshot> {
+        let mut mailbox = self
+            .changed
+            .wait_while(self.state.lock().ok()?, |mailbox| {
+                mailbox.latest.is_none() && mailbox.forced_hidden.is_empty() && !mailbox.closed
+            })
+            .ok()?;
+        if mailbox.closed {
             return None;
         }
         Some(PendingSnapshot {
-            states: states.unwrap_or_default(),
-            forced_hidden,
+            states: mailbox.latest.take().unwrap_or_default(),
+            forced_hidden: std::mem::take(&mut mailbox.forced_hidden),
         })
     }
 
     fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        if let Ok(wake) = self.wake.lock()
-            && let Some(wake) = wake.as_ref()
-        {
-            let _ = wake.try_send(());
+        if let Ok(mut mailbox) = self.state.lock() {
+            mailbox.closed = true;
         }
+        self.changed.notify_one();
     }
 }
 
@@ -326,9 +322,7 @@ struct X11Owner {
 
 impl X11Owner {
     fn start() -> Result<(Self, (i32, i32))> {
-        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
         let mailbox = Arc::new(StateMailbox::default());
-        *mailbox.wake.lock().expect("new gamescope mailbox") = Some(wake_tx);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread_mailbox = Arc::clone(&mailbox);
         let thread = thread::Builder::new()
@@ -336,7 +330,7 @@ impl X11Owner {
             .spawn(move || match X11Backend::connect() {
                 Ok((backend, dimensions)) => {
                     let _ = ready_tx.send(Ok(dimensions));
-                    owner_loop(backend, thread_mailbox, wake_rx);
+                    owner_loop(backend, &thread_mailbox);
                 }
                 Err(error) => {
                     let _ = ready_tx.send(Err(error.to_string()));
@@ -369,7 +363,7 @@ impl X11Owner {
 
     fn submit(&self, states: &[WindowState]) {
         if !self.mailbox.submit(states) {
-            tracing::debug!("gamescope state update was coalesced or owner is stopping");
+            tracing::debug!("gamescope state update dropped: owner is stopping");
         }
     }
 }
@@ -446,39 +440,15 @@ impl X11Io for X11Backend {
     }
 }
 
-fn owner_loop<S: X11Io>(mut service: S, mailbox: Arc<StateMailbox>, wake_rx: mpsc::Receiver<()>) {
+fn owner_loop<S: X11Io>(mut service: S, mailbox: &StateMailbox) {
     let mut applied = HashMap::<Window, WindowState>::new();
-    while wake_rx.recv().is_ok() {
-        if mailbox.closed.load(Ordering::Acquire) {
-            return;
-        }
-        while let Some(snapshot) = mailbox.take() {
-            apply_snapshot(
-                &mut service,
-                &mut applied,
-                &snapshot.states,
-                &snapshot.forced_hidden,
-            );
-            if mailbox.closed.load(Ordering::Acquire) || !has_pending_state(&mailbox) {
-                break;
-            }
-        }
-    }
-}
-
-fn has_pending_state(mailbox: &StateMailbox) -> bool {
-    let latest_pending = match mailbox.latest.try_lock() {
-        Ok(latest) => latest.is_some(),
-        Err(TryLockError::WouldBlock) => true,
-        Err(TryLockError::Poisoned(_)) => false,
-    };
-    if latest_pending {
-        return true;
-    }
-    match mailbox.forced_hidden.try_lock() {
-        Ok(forced_hidden) => !forced_hidden.is_empty(),
-        Err(TryLockError::WouldBlock) => true,
-        Err(TryLockError::Poisoned(_)) => false,
+    while let Some(snapshot) = mailbox.wait() {
+        apply_snapshot(
+            &mut service,
+            &mut applied,
+            &snapshot.states,
+            &snapshot.forced_hidden,
+        );
     }
 }
 
@@ -491,7 +461,6 @@ fn apply_snapshot<S: X11Io>(
     let next = states
         .iter()
         .copied()
-        .take(MAX_WINDOWS)
         .map(|state| (state.xid, state))
         .collect::<HashMap<_, _>>();
 
@@ -508,12 +477,10 @@ fn apply_snapshot<S: X11Io>(
             .unwrap_or(WindowState {
                 xid,
                 active: false,
-                mapped: true,
                 external_overlay: false,
             });
         let hidden = WindowState {
             active: false,
-            mapped: true,
             ..prior
         };
         apply_one(service, hidden);
@@ -556,8 +523,7 @@ fn apply_one<S: X11Io>(service: &mut S, state: WindowState) {
     if let Err(error) = service.set_overlay(state.xid, state.external_overlay) {
         tracing::debug!(%error, xid = state.xid, "could not set gamescope overlay property");
     }
-    let visible = state.active && state.mapped;
-    if !visible {
+    if !state.active {
         // Critical ordering: invisible windows lose Gamescope input before
         // their opacity is cleared.
         if let Err(error) = service.set_input_focus(state.xid, false) {
@@ -567,11 +533,17 @@ fn apply_one<S: X11Io>(service: &mut S, state: WindowState) {
             tracing::debug!(%error, xid = state.xid, "could not hide gamescope window");
         }
     } else if state.external_overlay {
-        let _ = service.set_input_focus(state.xid, false);
-        let _ = service.set_opacity(state.xid, FULL_OPACITY);
-    } else {
-        let _ = service.set_opacity(state.xid, FULL_OPACITY);
-        let _ = service.set_input_focus(state.xid, true);
+        if let Err(error) = service.set_input_focus(state.xid, false) {
+            tracing::debug!(%error, xid = state.xid, "could not clear gamescope input focus");
+        }
+        if let Err(error) = service.set_opacity(state.xid, FULL_OPACITY) {
+            tracing::debug!(%error, xid = state.xid, "could not show gamescope overlay");
+        }
+    } else if let Err(error) = service.set_opacity(state.xid, FULL_OPACITY) {
+        // Never give input to a window that may still be invisible.
+        tracing::debug!(%error, xid = state.xid, "could not show gamescope window");
+    } else if let Err(error) = service.set_input_focus(state.xid, true) {
+        tracing::debug!(%error, xid = state.xid, "could not set gamescope input focus");
     }
 }
 
@@ -595,24 +567,27 @@ struct RegisteredWindow {
 
 impl Gamescope {
     pub fn connect() -> Option<Rc<Self>> {
-        validated_socket_from_env()?;
+        if !GAMESCOPE_SELECTED.load(Ordering::Relaxed) {
+            return None;
+        }
         match X11Owner::start() {
             Ok((owner, (output_width, output_height))) => {
                 let scale_override = std::env::var(SCALE_ENV).unwrap_or_default();
-                let scale = ui_scale(output_width, &scale_override);
-                if !scale_override.is_empty() && parse_scale(&scale_override).is_none() {
-                    tracing::warn!(
+                let requested = parse_scale(&scale_override);
+                let scale = ui_scale(output_width, requested);
+                match requested {
+                    None if !scale_override.is_empty() => tracing::warn!(
                         value = scale_override,
                         "ignoring invalid gamescope UI scale override"
-                    );
-                } else if parse_scale(&scale_override).is_some_and(|requested| requested != scale) {
-                    tracing::warn!(
+                    ),
+                    Some(requested) if requested != scale => tracing::warn!(
                         requested = scale_override,
                         applied = scale,
                         min = MIN_SCALE,
                         max = MAX_SCALE,
                         "clamped gamescope UI scale override"
-                    );
+                    ),
+                    _ => {}
                 }
                 tracing::info!(
                     scale,
@@ -698,7 +673,7 @@ impl Gamescope {
         window.set_resizable(true);
         window.fullscreen();
         self.visible.set(visible);
-        self.register(&window, false);
+        self.register(&window);
         *self.current.borrow_mut() = Some(window.downgrade());
         window.present();
         self.sync_windows();
@@ -707,7 +682,7 @@ impl Gamescope {
     pub fn present_auxiliary(self: &Rc<Self>, window: &impl IsA<gtk::Window>) {
         let window = window.as_ref().clone();
         window.add_css_class("gamescope-ui");
-        self.register(&window, false);
+        self.register(&window);
         *self.current.borrow_mut() = Some(window.downgrade());
         let manager = self.clone();
         let closing = window.clone();
@@ -720,7 +695,7 @@ impl Gamescope {
     }
 
     pub fn show_auxiliary(self: &Rc<Self>, window: &gtk::Window) {
-        self.register(window, false);
+        self.register(window);
         *self.current.borrow_mut() = Some(window.downgrade());
         window.present();
         self.sync_windows();
@@ -738,19 +713,7 @@ impl Gamescope {
         {
             entry.hidden = true;
         }
-        if self
-            .current_window()
-            .is_some_and(|current| current == *window)
-        {
-            *self.current.borrow_mut() = self
-                .windows
-                .borrow()
-                .iter()
-                .rev()
-                .find_map(|entry| (!entry.hidden).then(|| entry.window.upgrade()).flatten())
-                .map(|candidate| candidate.downgrade());
-        }
-        self.sync_windows();
+        self.retire_current(window);
     }
 
     pub fn prepare_hud(self: &Rc<Self>, window: &impl IsA<gtk::Window>) {
@@ -785,7 +748,7 @@ impl Gamescope {
         self.sync_windows();
     }
 
-    fn register(self: &Rc<Self>, window: &gtk::Window, hidden: bool) {
+    fn register(self: &Rc<Self>, window: &gtk::Window) {
         self.windows
             .borrow_mut()
             .retain(|entry| entry.window.upgrade().is_some());
@@ -795,12 +758,12 @@ impl Gamescope {
                 .upgrade()
                 .is_some_and(|registered| registered == *window)
         }) {
-            entry.hidden = hidden;
+            entry.hidden = false;
             return;
         }
         self.windows.borrow_mut().push(RegisteredWindow {
             window: window.downgrade(),
-            hidden,
+            hidden: false,
         });
         let manager = self.clone();
         window.connect_realize(move |_| manager.sync_windows());
@@ -827,16 +790,19 @@ impl Gamescope {
                 .upgrade()
                 .is_some_and(|window| window != *closing)
         });
-        if self
-            .current_window()
-            .is_some_and(|window| window == *closing)
-        {
+        self.retire_current(closing);
+    }
+
+    /// If `window` was current, the newest non-hidden window takes over.
+    fn retire_current(&self, window: &gtk::Window) {
+        if self.current_window().as_ref() == Some(window) {
             *self.current.borrow_mut() = self
                 .windows
                 .borrow()
                 .iter()
                 .rev()
-                .find_map(|entry| (!entry.hidden).then(|| entry.window.upgrade()).flatten())
+                .filter(|entry| !entry.hidden)
+                .find_map(|entry| entry.window.upgrade())
                 .map(|candidate| candidate.downgrade());
         }
         self.sync_windows();
@@ -868,7 +834,6 @@ impl Gamescope {
             states.push(WindowState {
                 xid,
                 active,
-                mapped: true,
                 external_overlay: false,
             });
         }
@@ -885,7 +850,6 @@ impl Gamescope {
             states.push(WindowState {
                 xid,
                 active: true,
-                mapped: true,
                 external_overlay: true,
             });
         }
@@ -910,8 +874,8 @@ fn intern(conn: &RustConnection, name: &[u8]) -> Result<Atom> {
         .atom)
 }
 
-fn ui_scale(output_width: i32, scale_override: &str) -> f64 {
-    parse_scale(scale_override)
+fn ui_scale(output_width: i32, requested: Option<f64>) -> f64 {
+    requested
         .unwrap_or_else(|| {
             if output_width <= 0 {
                 MIN_SCALE
@@ -923,9 +887,6 @@ fn ui_scale(output_width: i32, scale_override: &str) -> f64 {
 }
 
 fn parse_scale(value: &str) -> Option<f64> {
-    if value.is_empty() {
-        return None;
-    }
     value
         .parse::<f64>()
         .ok()
@@ -984,11 +945,9 @@ mod tests {
     }
 
     fn fake_owner(service: FakeX11) -> (Arc<StateMailbox>, JoinHandle<()>) {
-        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
         let mailbox = Arc::new(StateMailbox::default());
-        *mailbox.wake.lock().unwrap() = Some(wake_tx);
         let thread_mailbox = Arc::clone(&mailbox);
-        let thread = thread::spawn(move || owner_loop(service, thread_mailbox, wake_rx));
+        let thread = thread::spawn(move || owner_loop(service, &thread_mailbox));
         (mailbox, thread)
     }
 
@@ -1021,6 +980,7 @@ mod tests {
             true,
             discover_gamescope_wayland,
             || Some(OsString::from(":0")),
+            |_| true,
         );
 
         assert_eq!(
@@ -1043,8 +1003,46 @@ mod tests {
             false,
             |_| Some(OsString::from("gamescope-0")),
             || Some(OsString::from(":0")),
+            |_| true,
         );
         assert_eq!(displays, None);
+    }
+
+    #[test]
+    fn advertised_displays_must_be_live_and_primary_gamescope() {
+        let runtime = std::env::temp_dir().join(format!(
+            "z13helper-gamescope-advertised-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&runtime);
+        fs::create_dir(&runtime).unwrap();
+        let socket = runtime.join("gamescope-0");
+        let resolve = |is_primary: fn(&OsStr) -> bool| {
+            resolve_gamescope_displays(
+                Some(&runtime),
+                Some(OsStr::new("gamescope-0")),
+                Some(OsStr::new(":1")),
+                false,
+                |_| None,
+                || Some(OsString::from(":0")),
+                is_primary,
+            )
+        };
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        // A leaked desktop DISPLAY is replaced by the discovered server 0.
+        assert_eq!(
+            resolve(|display| display == ":0"),
+            Some(GamescopeDisplays {
+                wayland: OsString::from("gamescope-0"),
+                x11: OsString::from(":0"),
+            })
+        );
+        // A crashed gamescope leaves a socket file nothing accepts on.
+        drop(listener);
+        assert!(socket.exists());
+        assert_eq!(resolve(|_| true), None);
+        fs::remove_dir_all(runtime).unwrap();
     }
 
     #[test]
@@ -1079,15 +1077,16 @@ mod tests {
 
     #[test]
     fn scaling_matches_native_panel_and_clamps_overrides() {
-        assert!((ui_scale(2560, "") - 2560.0 / REFERENCE_WIDTH).abs() < 0.0001);
-        assert_eq!(ui_scale(1280, ""), MIN_SCALE);
-        assert_eq!(ui_scale(7680, ""), MAX_SCALE);
-        assert_eq!(ui_scale(2560, "1.25"), 1.25);
-        assert_eq!(ui_scale(2560, "0.1"), MIN_SCALE);
-        assert_eq!(ui_scale(2560, "30"), MAX_SCALE);
-        let automatic = ui_scale(2560, "");
+        let scale = |width, value| ui_scale(width, parse_scale(value));
+        assert!((scale(2560, "") - 2560.0 / REFERENCE_WIDTH).abs() < 0.0001);
+        assert_eq!(scale(1280, ""), MIN_SCALE);
+        assert_eq!(scale(7680, ""), MAX_SCALE);
+        assert_eq!(scale(2560, "1.25"), 1.25);
+        assert_eq!(scale(2560, "0.1"), MIN_SCALE);
+        assert_eq!(scale(2560, "30"), MAX_SCALE);
+        let automatic = scale(2560, "");
         for invalid in ["garbage", "0", "-2", "NaN"] {
-            assert_eq!(ui_scale(2560, invalid), automatic);
+            assert_eq!(scale(2560, invalid), automatic);
         }
     }
 
@@ -1107,14 +1106,12 @@ mod tests {
         assert!(mailbox.submit(&[WindowState {
             xid: 7,
             active: true,
-            mapped: true,
             external_overlay: false
         }]));
         assert_eq!(flush_events_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
         assert!(mailbox.submit(&[WindowState {
             xid: 9,
             active: false,
-            mapped: true,
             external_overlay: false
         }]));
         release_tx.send(()).unwrap();
@@ -1122,16 +1119,20 @@ mod tests {
         mailbox.close();
         thread.join().unwrap();
         let operations = operations.lock().unwrap();
-        assert!(operations.starts_with(&[
-            "overlay:7:false".to_string(),
-            "opacity:7:4294967295".to_string(),
-            "focus:7:true".to_string()
-        ]));
-        assert!(operations.ends_with(&[
-            "overlay:9:false".to_string(),
-            "focus:9:false".to_string(),
-            "opacity:9:0".to_string()
-        ]));
+        assert_eq!(
+            operations.as_slice(),
+            [
+                "overlay:7:false",
+                "opacity:7:4294967295",
+                "focus:7:true",
+                "overlay:7:false",
+                "focus:7:false",
+                "opacity:7:0",
+                "overlay:9:false",
+                "focus:9:false",
+                "opacity:9:0",
+            ]
+        );
         assert_eq!(*flushes.lock().unwrap(), 2);
     }
 
@@ -1150,7 +1151,6 @@ mod tests {
         mailbox.submit(&[WindowState {
             xid: 11,
             active: true,
-            mapped: true,
             external_overlay: false,
         }]);
         assert_eq!(flush_events_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
@@ -1158,7 +1158,6 @@ mod tests {
         mailbox.submit(&[WindowState {
             xid: 11,
             active: false,
-            mapped: true,
             external_overlay: false,
         }]);
         assert_eq!(flush_events_rx.recv_timeout(Duration::from_secs(1)), Ok(2));
@@ -1169,6 +1168,38 @@ mod tests {
             &["overlay:11:false", "focus:11:false", "opacity:11:0"]
         );
         assert_eq!(*flushes.lock().unwrap(), 2);
+    }
+
+    struct OpacityFails(Vec<String>);
+
+    impl X11Io for OpacityFails {
+        fn set_overlay(&mut self, _: Window, _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn set_input_focus(&mut self, xid: Window, focused: bool) -> Result<()> {
+            self.0.push(format!("focus:{xid}:{focused}"));
+            Ok(())
+        }
+        fn set_opacity(&mut self, _: Window, _: u32) -> Result<()> {
+            anyhow::bail!("opacity write failed")
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_opacity_write_does_not_grant_input_focus() {
+        let mut service = OpacityFails(Vec::new());
+        apply_one(
+            &mut service,
+            WindowState {
+                xid: 5,
+                active: true,
+                external_overlay: false,
+            },
+        );
+        assert!(service.0.is_empty(), "{:?}", service.0);
     }
 
     #[test]
@@ -1187,7 +1218,6 @@ mod tests {
         let active = WindowState {
             xid: 21,
             active: true,
-            mapped: true,
             external_overlay: false,
         };
         mailbox.submit(&[active]);
@@ -1211,35 +1241,5 @@ mod tests {
             &operations[6..9],
             ["overlay:21:false", "opacity:21:4294967295", "focus:21:true"]
         );
-    }
-
-    #[test]
-    fn brand_new_inactive_window_is_explicitly_hidden_and_mapped() {
-        let operations = Arc::new(Mutex::new(Vec::new()));
-        let flushes = Arc::new(Mutex::new(0));
-        let (flush_events_tx, flush_events_rx) = mpsc::channel();
-        let service = FakeX11 {
-            operations: Arc::clone(&operations),
-            flushes: Arc::clone(&flushes),
-            flush_events: flush_events_tx,
-            first_flush_release: None,
-        };
-        let (mailbox, thread) = fake_owner(service);
-        let hidden = WindowState {
-            xid: 31,
-            active: false,
-            mapped: true,
-            external_overlay: false,
-        };
-        mailbox.submit(&[hidden]);
-        assert_eq!(flush_events_rx.recv_timeout(Duration::from_secs(1)), Ok(1));
-        mailbox.close();
-        thread.join().unwrap();
-        assert_eq!(
-            operations.lock().unwrap().as_slice(),
-            ["overlay:31:false", "focus:31:false", "opacity:31:0"]
-        );
-        assert!(hidden.mapped);
-        assert!(!hidden.active);
     }
 }

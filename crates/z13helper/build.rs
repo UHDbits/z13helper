@@ -14,6 +14,5 @@ fn main() {
         .expect("glib-compile-resources is required to build z13helper");
     assert!(status.success(), "failed to compile z13helper resources");
 
-    println!("cargo:rerun-if-changed=resources/z13helper.gresource.xml");
-    println!("cargo:rerun-if-changed=resources/z13helper-battery-limit-symbolic.svg");
+    println!("cargo:rerun-if-changed=resources");
 }

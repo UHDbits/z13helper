@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::curve::{HysteresisState, TemperatureAverager, duty_at, hysteretic_temperature};
 use crate::ec::{EcMailbox, PortIo};
 
-const MODEL: &str = "GZ302EA";
+pub const MODEL: &str = "GZ302EA";
 const MAX_CONSECUTIVE_EC_ERRORS: u32 = 3;
 
 const RISE_PWM_PER_SECOND: u32 = 255;
@@ -47,11 +47,11 @@ impl<P: PortIo> Controller<P> {
 
     pub fn startup_release_and_probe(&mut self) -> Result<ProbeReply, String> {
         self.release()?;
-        let probe = self.ec.probe().map_err(|error| error.to_string())?;
+        let ec_version = self.ec.probe().map_err(|error| error.to_string())?;
         Ok(ProbeReply {
             model: MODEL.into(),
-            ec_version: probe.version,
-            fan_count: probe.fan_count,
+            ec_version,
+            fan_count: 2,
         })
     }
 
@@ -66,20 +66,29 @@ impl<P: PortIo> Controller<P> {
             .map_err(|error| self.note_ec_error(error.to_string()))?;
         self.reset_runtime();
         self.consecutive_ec_errors = 0;
+        self.release_failure = None;
         self.curves = Some(curves);
         self.hysteresis = hysteresis;
         self.temperature_average_seconds = temperature_average_seconds;
         Ok(())
     }
 
+    /// Return the EC to automatic mode. A failure is kept for
+    /// `take_release_failure` until a later release or enable succeeds.
     pub fn release(&mut self) -> Result<(), String> {
         self.reset_runtime();
         match self.ec.set_global_mode(false) {
             Ok(()) => {
                 self.consecutive_ec_errors = 0;
+                self.release_failure = None;
                 Ok(())
             }
-            Err(error) => Err(self.note_ec_error(error.to_string())),
+            Err(error) => {
+                let error = error.to_string();
+                self.release_failure = Some(error.clone());
+                tracing::error!(%error, "failed to release EC automatic mode");
+                Err(error)
+            }
         }
     }
 
@@ -158,7 +167,7 @@ impl<P: PortIo> Controller<P> {
     }
 
     pub fn sensor_failed(&mut self, error: String) -> String {
-        match self.release_best_effort() {
+        match self.release().err() {
             Some(release_error) => {
                 format!("sensor failure; EC control release failed ({release_error}): {error}")
             }
@@ -181,7 +190,7 @@ impl<P: PortIo> Controller<P> {
     fn note_ec_error(&mut self, error: String) -> String {
         self.consecutive_ec_errors = self.consecutive_ec_errors.saturating_add(1);
         if self.consecutive_ec_errors >= MAX_CONSECUTIVE_EC_ERRORS {
-            match self.release_best_effort() {
+            match self.release().err() {
                 Some(release_error) => format!(
                     "repeated EC failure; control release failed ({release_error}): {error}"
                 ),
@@ -189,19 +198,6 @@ impl<P: PortIo> Controller<P> {
             }
         } else {
             format!("EC failure: {error}")
-        }
-    }
-
-    fn release_best_effort(&mut self) -> Option<String> {
-        self.reset_runtime();
-        match self.ec.set_global_mode(false) {
-            Ok(()) => None,
-            Err(error) => {
-                let error = error.to_string();
-                self.release_failure = Some(error.clone());
-                tracing::error!(%error, "failed to release EC automatic mode");
-                Some(error)
-            }
         }
     }
 
@@ -394,17 +390,7 @@ mod tests {
         controller
             .tick(now + DIRECT_TICK_INTERVAL * 2, 60_000)
             .unwrap();
-        let io = controller.into_io();
-        let duty_transactions = io
-            .writes
-            .windows(5)
-            .filter(|writes| {
-                writes[0] == (COMMAND_STATUS_PORT, 0xff)
-                    && writes[1] == (COMMAND_STATUS_PORT, 0xdd)
-                    && writes[2] == (DATA_PORT, 0x82)
-                    && writes[3] == (DATA_PORT, Register::Duty as u8)
-            })
-            .count();
+        let duty_transactions = duty_transaction_values(&controller.into_io().writes).len();
         // Each fan's duty changes twice. The third, stable tick adds no duty
         // transaction (fan-select writes do not count here).
         assert_eq!(duty_transactions, 4);
@@ -423,19 +409,32 @@ mod tests {
     }
 
     #[test]
-    fn failed_best_effort_release_is_reported() {
+    fn failed_best_effort_release_is_reported_until_release_or_enable_succeeds() {
         let fail_writes = Rc::new(Cell::new(false));
         let mut controller = Controller::new(EcMailbox::new(SwitchIo {
             fail_writes: fail_writes.clone(),
             writes: Rc::new(RefCell::new(Vec::new())),
         }));
+        let fail_release = |controller: &mut Controller<SwitchIo>| {
+            fail_writes.set(true);
+            controller.sensor_failed("missing k10temp".into());
+            fail_writes.set(false);
+        };
         controller
             .enable([curve(100), curve(100)], FanHysteresis::default(), 0)
             .unwrap();
-        fail_writes.set(true);
-        controller.sensor_failed("missing k10temp".into());
+        fail_release(&mut controller);
         assert!(controller.take_release_failure().is_some());
-        fail_writes.set(false);
+
+        // A later successful release or enable supersedes the failure, so a
+        // single transient tick error cannot pick up a stale release failure.
+        fail_release(&mut controller);
         assert!(controller.release().is_ok());
+        assert!(controller.take_release_failure().is_none());
+        fail_release(&mut controller);
+        controller
+            .enable([curve(100), curve(100)], FanHysteresis::default(), 0)
+            .unwrap();
+        assert!(controller.take_release_failure().is_none());
     }
 }

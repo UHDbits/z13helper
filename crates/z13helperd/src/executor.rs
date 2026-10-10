@@ -39,7 +39,7 @@ impl OutcomeKey {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AdmissionMode {
+enum AdmissionMode {
     Active,
     BarrierPending,
     Suspended,
@@ -82,38 +82,25 @@ impl Admission {
         }
     }
 
-    fn mode(&self) -> AdmissionMode {
-        self.mode
-    }
-
     fn release_queue_slot(&mut self) {
         self.queued = self.queued.saturating_sub(1);
     }
 
-    fn admit_client(&mut self) -> Result<(), AdmissionError> {
+    /// The error for an operation the current mode does not admit.
+    fn rejection(&self) -> AdmissionError {
         match self.mode {
-            AdmissionMode::Active => {}
-            AdmissionMode::Suspended => return Err(AdmissionError::Suspended),
-            AdmissionMode::BarrierPending => return Err(AdmissionError::BarrierPending),
-            AdmissionMode::ShuttingDown => return Err(AdmissionError::ShuttingDown),
-            AdmissionMode::Stopped => return Err(AdmissionError::Stopped),
+            AdmissionMode::Suspended => AdmissionError::Suspended,
+            AdmissionMode::ShuttingDown => AdmissionError::ShuttingDown,
+            AdmissionMode::Stopped => AdmissionError::Stopped,
+            // Active only rejects Resume, which needs a finished suspend.
+            AdmissionMode::Active | AdmissionMode::BarrierPending => AdmissionError::BarrierPending,
         }
-        if self.queued >= BACKEND_QUEUE_CAPACITY - LIFECYCLE_RESERVE {
-            return Err(AdmissionError::Full);
-        }
-        self.queued += 1;
-        Ok(())
     }
 
-    fn admit_maintenance(&mut self) -> Result<(), AdmissionError> {
+    /// Client commands and maintenance share the non-reserved queue slots.
+    fn admit(&mut self) -> Result<(), AdmissionError> {
         if self.mode != AdmissionMode::Active {
-            return Err(match self.mode {
-                AdmissionMode::Suspended => AdmissionError::Suspended,
-                AdmissionMode::BarrierPending => AdmissionError::BarrierPending,
-                AdmissionMode::ShuttingDown => AdmissionError::ShuttingDown,
-                AdmissionMode::Stopped => AdmissionError::Stopped,
-                AdmissionMode::Active => unreachable!(),
-            });
+            return Err(self.rejection());
         }
         if self.queued >= BACKEND_QUEUE_CAPACITY - LIFECYCLE_RESERVE {
             return Err(AdmissionError::Full);
@@ -136,13 +123,7 @@ impl Admission {
             }
         };
         if !allowed {
-            return Err(match self.mode {
-                AdmissionMode::Suspended => AdmissionError::Suspended,
-                AdmissionMode::BarrierPending => AdmissionError::BarrierPending,
-                AdmissionMode::ShuttingDown => AdmissionError::ShuttingDown,
-                AdmissionMode::Stopped => AdmissionError::Stopped,
-                AdmissionMode::Active => AdmissionError::BarrierPending,
-            });
+            return Err(self.rejection());
         }
         if self.queued >= BACKEND_QUEUE_CAPACITY {
             return Err(AdmissionError::Full);
@@ -159,9 +140,11 @@ impl Admission {
 
     fn barrier_finished(&mut self, operation: LifecycleOperation) {
         self.mode = match operation {
+            LifecycleOperation::Shutdown => AdmissionMode::Stopped,
+            // A shutdown admitted behind this barrier keeps admission closed.
+            _ if self.mode == AdmissionMode::ShuttingDown => return,
             LifecycleOperation::Suspend => AdmissionMode::Suspended,
             LifecycleOperation::Resume => AdmissionMode::Active,
-            LifecycleOperation::Shutdown => AdmissionMode::Stopped,
         };
     }
 }
@@ -173,8 +156,9 @@ pub struct PeerLiveness {
 
 impl PeerLiveness {
     pub fn from_stream(stream: &UnixStream) -> io::Result<Self> {
+        // No set_nonblocking: O_NONBLOCK is shared with the client stream and
+        // would void its write timeout. recv() passes MSG_DONTWAIT instead.
         let stream = stream.try_clone()?;
-        stream.set_nonblocking(true)?;
         Ok(Self {
             stream: Arc::new(stream),
         })
@@ -226,14 +210,7 @@ enum Operation {
     },
     Observe,
     Hotplug,
-    Lifecycle {
-        operation: LifecycleOperation,
-        ack: Option<SyncSender<()>>,
-    },
-}
-
-struct Job {
-    operation: Operation,
+    Lifecycle(LifecycleOperation),
 }
 
 #[derive(Default)]
@@ -247,10 +224,6 @@ pub enum ExecutorEvent {
     StateChanged,
     Suspended,
     Resumed(Option<bool>),
-}
-
-fn can_start(now: Instant, deadline: Instant, peer_alive: bool) -> bool {
-    now < deadline && peer_alive
 }
 
 impl EventQueue {
@@ -285,7 +258,7 @@ impl EventQueue {
 }
 
 pub struct BackendExecutor {
-    sender: Mutex<Option<SyncSender<Job>>>,
+    sender: Mutex<Option<SyncSender<Operation>>>,
     admission: Arc<Mutex<Admission>>,
     events: Arc<Mutex<EventQueue>>,
     outcomes: Arc<OutcomeStore>,
@@ -298,15 +271,13 @@ struct StoredOutcome {
     response: Option<WireResponse>,
 }
 
+/// Outcomes by key plus the completion order that bounds them, under one lock.
 #[derive(Default)]
-struct OutcomeStore {
-    entries: Mutex<HashMap<OutcomeKey, StoredOutcome>>,
-    completed: Mutex<VecDeque<OutcomeKey>>,
-}
+struct OutcomeStore(Mutex<(HashMap<OutcomeKey, StoredOutcome>, VecDeque<OutcomeKey>)>);
 
 impl OutcomeStore {
     fn register(&self, key: OutcomeKey) -> Option<WireResponse> {
-        let mut entries = self.entries.lock().unwrap();
+        let (entries, _) = &mut *self.0.lock().unwrap();
         if let Some(stored) = entries.get(&key) {
             return Some(snapshot(key, key.request_id, stored, false));
         }
@@ -321,17 +292,17 @@ impl OutcomeStore {
     }
 
     fn remove(&self, key: OutcomeKey) {
-        self.entries.lock().unwrap().remove(&key);
+        self.0.lock().unwrap().0.remove(&key);
     }
 
     fn set_started(&self, key: OutcomeKey) {
-        if let Some(stored) = self.entries.lock().unwrap().get_mut(&key) {
+        if let Some(stored) = self.0.lock().unwrap().0.get_mut(&key) {
             stored.outcome = RequestOutcome::Started;
         }
     }
 
     fn set_terminal(&self, key: OutcomeKey, outcome: RequestOutcome, response: WireResponse) {
-        let mut entries = self.entries.lock().unwrap();
+        let (entries, completed) = &mut *self.0.lock().unwrap();
         entries.insert(
             key,
             StoredOutcome {
@@ -339,7 +310,6 @@ impl OutcomeStore {
                 response: Some(response),
             },
         );
-        let mut completed = self.completed.lock().unwrap();
         completed.push_back(key);
         while completed.len() > MAX_RETAINED_OUTCOMES {
             if let Some(old) = completed.pop_front() {
@@ -349,9 +319,10 @@ impl OutcomeStore {
     }
 
     fn lookup(&self, target: OutcomeKey, correlation: RequestId) -> Option<WireResponse> {
-        self.entries
+        self.0
             .lock()
             .unwrap()
+            .0
             .get(&target)
             .map(|stored| snapshot(target, correlation, stored, true))
     }
@@ -440,10 +411,6 @@ impl BackendExecutor {
         }
     }
 
-    pub fn mode(&self) -> AdmissionMode {
-        self.admission.lock().unwrap().mode()
-    }
-
     pub fn submit_command(
         &self,
         key: OutcomeKey,
@@ -456,15 +423,13 @@ impl BackendExecutor {
             return Ok(CommandSubmission::Existing(Box::new(existing)));
         }
         let (reply, receiver) = mpsc::sync_channel(2);
-        let result = self.admit_client(Job {
-            operation: Operation::Command {
-                key,
-                command: Box::new(command),
-                effects,
-                peer,
-                deadline,
-                reply,
-            },
+        let result = self.submit(Operation::Command {
+            key,
+            command: Box::new(command),
+            effects,
+            peer,
+            deadline,
+            reply,
         });
         if result.is_err() {
             self.outcomes.remove(key);
@@ -493,19 +458,19 @@ impl BackendExecutor {
     }
 
     pub fn try_observe(&self) -> Result<(), AdmissionError> {
-        self.submit_maintenance(Operation::Observe)
+        self.submit(Operation::Observe)
     }
 
     pub fn try_hotplug(&self) -> Result<(), AdmissionError> {
-        self.submit_maintenance(Operation::Hotplug)
+        self.submit(Operation::Hotplug)
     }
 
     pub fn begin_suspend(&self) -> Result<(), AdmissionError> {
-        self.begin_lifecycle(LifecycleOperation::Suspend, None)
+        self.submit(Operation::Lifecycle(LifecycleOperation::Suspend))
     }
 
     pub fn begin_resume(&self) -> Result<(), AdmissionError> {
-        self.begin_lifecycle(LifecycleOperation::Resume, None)
+        self.submit(Operation::Lifecycle(LifecycleOperation::Resume))
     }
 
     pub fn drain_events(&self) -> Vec<ExecutorEvent> {
@@ -519,16 +484,11 @@ impl BackendExecutor {
         let Some(owner) = self.owner.lock().unwrap().take() else {
             return;
         };
-        if !matches!(
-            self.mode(),
-            AdmissionMode::Stopped | AdmissionMode::ShuttingDown
-        ) {
-            // Do not wait on an acknowledgement here. Closing the sender
-            // after enqueueing is sufficient: a live owner drains the FIFO
-            // and observes Shutdown, while a failed owner observes receiver
-            // disconnect and runs its release path.
-            let _ = self.begin_lifecycle(LifecycleOperation::Shutdown, None);
-        }
+        // Do not wait on an acknowledgement here. Closing the sender after
+        // enqueueing is sufficient: a live owner drains the FIFO and observes
+        // Shutdown, while a failed owner observes receiver disconnect and runs
+        // its release path. Admission rejects a repeated shutdown untouched.
+        let _ = self.submit(Operation::Lifecycle(LifecycleOperation::Shutdown));
         // If admission could not enqueue the final barrier, closing the sole
         // sender makes the owner leave recv() and its disconnect path releases
         // direct control. A successful barrier also gets a clean close before
@@ -537,79 +497,29 @@ impl BackendExecutor {
         let _ = owner.join();
     }
 
-    fn admit_client(&self, job: Job) -> Result<(), AdmissionError> {
-        let mut admission = self.admission.lock().unwrap();
-        admission.admit_client()?;
-        let sender = self.sender.lock().unwrap();
-        let Some(sender) = sender.as_ref() else {
-            admission.release_queue_slot();
-            return Err(AdmissionError::Stopped);
-        };
-        match sender.try_send(job) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => {
-                admission.release_queue_slot();
-                Err(AdmissionError::Full)
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                admission.release_queue_slot();
-                admission.mode = AdmissionMode::Stopped;
-                Err(AdmissionError::Stopped)
-            }
-        }
-    }
-
-    fn submit_maintenance(&self, operation: Operation) -> Result<(), AdmissionError> {
-        let mut admission = self.admission.lock().unwrap();
-        admission.admit_maintenance()?;
-        let sender = self.sender.lock().unwrap();
-        let Some(sender) = sender.as_ref() else {
-            admission.release_queue_slot();
-            return Err(AdmissionError::Stopped);
-        };
-        match sender.try_send(Job { operation }) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => {
-                admission.release_queue_slot();
-                Err(AdmissionError::Full)
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                admission.release_queue_slot();
-                admission.mode = AdmissionMode::Stopped;
-                Err(AdmissionError::Stopped)
-            }
-        }
-    }
-
-    fn begin_lifecycle(
-        &self,
-        operation: LifecycleOperation,
-        ack: Option<SyncSender<()>>,
-    ) -> Result<(), AdmissionError> {
+    /// Admit and enqueue `operation`; a failed enqueue returns its slot and
+    /// restores the mode, unless the owner is gone.
+    fn submit(&self, operation: Operation) -> Result<(), AdmissionError> {
         let mut admission = self.admission.lock().unwrap();
         let previous_mode = admission.mode;
-        admission.begin_lifecycle(operation)?;
-        let sender = self.sender.lock().unwrap();
-        let Some(sender) = sender.as_ref() else {
-            admission.release_queue_slot();
-            admission.mode = previous_mode;
-            return Err(AdmissionError::Stopped);
-        };
-        match sender.try_send(Job {
-            operation: Operation::Lifecycle { operation, ack },
-        }) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => {
-                admission.release_queue_slot();
-                admission.mode = previous_mode;
-                Err(AdmissionError::Full)
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                admission.release_queue_slot();
-                admission.mode = AdmissionMode::Stopped;
-                Err(AdmissionError::Stopped)
-            }
+        match &operation {
+            Operation::Lifecycle(lifecycle) => admission.begin_lifecycle(*lifecycle)?,
+            _ => admission.admit()?,
         }
+        let sender = self.sender.lock().unwrap();
+        let (error, mode) = match sender.as_ref() {
+            None => (AdmissionError::Stopped, previous_mode),
+            Some(sender) => match sender.try_send(operation) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(_)) => (AdmissionError::Full, previous_mode),
+                Err(TrySendError::Disconnected(_)) => {
+                    (AdmissionError::Stopped, AdmissionMode::Stopped)
+                }
+            },
+        };
+        admission.release_queue_slot();
+        admission.mode = mode;
+        Err(error)
     }
 }
 
@@ -621,14 +531,14 @@ impl Drop for BackendExecutor {
 
 fn run_owner(
     backend: &mut Backend,
-    receiver: Receiver<Job>,
+    receiver: Receiver<Operation>,
     admission: Arc<Mutex<Admission>>,
     events: Arc<Mutex<EventQueue>>,
     outcomes: Arc<OutcomeStore>,
 ) {
-    while let Ok(job) = receiver.recv() {
+    while let Ok(operation) = receiver.recv() {
         admission.lock().unwrap().release_queue_slot();
-        match job.operation {
+        match operation {
             Operation::Command {
                 key,
                 command,
@@ -639,8 +549,7 @@ fn run_owner(
             } => {
                 let request_id = key.request_id;
                 let now = Instant::now();
-                let peer_alive = peer.is_alive();
-                if !peer_alive {
+                if !peer.is_alive() {
                     let mut response = failure(
                         Some(request_id),
                         ErrorCode::Rejected,
@@ -661,63 +570,54 @@ fn run_owner(
                     let _ = reply.send(response);
                     continue;
                 }
-                if !can_start(now, deadline, peer_alive) {
-                    continue;
-                }
                 outcomes.set_started(key);
                 // The owner never waits for a client to acknowledge progress;
                 // the bounded reply channel can hold started and completed.
                 let _ = reply.send(WireResponse::progress(request_id, RequestOutcome::Started));
                 let response = execute(backend, request_id, *command);
-                if response.ok {
-                    let mut event_queue = events.lock().unwrap();
-                    event_queue.publish_effects(&effects);
-                }
-                outcomes.set_terminal(key, RequestOutcome::Completed, response.clone());
+                complete_command(&events, &outcomes, key, &effects, &response);
                 // A response receiver may be gone. Effects were committed
                 // above and remain independent of this socket write.
                 let _ = reply.send(response);
             }
-            Operation::Observe => backend.observe(),
+            Operation::Observe => {
+                if backend.observe() {
+                    events
+                        .lock()
+                        .unwrap()
+                        .publish_effects(&[Effect::StateChanged]);
+                }
+            }
             Operation::Hotplug => backend.restore_hotplugged_lighting(),
-            Operation::Lifecycle { operation, ack } => {
-                match operation {
-                    LifecycleOperation::Suspend => {
-                        backend.shutdown();
-                        admission
-                            .lock()
-                            .unwrap()
-                            .barrier_finished(LifecycleOperation::Suspend);
-                        events
-                            .lock()
-                            .unwrap()
-                            .publish_lifecycle(ExecutorEvent::Suspended);
-                    }
-                    LifecycleOperation::Resume => {
-                        let changed = backend.restore_volatile();
-                        admission
-                            .lock()
-                            .unwrap()
-                            .barrier_finished(LifecycleOperation::Resume);
-                        events
-                            .lock()
-                            .unwrap()
-                            .publish_lifecycle(ExecutorEvent::Resumed(changed));
-                    }
-                    LifecycleOperation::Shutdown => {
-                        backend.shutdown();
-                        admission
-                            .lock()
-                            .unwrap()
-                            .barrier_finished(LifecycleOperation::Shutdown);
-                    }
-                }
-                if let Some(ack) = ack {
-                    let _ = ack.send(());
-                }
-                if matches!(operation, LifecycleOperation::Shutdown) {
-                    return;
-                }
+            Operation::Lifecycle(LifecycleOperation::Suspend) => {
+                backend.shutdown();
+                admission
+                    .lock()
+                    .unwrap()
+                    .barrier_finished(LifecycleOperation::Suspend);
+                events
+                    .lock()
+                    .unwrap()
+                    .publish_lifecycle(ExecutorEvent::Suspended);
+            }
+            Operation::Lifecycle(LifecycleOperation::Resume) => {
+                let changed = backend.restore_volatile();
+                admission
+                    .lock()
+                    .unwrap()
+                    .barrier_finished(LifecycleOperation::Resume);
+                events
+                    .lock()
+                    .unwrap()
+                    .publish_lifecycle(ExecutorEvent::Resumed(changed));
+            }
+            Operation::Lifecycle(LifecycleOperation::Shutdown) => {
+                backend.shutdown();
+                admission
+                    .lock()
+                    .unwrap()
+                    .barrier_finished(LifecycleOperation::Shutdown);
+                return;
             }
         }
     }
@@ -725,6 +625,19 @@ fn run_owner(
     // that path the sole backend owner must release direct EC control.
     backend.shutdown();
     admission.lock().unwrap().mode = AdmissionMode::Stopped;
+}
+
+fn complete_command(
+    events: &Mutex<EventQueue>,
+    outcomes: &OutcomeStore,
+    key: OutcomeKey,
+    effects: &[Effect],
+    response: &WireResponse,
+) {
+    // Published even on failure: a failed Apply can still roll back hardware
+    // and record degraded state that subscribers must re-read.
+    events.lock().unwrap().publish_effects(effects);
+    outcomes.set_terminal(key, RequestOutcome::Completed, response.clone());
 }
 
 #[cfg(test)]
@@ -735,13 +648,13 @@ mod tests {
     fn admission_reserves_slots_for_lifecycle() {
         let mut admission = Admission::new();
         for _ in 0..(BACKEND_QUEUE_CAPACITY - LIFECYCLE_RESERVE) {
-            admission.admit_client().unwrap();
+            admission.admit().unwrap();
         }
-        assert_eq!(admission.admit_client(), Err(AdmissionError::Full));
+        assert_eq!(admission.admit(), Err(AdmissionError::Full));
         admission
             .begin_lifecycle(LifecycleOperation::Suspend)
             .unwrap();
-        assert_eq!(admission.mode(), AdmissionMode::BarrierPending);
+        assert_eq!(admission.mode, AdmissionMode::BarrierPending);
     }
 
     #[test]
@@ -750,18 +663,15 @@ mod tests {
         admission
             .begin_lifecycle(LifecycleOperation::Suspend)
             .unwrap();
-        assert_eq!(
-            admission.admit_client(),
-            Err(AdmissionError::BarrierPending)
-        );
+        assert_eq!(admission.admit(), Err(AdmissionError::BarrierPending));
         admission.barrier_finished(LifecycleOperation::Suspend);
-        assert_eq!(admission.admit_client(), Err(AdmissionError::Suspended));
+        assert_eq!(admission.admit(), Err(AdmissionError::Suspended));
         admission
             .begin_lifecycle(LifecycleOperation::Resume)
             .unwrap();
         admission.barrier_finished(LifecycleOperation::Resume);
-        assert_eq!(admission.mode(), AdmissionMode::Active);
-        admission.admit_client().unwrap();
+        assert_eq!(admission.mode, AdmissionMode::Active);
+        admission.admit().unwrap();
     }
 
     #[test]
@@ -772,28 +682,73 @@ mod tests {
             admission.begin_lifecycle(LifecycleOperation::Suspend),
             Err(AdmissionError::Full)
         );
-        assert_eq!(admission.mode(), AdmissionMode::Active);
+        assert_eq!(admission.mode, AdmissionMode::Active);
 
         admission.mode = AdmissionMode::Suspended;
         assert_eq!(
             admission.begin_lifecycle(LifecycleOperation::Resume),
             Err(AdmissionError::Full)
         );
-        assert_eq!(admission.mode(), AdmissionMode::Suspended);
+        assert_eq!(admission.mode, AdmissionMode::Suspended);
     }
 
     #[test]
-    fn expired_or_disconnected_jobs_are_rejected_before_start() {
-        let now = Instant::now();
-        assert!(!can_start(now, now - Duration::from_millis(1), true));
-        assert!(!can_start(now, now + Duration::from_secs(1), false));
-        assert!(can_start(now, now + Duration::from_secs(1), true));
-
+    fn peer_liveness_detects_disconnect() {
         let (peer, stream) = UnixStream::pair().unwrap();
         let live = PeerLiveness::from_stream(&stream).unwrap();
         assert!(live.is_alive());
         drop(peer);
         assert!(!live.is_alive());
+    }
+
+    #[test]
+    fn peer_liveness_keeps_client_stream_blocking() {
+        // O_NONBLOCK is shared by duplicated descriptors; setting it would
+        // disable the client's write timeout.
+        let (_peer, stream) = UnixStream::pair().unwrap();
+        let _live = PeerLiveness::from_stream(&stream).unwrap();
+        // SAFETY: F_GETFL only reads flags of a descriptor `stream` owns.
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+    }
+
+    #[test]
+    fn shutdown_admitted_behind_a_barrier_keeps_admission_closed() {
+        for barrier in [LifecycleOperation::Suspend, LifecycleOperation::Resume] {
+            let mut admission = Admission::new();
+            admission.mode = match barrier {
+                LifecycleOperation::Resume => AdmissionMode::Suspended,
+                _ => AdmissionMode::Active,
+            };
+            admission.begin_lifecycle(barrier).unwrap();
+            admission
+                .begin_lifecycle(LifecycleOperation::Shutdown)
+                .unwrap();
+            admission.barrier_finished(barrier);
+            assert_eq!(admission.mode, AdmissionMode::ShuttingDown);
+            admission.barrier_finished(LifecycleOperation::Shutdown);
+            assert_eq!(admission.mode, AdmissionMode::Stopped);
+        }
+    }
+
+    #[test]
+    fn failed_command_still_invalidates_state() {
+        // A failed Apply can roll back hardware and record degraded state.
+        let events = Mutex::new(EventQueue::default());
+        let outcomes = OutcomeStore::default();
+        let request_id = RequestId::new(7).unwrap();
+        let key = OutcomeKey::new(ClientId::new(1).unwrap(), request_id);
+        outcomes.register(key);
+        let response = failure(Some(request_id), ErrorCode::Rejected, "apply failed");
+        complete_command(&events, &outcomes, key, &[Effect::StateChanged], &response);
+        assert_eq!(
+            events.lock().unwrap().drain(),
+            vec![ExecutorEvent::StateChanged]
+        );
+        assert_eq!(
+            outcomes.lookup(key, request_id).unwrap().outcome,
+            RequestOutcome::Completed
+        );
     }
 
     #[test]
@@ -866,27 +821,6 @@ mod tests {
                     reconnect,
                 )
                 .is_some()
-        );
-    }
-
-    #[test]
-    fn immediate_outcome_stays_queued_until_the_effect_boundary_completes() {
-        let store = OutcomeStore::default();
-        let request_id = RequestId::new(41).unwrap();
-        let key = OutcomeKey::new(ClientId::new(1).unwrap(), request_id);
-        assert!(store.register(key).is_none());
-        assert_eq!(
-            store.lookup(key, request_id).unwrap().outcome,
-            RequestOutcome::Queued
-        );
-        store.set_terminal(
-            key,
-            RequestOutcome::Completed,
-            WireResponse::success(request_id),
-        );
-        assert_eq!(
-            store.lookup(key, request_id).unwrap().outcome,
-            RequestOutcome::Completed
         );
     }
 

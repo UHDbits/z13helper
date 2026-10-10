@@ -18,6 +18,9 @@ z13helper-core = { path = "../z13helper-core" }
 tracing.workspace = true
 zbus.workspace = true
 
+[dev-dependencies]
+z13helper-core = { path = "../z13helper-core", features = ["fault-injection"] }
+
 [lib]
 name = "z13helperd"
 path = "src/lib.rs"

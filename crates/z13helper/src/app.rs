@@ -6,15 +6,13 @@ use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::AdwDialogExt;
 use z13helper_client::Client;
-use z13helper_core::{ApplyRequest, Config, ControllerAction};
+use z13helper_core::{ApplyRequest, Command, Config, ControllerAction};
 
+use crate::controller::ControllerCapture;
 use crate::css;
 use crate::gamescope::Gamescope;
-use crate::profile_coordinator::{
-    ApplyRequest as CoordinatorApplyRequest, ApplyToken, ProfileCoordinator, ProfileOperationToken,
-};
-use crate::services::{controller::ControllerCapture, subscribe, worker};
-use crate::ui::{hud, main_window};
+use crate::profile_coordinator::{ApplyToken, ProfileCoordinator, ProfileOperationToken};
+use crate::{hud, main_window, power, subscribe, worker};
 
 type ControllerActivation = (glib::WeakRef<gtk4::Widget>, Rc<dyn Fn()>);
 
@@ -116,10 +114,6 @@ impl AppState {
             return false;
         }
         self.coordinator.borrow_mut().select_editing(id)
-    }
-
-    pub fn mark_config_changed(&self) {
-        self.coordinator.borrow_mut().mark_config_changed();
     }
 
     /// Mutate one named profile and advance only that profile's runtime
@@ -236,7 +230,7 @@ impl AppState {
         let client = self.client.clone();
         let feedback = self.clone();
         worker::blocking(
-            move || client.panel_overdrive_set(enabled),
+            move || client.send(Command::SetPanelOverdrive { enabled }),
             move |result| {
                 if let Err(error) = result {
                     feedback.report_error(&format!("Panel overdrive failed: {error}"));
@@ -246,16 +240,6 @@ impl AppState {
     }
 
     fn seed_factory_fan_curves(self: &Rc<Self>) {
-        if self
-            .config
-            .borrow()
-            .profiles
-            .iter()
-            .filter(|profile| profile.builtin)
-            .all(|profile| profile.factory_fan_curves_loaded || profile.apply_fan_curve)
-        {
-            return;
-        }
         let targets: Vec<(ProfileOperationToken, String, String)> = self
             .config
             .borrow()
@@ -270,12 +254,12 @@ impl AppState {
                 Some((token, profile.id.clone(), ppd))
             })
             .collect();
-        let mut ppd_profiles: Vec<String> = targets.iter().map(|(_, _, ppd)| ppd.clone()).collect();
-        ppd_profiles.sort();
-        ppd_profiles.dedup();
         if targets.is_empty() {
             return;
         }
+        let mut ppd_profiles: Vec<String> = targets.iter().map(|(_, _, ppd)| ppd.clone()).collect();
+        ppd_profiles.sort();
+        ppd_profiles.dedup();
         let client = self.client.clone();
         let done = self.clone();
         worker::blocking(
@@ -341,7 +325,7 @@ impl AppState {
             .coordinator
             .borrow_mut()
             .request_apply(self.on_battery.get());
-        let CoordinatorApplyRequest::Started(token) = request else {
+        let Some(token) = request else {
             return;
         };
         self.start_apply(token);
@@ -455,7 +439,7 @@ impl AppState {
             self.report_persistent_error(&message);
         }
         *self.main_window.borrow_mut() = Some(window.clone());
-        subscribe::start(self);
+        subscribe::start(self, power::start(self));
         self.main_window_visible.set(show);
         if let Some(capture) = self.controller_capture.as_ref() {
             capture.set_enabled(show);
@@ -496,6 +480,12 @@ impl AppState {
             capture.set_enabled(false);
         }
         if let Some(gamescope) = self.gamescope.as_ref() {
+            // The overlay stays mapped while hidden; drop an open inline picker.
+            if let Some(stack) = find_named_descendant(&window, "gamescope-main-pages")
+                .and_then(|widget| widget.downcast::<gtk4::Stack>().ok())
+            {
+                stack.set_visible_child_name("main");
+            }
             gamescope.hide();
         } else {
             window.set_visible(false);

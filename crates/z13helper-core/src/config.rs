@@ -74,23 +74,25 @@ pub fn builtin_profiles() -> Vec<Profile> {
     ]
 }
 
+// Atomic, symlink-refusing file persistence shared with the daemon state store.
+
 static SIBLING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FailurePoint {
+pub enum FailurePoint {
     Write,
     FileSync,
     Rename,
     ParentSync,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 thread_local! {
     static FAILURE_POINT: std::cell::Cell<Option<FailurePoint>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 fn take_failure(point: FailurePoint) -> bool {
     FAILURE_POINT.with(|slot| {
         if slot.get() == Some(point) {
@@ -102,84 +104,70 @@ fn take_failure(point: FailurePoint) -> bool {
     })
 }
 
-#[cfg(test)]
-struct FailureGuard;
+#[cfg(any(test, feature = "fault-injection"))]
+pub struct FailureGuard;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 impl Drop for FailureGuard {
     fn drop(&mut self) {
         FAILURE_POINT.with(|slot| slot.set(None));
     }
 }
 
-#[cfg(test)]
-fn fail_once_at(point: FailurePoint) -> FailureGuard {
+/// Makes the next `point` on this thread fail once.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn fail_once_at(point: FailurePoint) -> FailureGuard {
     FAILURE_POINT.with(|slot| slot.set(Some(point)));
     FailureGuard
 }
 
-fn parent_dir(path: &Path) -> &Path {
+pub fn parent_dir(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn open_regular(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
+pub fn open_nofollow(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .read(true)
         // Avoid blocking on a FIFO if another same-UID process swaps the
         // pathname before metadata can reject the non-regular file.
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
+        .open(path)
+}
+
+/// Reads `file` (whose metadata length is `len`); `None` if it exceeds
+/// `max_bytes` before or during the read.
+pub fn read_limited(file: File, len: u64, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
+    if len > max_bytes {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= max_bytes).then_some(bytes))
+}
+
+fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
+    let file = open_nofollow(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{} is not a regular file", path.display()),
         ));
     }
-    Ok(file)
-}
-
-fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
-    let file = open_regular(path)?;
-    let metadata = file.metadata()?;
-    if metadata.len() > MAX_CONFIG_BYTES {
-        return Err(io::Error::new(
+    read_limited(file, metadata.len(), MAX_CONFIG_BYTES)?.ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::InvalidData,
             format!("config {} exceeds {MAX_CONFIG_BYTES} bytes", path.display()),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_CONFIG_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("config {} exceeds {MAX_CONFIG_BYTES} bytes", path.display()),
-        ));
-    }
-    Ok(bytes)
+        )
+    })
 }
 
-fn write_all(file: &mut File, bytes: &[u8]) -> io::Result<()> {
-    #[cfg(test)]
-    if take_failure(FailurePoint::Write) {
-        return Err(io::Error::other("injected config write failure"));
-    }
-    file.write_all(bytes)
-}
-
-fn sync_file(file: &File) -> io::Result<()> {
-    #[cfg(test)]
-    if take_failure(FailurePoint::FileSync) {
-        return Err(io::Error::other("injected config file sync failure"));
-    }
-    file.sync_all()
-}
-
-fn rename(from: &Path, to: &Path) -> io::Result<()> {
-    #[cfg(test)]
+pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "fault-injection"))]
     if take_failure(FailurePoint::Rename) {
-        return Err(io::Error::other("injected config rename failure"));
+        return Err(io::Error::other("injected rename failure"));
     }
     fs::rename(from, to)
 }
@@ -200,7 +188,8 @@ fn sibling_candidate(base: &Path, suffix: u64) -> io::Result<PathBuf> {
     Ok(base.with_file_name(candidate))
 }
 
-fn create_unique_sibling(base: &Path) -> io::Result<(PathBuf, File)> {
+/// Exclusively creates `base`, or `base.N` if taken, as a private file.
+pub fn create_unique_sibling(base: &Path) -> io::Result<(PathBuf, File)> {
     for suffix in 0..10_000_u64 {
         let candidate = sibling_candidate(base, suffix)?;
         let file = OpenOptions::new()
@@ -237,29 +226,47 @@ fn backup_destination(base: &Path) -> io::Result<PathBuf> {
     ))
 }
 
+/// Writes `bytes`, forces mode 0600 and fsyncs. Never unlink a failed
+/// candidate by pathname: a concurrent writer could have replaced that name
+/// before cleanup, turning cleanup into data loss.
+pub fn write_private(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(any(test, feature = "fault-injection"))]
+    if take_failure(FailurePoint::Write) {
+        return Err(io::Error::other("injected write failure"));
+    }
+    file.write_all(bytes)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    #[cfg(any(test, feature = "fault-injection"))]
+    if take_failure(FailurePoint::FileSync) {
+        return Err(io::Error::other("injected file sync failure"));
+    }
+    file.sync_all()
+}
+
 fn write_unique_sibling(base: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     let (candidate, mut file) = create_unique_sibling(base)?;
-    let result = (|| {
-        write_all(&mut file, bytes)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        sync_file(&file)
-    })();
-    drop(file);
-    // Do not unlink by pathname after failure: a concurrent writer could have
-    // replaced that name before cleanup, turning cleanup into data loss.
-    result?;
+    write_private(&mut file, bytes)?;
     Ok(candidate)
 }
 
-fn sync_parent(path: &Path) -> io::Result<()> {
-    #[cfg(test)]
+pub fn sync_parent(path: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "fault-injection"))]
     if take_failure(FailurePoint::ParentSync) {
-        return Err(io::Error::other("injected config parent sync failure"));
+        return Err(io::Error::other("injected parent sync failure"));
     }
     File::open(parent_dir(path))?.sync_all()
 }
 
-fn temp_base(path: &Path) -> PathBuf {
+/// Copies unparseable bytes to a fresh private `<name>.json.corrupt[.N]`
+/// beside `path` and syncs the directory.
+pub fn preserve_corrupt(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    let corrupt = write_unique_sibling(&path.with_extension("json.corrupt"), bytes)?;
+    sync_parent(path)?;
+    Ok(corrupt)
+}
+
+/// Unique hidden temp name beside `path`, for `create_unique_sibling`.
+pub fn temp_base(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -275,15 +282,17 @@ fn temp_base(path: &Path) -> PathBuf {
     ))
 }
 
-fn reject_unexpected_config_path(path: &Path) -> io::Result<bool> {
+/// `Ok(false)` if `path` is missing, `Ok(true)` if it is a regular file, and
+/// an error naming it as `label` if it is a symlink or anything else.
+pub fn reject_unexpected_path(path: &Path, label: &str) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("config path {} is a symlink", path.display()),
+            format!("{label} path {} is a symlink", path.display()),
         )),
         Ok(metadata) if !metadata.is_file() => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("config path {} is not a regular file", path.display()),
+            format!("{label} path {} is not a regular file", path.display()),
         )),
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -306,7 +315,7 @@ impl Config {
     }
 
     pub fn load_or_default(path: &Path) -> Result<Self, ConfigError> {
-        if !reject_unexpected_config_path(path)? {
+        if !reject_unexpected_path(path, "config")? {
             let cfg = Self::default();
             cfg.save(path)?;
             return Ok(cfg);
@@ -316,13 +325,7 @@ impl Config {
             Ok(cfg) => Ok(cfg),
             Err(ConfigError::Json(_)) => {
                 // Syntax corruption: preserve the original before replacing it.
-                let corrupt_base = path.with_extension("json.corrupt");
-                let _corrupt = write_unique_sibling(&corrupt_base, &bytes)
-                    .and_then(|corrupt| {
-                        sync_parent(path)?;
-                        Ok(corrupt)
-                    })
-                    .map_err(ConfigError::Preservation)?;
+                preserve_corrupt(path, &bytes).map_err(ConfigError::Preservation)?;
                 let cfg = Self::default();
                 cfg.save(path)?;
                 Ok(cfg)
@@ -354,7 +357,7 @@ impl Config {
         self.validate()?;
         let parent = parent_dir(path);
         fs::create_dir_all(parent)?;
-        let had_existing = reject_unexpected_config_path(path)?;
+        let had_existing = reject_unexpected_path(path, "config")?;
         if had_existing {
             let current = read_regular(path)?;
             let backup_base = path.with_extension("json.bak");
@@ -558,43 +561,28 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_file_reseeds() {
+    fn corrupt_file_is_reseeded_and_preserved_without_overwriting_older_samples() {
         let path = tmp_path("corrupt");
-        fs::write(&path, b"{not json!!!").unwrap();
+        let first = b"{not json!!!";
+        fs::write(&path, first).unwrap();
         let cfg = Config::load_or_default(&path).unwrap();
         assert_eq!(cfg.profiles.len(), 3);
-        assert!(path.with_extension("json.corrupt").exists());
+        let corrupt = path.with_extension("json.corrupt");
+        assert_eq!(fs::read(&corrupt).unwrap(), first);
         assert_eq!(
-            fs::metadata(path.with_extension("json.corrupt"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
+            fs::metadata(&corrupt).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(path.with_extension("json.corrupt"));
-    }
 
-    #[test]
-    fn corrupt_preservation_skips_existing_sibling_without_overwriting_bytes() {
-        let path = tmp_path("corrupt-preservation-failure");
-        let original = b"{not json!!!";
-        fs::write(&path, original).unwrap();
-        let existing = path.with_extension("json.corrupt");
-        fs::write(&existing, b"keep this old sample").unwrap();
+        // A second corruption must not overwrite the sample already kept.
+        let second = b"{still not json";
+        fs::write(&path, second).unwrap();
         Config::load_or_default(&path).unwrap();
-        assert_eq!(fs::read(existing).unwrap(), b"keep this old sample");
+        assert_eq!(fs::read(&corrupt).unwrap(), first);
+        let numbered = path.with_extension("json.corrupt.1");
+        assert_eq!(fs::read(&numbered).unwrap(), second);
         assert_eq!(
-            fs::read(path.with_extension("json.corrupt.1")).unwrap(),
-            original
-        );
-        assert_eq!(
-            fs::metadata(path.with_extension("json.corrupt.1"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
+            fs::metadata(&numbered).unwrap().permissions().mode() & 0o777,
             0o600
         );
         assert!(Config::load(&path).is_ok());
@@ -649,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn add_rename_remove_custom() {
+    fn custom_profile_lifecycle() {
         let mut cfg = Config::default();
         let p = cfg.add_custom();
         assert_eq!(p.name, "Custom 1");
@@ -658,40 +646,22 @@ mod tests {
         assert!(cfg.rename(&id, "Gaming"));
         assert_eq!(cfg.find(&id).unwrap().name, "Gaming");
         assert!(!cfg.rename("balanced", "Nope"));
-        assert!(cfg.remove(&id));
         assert!(!cfg.remove("silent"));
-        assert_eq!(cfg.active_profile, "balanced");
-    }
 
-    #[test]
-    fn custom_ids_stay_unique_after_deletion() {
-        let mut cfg = Config::default();
+        // Removing a profile repairs remembered references to it.
+        cfg.last_profile_on_ac = id.clone();
+        cfg.last_profile_on_battery = id.clone();
+        assert!(cfg.remove(&id));
+        assert_eq!(cfg.active_profile, "balanced");
+        assert_eq!(cfg.last_profile_on_ac, "balanced");
+        assert_eq!(cfg.last_profile_on_battery, "balanced");
+
+        // Ids stay unique: a freed id is reused, a live one is not.
         let first = cfg.add_custom().id.clone();
         let second = cfg.add_custom().id.clone();
         cfg.remove(&first);
         assert_eq!(cfg.add_custom().id, first);
         assert_ne!(first, second);
-    }
-
-    #[test]
-    fn removing_profile_repairs_remembered_references() {
-        let mut cfg = Config::default();
-        let id = cfg.add_custom().id.clone();
-        cfg.last_profile_on_ac = id.clone();
-        cfg.last_profile_on_battery = id.clone();
-        assert!(cfg.remove(&id));
-        assert_eq!(cfg.last_profile_on_ac, "balanced");
-        assert_eq!(cfg.last_profile_on_battery, "balanced");
-    }
-
-    #[test]
-    fn fixed_temp_collision_is_not_reused_or_overwritten() {
-        let path = tmp_path("temp-collision");
-        let stale = path.with_extension("json.tmp");
-        fs::write(&stale, b"keep me").unwrap();
-        Config::default().save(&path).unwrap();
-        assert_eq!(fs::read(stale).unwrap(), b"keep me");
-        assert!(Config::load(&path).is_ok());
     }
 
     #[test]

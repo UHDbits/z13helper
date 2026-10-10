@@ -1,16 +1,21 @@
 //! z13helper — G-Helper-style control panel for z13helperd.
 mod app;
+mod controller;
 mod css;
+mod curve_editor;
+mod fans_window;
 mod gamescope;
+mod hud;
+mod main_window;
+mod power;
 mod profile_coordinator;
-mod resources;
-mod services;
-mod ui;
+mod subscribe;
+mod sync;
+mod worker;
 
 use gtk4::prelude::*;
 use libadwaita as adw;
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::cell::{Cell, OnceCell};
 
 const APPLICATION_ID: &str = "com.ashtonantila.z13helper";
 
@@ -22,22 +27,20 @@ fn main() {
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::PreferDark);
     }
     app.connect_startup(|_| {
-        resources::register();
+        gio::resources_register_include!("z13helper.gresource")
+            .expect("embedded z13helper resources must be valid");
+        if let Some(display) = gtk4::gdk::Display::default() {
+            gtk4::IconTheme::for_display(&display)
+                .add_resource_path("/com/ashtonantila/z13helper/icons");
+        }
         css::install();
     });
     install_standard_actions(&app);
-    let state = Rc::new(RefCell::new(None));
-    let first_activation = Rc::new(Cell::new(true));
+    let state = OnceCell::new();
+    let first_activation = Cell::new(true);
     let start_hidden = std::env::var_os("Z13HELPER_START_HIDDEN").is_some();
     app.connect_activate(move |app| {
-        let state = state
-            .borrow_mut()
-            .get_or_insert_with(|| {
-                let state = app::AppState::new(app);
-                services::power::start(&state);
-                state
-            })
-            .clone();
+        let state = state.get_or_init(|| app::AppState::new(app));
         let show = !start_hidden || !first_activation.replace(false);
         state.activate(show);
     });

@@ -23,12 +23,6 @@ pub struct ApplyToken {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ApplyRequest {
-    Started(ApplyToken),
-    Queued,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplyCompletion {
     pub current: bool,
     pub next: Option<ApplyToken>,
@@ -40,12 +34,11 @@ pub struct ProfileCoordinator {
     active_id: String,
     editing_id: String,
     editing_epoch: u64,
-    config_revision: u64,
     profile_revisions: HashMap<String, u64>,
     operation_serials: HashMap<String, u64>,
     next_serial: u64,
     applying: Option<ApplyToken>,
-    pending_apply: Option<ApplyToken>,
+    pending_apply: bool,
 }
 
 impl ProfileCoordinator {
@@ -65,12 +58,11 @@ impl ProfileCoordinator {
             active_id,
             editing_id,
             editing_epoch: 0,
-            config_revision: 0,
             profile_revisions,
             operation_serials: HashMap::new(),
             next_serial: 0,
             applying: None,
-            pending_apply: None,
+            pending_apply: false,
         }
     }
 
@@ -87,7 +79,6 @@ impl ProfileCoordinator {
             return false;
         }
         self.active_id = id.into();
-        self.config_revision = self.config_revision.wrapping_add(1);
         true
     }
 
@@ -97,12 +88,7 @@ impl ProfileCoordinator {
         }
         self.editing_id = id.into();
         self.editing_epoch = self.editing_epoch.wrapping_add(1);
-        self.config_revision = self.config_revision.wrapping_add(1);
         true
-    }
-
-    pub fn mark_config_changed(&mut self) {
-        self.config_revision = self.config_revision.wrapping_add(1);
     }
 
     pub fn mark_profile_changed(&mut self, id: &str) -> bool {
@@ -110,13 +96,11 @@ impl ProfileCoordinator {
             return false;
         };
         *revision = revision.wrapping_add(1);
-        self.config_revision = self.config_revision.wrapping_add(1);
         true
     }
 
     pub fn add_profile(&mut self, id: &str) {
         self.profile_revisions.entry(id.into()).or_insert(0);
-        self.config_revision = self.config_revision.wrapping_add(1);
     }
 
     pub fn remove_profile(
@@ -136,7 +120,6 @@ impl ProfileCoordinator {
             self.editing_id = fallback_editing.into();
             self.editing_epoch = self.editing_epoch.wrapping_add(1);
         }
-        self.config_revision = self.config_revision.wrapping_add(1);
         true
     }
 
@@ -184,15 +167,16 @@ impl ProfileCoordinator {
         }
     }
 
-    pub fn request_apply(&mut self, on_battery: bool) -> ApplyRequest {
-        let token = self.new_apply_token(on_battery);
+    /// Start an apply, or return `None` after queueing it behind the one in
+    /// flight. A queued request is rebuilt from current state on completion.
+    pub fn request_apply(&mut self, on_battery: bool) -> Option<ApplyToken> {
         if self.applying.is_some() {
-            self.pending_apply = Some(token);
-            ApplyRequest::Queued
-        } else {
-            self.applying = Some(token.clone());
-            ApplyRequest::Started(token)
+            self.pending_apply = true;
+            return None;
         }
+        let token = self.new_apply_token(on_battery);
+        self.applying = Some(token.clone());
+        Some(token)
     }
 
     pub fn is_current_apply(&self, token: &ApplyToken, on_battery: bool) -> bool {
@@ -214,11 +198,8 @@ impl ProfileCoordinator {
         }
         self.applying = None;
         let current = self.is_current_apply(token, on_battery);
-        let pending = self.pending_apply.take();
-        let had_pending = pending.is_some();
-        let next = pending
-            .filter(|pending| self.is_current_apply(pending, on_battery))
-            .or_else(|| (had_pending || !current).then(|| self.new_apply_token(on_battery)));
+        let had_pending = std::mem::take(&mut self.pending_apply);
+        let next = (had_pending || !current).then(|| self.new_apply_token(on_battery));
         if let Some(next) = next.as_ref() {
             self.applying = Some(next.clone());
         }
@@ -228,7 +209,7 @@ impl ProfileCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplyRequest, ProfileCoordinator};
+    use super::ProfileCoordinator;
 
     fn coordinator() -> ProfileCoordinator {
         ProfileCoordinator::new("a".into(), ["a".into(), "b".into(), "custom".into()])
@@ -266,14 +247,11 @@ mod tests {
     #[test]
     fn newest_apply_wins_while_started_work_finishes() {
         let mut coordinator = coordinator();
-        let ApplyRequest::Started(first) = coordinator.request_apply(false) else {
+        let Some(first) = coordinator.request_apply(false) else {
             panic!("first apply must start")
         };
         assert!(coordinator.activate("b"));
-        assert!(matches!(
-            coordinator.request_apply(false),
-            ApplyRequest::Queued
-        ));
+        assert!(coordinator.request_apply(false).is_none());
         let completion = coordinator.complete_apply(&first, false);
         let next = completion.next.expect("newest apply should be scheduled");
         assert_eq!(next.id, "b");

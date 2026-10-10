@@ -1,6 +1,6 @@
 //! Fail-closed hardware apply sequencing.
 
-use crate::curve::{Curve, HIGH_POWER_THRESHOLD_W};
+use crate::curve::{Curve, fan_protection_required};
 use crate::error::DaemonError;
 use crate::profile::{FanControlMode, stock_fan_curves};
 use crate::protocol::{ApplyRequest, TdpState};
@@ -20,6 +20,8 @@ pub trait Daemon {
         effective_pl1: u32,
     ) -> Result<(), DaemonError>;
     fn fans_release(&mut self) -> Result<(), DaemonError>;
+    /// PL1 the hardware is running at now.
+    fn current_pl1(&self) -> Result<u32, DaemonError>;
     fn cpu_temp_limit_set(&mut self, temperature_c: u8) -> Result<(), DaemonError>;
     fn undervolt_set(&mut self, cpu_co: i32) -> Result<(), DaemonError>;
     fn undervolt_available(&self) -> bool;
@@ -31,15 +33,17 @@ fn selected_curves(request: &ApplyRequest) -> [Curve; 2] {
         .unwrap_or_else(|| stock_fan_curves(request.ppd_profile.as_deref()))
 }
 
-fn set_fans(
-    daemon: &mut impl Daemon,
-    request: &ApplyRequest,
-    curves: &[Curve; 2],
-    pl1: u32,
-) -> Result<(), DaemonError> {
+/// Write the request's fans for the PL1 they will run under: the request's
+/// own PPT, or the hardware's current PL1 when the request leaves PPT alone.
+pub fn set_fans(daemon: &mut impl Daemon, request: &ApplyRequest) -> Result<(), DaemonError> {
+    let curves = selected_curves(request);
+    let pl1 = match request.effective_pl1() {
+        Some(pl1) => pl1,
+        None => daemon.current_pl1()?,
+    };
     match request.fan_mode {
-        FanControlMode::Firmware => daemon.firmware_fans_set(curves, pl1),
-        FanControlMode::Direct => daemon.direct_fans_set(curves, pl1),
+        FanControlMode::Firmware => daemon.firmware_fans_set(&curves, pl1),
+        FanControlMode::Direct => daemon.direct_fans_set(&curves, pl1),
     }
 }
 
@@ -59,11 +63,12 @@ pub fn apply_request(
         warnings.push(warning);
     }
 
-    let pl1 = request.effective_pl1();
     let limits = request.effective_power_limits();
-    let curves = selected_curves(request);
-    if pl1 >= HIGH_POWER_THRESHOLD_W && !request.disable_high_power_fan_protection {
-        set_fans(daemon, request, &curves, pl1)?;
+    if request
+        .effective_pl1()
+        .is_some_and(|pl1| fan_protection_required(pl1, request.disable_high_power_fan_protection))
+    {
+        set_fans(daemon, request)?;
         if let Some(limits) = limits {
             daemon.tdp_set(limits)?;
         }
@@ -72,7 +77,7 @@ pub fn apply_request(
             daemon.tdp_set(limits)?;
         }
         if request.fan_curves.is_some() {
-            set_fans(daemon, request, &curves, pl1)?;
+            set_fans(daemon, request)?;
         } else {
             daemon.fans_release()?;
         }
@@ -104,6 +109,7 @@ mod tests {
         calls: RefCell<Vec<String>>,
         fail_at: Option<&'static str>,
         uv: bool,
+        pl1: u32,
     }
 
     impl RecordingDaemon {
@@ -130,14 +136,17 @@ mod tests {
                 limits.pl1_spl, limits.pl2_sppt, limits.fppt, limits.apu_sppt, limits.platform_sppt
             ))
         }
-        fn firmware_fans_set(&mut self, _: &[Curve; 2], _: u32) -> Result<(), DaemonError> {
-            self.call("firmware-fans")
+        fn firmware_fans_set(&mut self, _: &[Curve; 2], pl1: u32) -> Result<(), DaemonError> {
+            self.call(format!("firmware-fans:{pl1}"))
         }
-        fn direct_fans_set(&mut self, _: &[Curve; 2], _: u32) -> Result<(), DaemonError> {
-            self.call("direct-fans")
+        fn direct_fans_set(&mut self, _: &[Curve; 2], pl1: u32) -> Result<(), DaemonError> {
+            self.call(format!("direct-fans:{pl1}"))
         }
         fn fans_release(&mut self) -> Result<(), DaemonError> {
             self.call("fans-release")
+        }
+        fn current_pl1(&self) -> Result<u32, DaemonError> {
+            Ok(self.pl1)
         }
         fn cpu_temp_limit_set(&mut self, temperature_c: u8) -> Result<(), DaemonError> {
             self.call(format!("cpu-temp:{temperature_c}"))
@@ -165,7 +174,10 @@ mod tests {
         let mut daemon = RecordingDaemon::default();
         apply_request(&mut daemon, &request(80)).unwrap();
         let calls = daemon.calls.borrow();
-        let fan = calls.iter().position(|v| v == "firmware-fans").unwrap();
+        let fan = calls
+            .iter()
+            .position(|v| v.starts_with("firmware-fans:"))
+            .unwrap();
         let tdp = calls.iter().position(|v| v.starts_with("tdp:")).unwrap();
         assert!(fan < tdp);
     }
@@ -212,7 +224,20 @@ mod tests {
         apply_request(&mut daemon, &request).unwrap();
         let calls = daemon.calls.into_inner();
         assert!(calls.iter().any(|call| call == "fans-release"));
-        assert!(!calls.iter().any(|call| call == "firmware-fans"));
+        assert!(!calls.iter().any(|call| call.starts_with("firmware-fans:")));
+    }
+
+    #[test]
+    fn fans_without_ppt_follow_the_current_hardware_pl1() {
+        let mut request = request(60);
+        request.ppd_profile = None;
+        request.power_limits = None;
+        let mut daemon = RecordingDaemon {
+            pl1: 90,
+            ..Default::default()
+        };
+        apply_request(&mut daemon, &request).unwrap();
+        assert_eq!(daemon.calls.into_inner(), ["ppd:off", "firmware-fans:90"]);
     }
 
     #[test]
@@ -220,7 +245,10 @@ mod tests {
         let mut daemon = RecordingDaemon::default();
         apply_request(&mut daemon, &request(60)).unwrap();
         let calls = daemon.calls.borrow();
-        let fan = calls.iter().position(|v| v == "firmware-fans").unwrap();
+        let fan = calls
+            .iter()
+            .position(|v| v.starts_with("firmware-fans:"))
+            .unwrap();
         let tdp = calls.iter().position(|v| v.starts_with("tdp:")).unwrap();
         assert!(tdp < fan);
     }
@@ -245,34 +273,20 @@ mod tests {
     }
 
     #[test]
-    fn ppd_runs_and_stock_releases_fans() {
-        let profile = Profile::builtin("balanced", "Balanced");
-        let request = ApplyRequest::from_profile(&profile, false);
-        let mut daemon = RecordingDaemon::default();
-        apply_request(&mut daemon, &request).unwrap();
-        assert_eq!(
-            daemon.calls.into_inner(),
-            ["ppd:balanced", "tdp:52/71/70/70/70", "fans-release"]
-        );
-    }
-
-    #[test]
-    fn stock_profiles_write_distinct_power_tables() {
-        for (id, expected) in [
-            ("silent", "tdp:40/55/55/70/70"),
-            ("balanced", "tdp:52/71/70/70/70"),
-            ("turbo", "tdp:70/86/86/70/70"),
+    fn stock_profiles_run_ppd_write_distinct_power_tables_and_release_fans() {
+        for (id, ppd, tdp) in [
+            ("silent", "power-saver", "tdp:40/55/55/70/70"),
+            ("balanced", "balanced", "tdp:52/71/70/70/70"),
+            ("turbo", "performance", "tdp:70/86/86/70/70"),
         ] {
             let profile = Profile::builtin(id, id);
             let request = ApplyRequest::from_profile(&profile, false);
             let mut daemon = RecordingDaemon::default();
             apply_request(&mut daemon, &request).unwrap();
-            assert!(
-                daemon
-                    .calls
-                    .into_inner()
-                    .iter()
-                    .any(|call| call == expected)
+            assert_eq!(
+                daemon.calls.into_inner(),
+                [format!("ppd:{ppd}").as_str(), tdp, "fans-release"],
+                "{id}"
             );
         }
     }

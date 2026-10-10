@@ -5,7 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use z13helper_core::curve::{Curve, validate};
-use z13helper_core::protocol::{BatteryTelemetry, TdpState};
+use z13helper_core::protocol::{
+    BatteryTelemetry, TdpState, validate_cpu_temp_limit, validate_undervolt,
+};
 
 const STRIX_HALO_TCTL_COMMAND: u32 = 0x19;
 const STRIX_HALO_CHTC_COMMAND: u32 = 0x63;
@@ -179,18 +181,21 @@ impl Sysfs {
         Ok(curves)
     }
 
-    pub fn battery_limit(&self) -> Result<i32, String> {
+    fn battery_threshold_path(&self) -> Result<PathBuf, String> {
         let directory = self.path("/sys/class/power_supply");
         for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
             let path = entry.path().join("charge_control_end_threshold");
             if entry.file_name().to_string_lossy().starts_with("BAT") && path.exists() {
-                return self
-                    .read_text(path)?
-                    .parse()
-                    .map_err(|error| format!("parse battery limit: {error}"));
+                return Ok(path);
             }
         }
         Err("battery charge threshold not found".into())
+    }
+
+    pub fn battery_limit(&self) -> Result<i32, String> {
+        self.read_text(self.battery_threshold_path()?)?
+            .parse()
+            .map_err(|error| format!("parse battery limit: {error}"))
     }
 
     pub fn battery_telemetry(&self) -> Result<BatteryTelemetry, String> {
@@ -251,13 +256,18 @@ impl Sysfs {
             .map_err(|error| format!("read {}: {error}", directory.display()))?
             .flatten()
         {
-            let kind = self.read_text(entry.path().join("type"))?;
-            if kind != "Mains" && kind != "ADP" {
+            // Entries (e.g. UCSI ports) can vanish mid-scan; skip unreadable ones.
+            let Ok(kind) = self.read_text(entry.path().join("type")) else {
+                continue;
+            };
+            if kind != "Mains" {
                 continue;
             }
+            let Ok(online) = self.read_text(entry.path().join("online")) else {
+                continue;
+            };
             found_adapter = true;
-            let online = self
-                .read_text(entry.path().join("online"))?
+            let online = online
                 .parse::<u8>()
                 .map_err(|error| format!("parse adapter online state: {error}"))?;
             if online == 1 {
@@ -272,10 +282,16 @@ impl Sysfs {
             .map_err(|error| format!("read {}: {error}", directory.display()))?
             .flatten()
         {
-            if self.read_text(entry.path().join("type"))? != "Battery" {
+            // Peripheral (HID) batteries report scope "Device", not the system.
+            if self.read_text(entry.path().join("type")).as_deref() != Ok("Battery")
+                || self.read_text(entry.path().join("scope")).as_deref() == Ok("Device")
+            {
                 continue;
             }
-            return Ok(self.read_text(entry.path().join("status"))? == "Discharging");
+            let Ok(status) = self.read_text(entry.path().join("status")) else {
+                continue;
+            };
+            return Ok(status == "Discharging");
         }
         Err("power source not found".into())
     }
@@ -284,39 +300,27 @@ impl Sysfs {
         if !(40..=100).contains(&limit) {
             return Err("battery limit must be between 40 and 100".into());
         }
-        let directory = self.path("/sys/class/power_supply");
-        for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
-            let path = entry.path().join("charge_control_end_threshold");
-            if entry.file_name().to_string_lossy().starts_with("BAT") && path.exists() {
-                return self.write_text(path, limit);
-            }
-        }
-        Err("battery charge threshold not found".into())
+        self.write_text(self.battery_threshold_path()?, limit)
     }
 
-    fn armoury_attribute(&self, name: &str) -> PathBuf {
-        self.path("/sys/class/firmware-attributes/asus-armoury/attributes")
-            .join(name)
-            .join("current_value")
+    fn panel_overdrive_path(&self) -> PathBuf {
+        self.path(
+            "/sys/class/firmware-attributes/asus-armoury/attributes/panel_overdrive/current_value",
+        )
     }
 
-    pub fn read_armoury_bool(&self, name: &str) -> Result<i32, String> {
-        self.read_text(self.armoury_attribute(name))?
+    pub fn read_panel_overdrive(&self) -> Result<i32, String> {
+        self.read_text(self.panel_overdrive_path())?
             .parse()
-            .map_err(|error| format!("parse {name}: {error}"))
+            .map_err(|error| format!("parse panel_overdrive: {error}"))
     }
 
-    pub fn set_armoury_bool(&self, name: &str, enabled: bool) -> Result<(), String> {
-        self.write_text(self.armoury_attribute(name), i32::from(enabled))
+    pub fn set_panel_overdrive(&self, enabled: bool) -> Result<(), String> {
+        self.write_text(self.panel_overdrive_path(), i32::from(enabled))
     }
 
     fn smu_path(&self, name: &str) -> PathBuf {
         self.path("/sys/kernel/ryzen_smu_drv").join(name)
-    }
-
-    fn send_smu_co(&self, offset: i32) -> Result<(), String> {
-        let args = encode_smu_co(offset)?;
-        self.send_smu_command(0x4C, args, "Curve Optimizer")
     }
 
     fn send_smu_command(
@@ -338,11 +342,11 @@ impl Sysfs {
     }
 
     pub fn probe_undervolt_once(&self) -> bool {
-        self.smu_path("mp1_smu_cmd").exists() && self.send_smu_co(0).is_ok()
+        self.smu_path("mp1_smu_cmd").exists() && self.set_undervolt(0).is_ok()
     }
 
     pub fn set_undervolt(&self, offset: i32) -> Result<(), String> {
-        self.send_smu_co(offset)
+        self.send_smu_command(0x4C, encode_smu_co(offset)?, "Curve Optimizer")
     }
 
     pub fn set_cpu_temp_limit(&self, temperature_c: u8) -> Result<(), String> {
@@ -485,22 +489,15 @@ fn battery_health_percent(full: u64, design: u64) -> Option<u8> {
 }
 
 fn encode_smu_co(offset: i32) -> Result<[u8; 24], String> {
-    if !(-40..=0).contains(&offset) {
-        return Err("Curve Optimizer offset must be between -40 and 0".into());
-    }
-    let encoded = 0x10_0000u32.saturating_sub(offset.unsigned_abs());
-    let mut args = [0u8; 24];
-    args[..4].copy_from_slice(&encoded.to_le_bytes());
-    Ok(args)
+    validate_undervolt(offset)?;
+    Ok(encode_smu_u32(
+        0x10_0000u32.saturating_sub(offset.unsigned_abs()),
+    ))
 }
 
 fn encode_smu_temp_limit(temperature_c: u8) -> Result<[u8; 24], String> {
-    if !(80..=99).contains(&temperature_c) {
-        return Err("APU temperature limit must be between 80 and 99°C".into());
-    }
-    let mut args = [0u8; 24];
-    args[..4].copy_from_slice(&u32::from(temperature_c).to_le_bytes());
-    Ok(args)
+    validate_cpu_temp_limit(temperature_c)?;
+    Ok(encode_smu_u32(u32::from(temperature_c)))
 }
 
 fn encode_smu_u32(value: u32) -> [u8; 24] {
@@ -524,19 +521,12 @@ fn decode_smu_f32(table: &[u8], offset: usize, name: &str) -> Result<f32, String
 }
 
 fn decode_strix_halo_tctl(table: &[u8]) -> Result<u8, String> {
-    let end = STRIX_HALO_TCTL_PM_TABLE_OFFSET + size_of::<f32>();
-    let bytes: [u8; 4] = table
-        .get(STRIX_HALO_TCTL_PM_TABLE_OFFSET..end)
-        .ok_or_else(|| "SMU PM table is too short to verify the APU temperature limit".to_string())?
-        .try_into()
-        .expect("slice length was checked above");
-    let temperature = f32::from_le_bytes(bytes);
-    if !temperature.is_finite() || !(0.0..=255.0).contains(&temperature) {
-        return Err(format!(
-            "SMU PM table returned invalid Tctl limit {temperature}"
-        ));
-    }
-    Ok(temperature.round() as u8)
+    decode_smu_f32(
+        table,
+        STRIX_HALO_TCTL_PM_TABLE_OFFSET,
+        "APU temperature limit",
+    )
+    .map(|temperature| temperature.round() as u8)
 }
 
 #[cfg(test)]
@@ -601,19 +591,29 @@ mod tests {
     }
 
     #[test]
-    fn reads_power_source_from_adapter_and_falls_back_to_battery_status() {
+    fn power_source_skips_vanished_entries_and_peripheral_batteries() {
         let source_root = root();
-        let adapter = source_root.join("class/power_supply/AC0");
+        let supplies = source_root.join("class/power_supply");
+        // A UCSI entry removed between read_dir and reading its `type`.
+        fs::create_dir_all(supplies.join("ucsi-source-psy-USBC000:001")).unwrap();
+        let adapter = supplies.join("ACAD");
         fs::create_dir_all(&adapter).unwrap();
         fs::write(adapter.join("type"), "Mains\n").unwrap();
-        fs::write(adapter.join("online"), "1\n").unwrap();
-        assert!(!Sysfs::new(&source_root).on_battery().unwrap());
         fs::write(adapter.join("online"), "0\n").unwrap();
         assert!(Sysfs::new(&source_root).on_battery().unwrap());
+        fs::write(adapter.join("online"), "1\n").unwrap();
+        assert!(!Sysfs::new(&source_root).on_battery().unwrap());
         let _ = fs::remove_dir_all(&source_root);
 
         let source_root = root();
-        let battery = source_root.join("class/power_supply/BAT0");
+        let supplies = source_root.join("class/power_supply");
+        let stylus = supplies.join("hid-0018:0B05:0001.0001-battery");
+        fs::create_dir_all(&stylus).unwrap();
+        fs::write(stylus.join("type"), "Battery\n").unwrap();
+        fs::write(stylus.join("scope"), "Device\n").unwrap();
+        fs::write(stylus.join("status"), "Discharging\n").unwrap();
+        assert!(Sysfs::new(&source_root).on_battery().is_err());
+        let battery = supplies.join("BAT0");
         fs::create_dir_all(&battery).unwrap();
         fs::write(battery.join("type"), "Battery\n").unwrap();
         fs::write(battery.join("status"), "Charging\n").unwrap();

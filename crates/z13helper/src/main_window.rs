@@ -7,16 +7,39 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use z13helper_core::label::mode_label;
-use z13helper_core::{DaemonError, LightingState, WireStatus};
+use z13helper_core::{Command, DaemonError, LightingState, WireStatus};
 
 use crate::app::AppState;
-use crate::services::worker;
-use crate::ui::fans_window;
-use crate::ui::sync::SyncGuard;
+use crate::fans_window;
+use crate::sync::SyncGuard;
+use crate::{power, worker};
 
 const MAIN_WINDOW_WIDTH: i32 = 368;
 const GAMESCOPE_MAIN_WINDOW_WIDTH: i32 = 320;
 const GAMESCOPE_COLOR_PICKER_HEIGHT: i32 = 500;
+
+/// One lighting-mode dropdown row. Row 0 is Off, which is sent as
+/// `enabled: false`; unknown daemon modes display as row 1 (Static).
+struct LightingMode {
+    label: &'static str,
+    wire: &'static str,
+    has_color: bool,
+    has_speed: bool,
+}
+
+#[rustfmt::skip]
+const LIGHTING_MODES: [LightingMode; 6] = [
+    LightingMode { label: "Off", wire: "static", has_color: false, has_speed: false },
+    LightingMode { label: "Static", wire: "static", has_color: true, has_speed: false },
+    LightingMode { label: "Breathe", wire: "breathe", has_color: true, has_speed: true },
+    LightingMode { label: "Cycle", wire: "cycle", has_color: false, has_speed: true },
+    LightingMode { label: "Rainbow", wire: "rainbow", has_color: false, has_speed: true },
+    LightingMode { label: "Strobe", wire: "strobe", has_color: true, has_speed: true },
+];
+
+/// Speed dropdown rows: (label, wire id). Unknown daemon speeds display as row 1.
+const LIGHTING_SPEEDS: [(&str, &str); 3] =
+    [("Slow", "slow"), ("Normal", "normal"), ("Fast", "fast")];
 
 pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     let gamescope_pages = state.gamescope.as_ref().map(|_| {
@@ -76,6 +99,9 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     content.set_margin_start(12);
     content.set_margin_end(12);
     let sync = SyncGuard::default();
+    // Setting writes queued or debouncing; telemetry snapshots taken before
+    // them are stale for the settings controls.
+    let pending_writes = Rc::new(Cell::new(0u32));
 
     // --- Performance Mode ---
     let mode_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -99,44 +125,40 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         .build();
     content.append(&mode_grid);
 
-    let mode_buttons: Rc<RefCell<Vec<(String, gtk::ToggleButton)>>> =
-        Rc::new(RefCell::new(Vec::new()));
-    let mut mode_group: Option<gtk::ToggleButton> = None;
-
-    for (index, (name, id, class)) in [
-        ("Silent", "silent", "silent"),
-        ("Balanced", "balanced", "balanced"),
-        ("Turbo", "turbo", "turbo"),
+    let mode_buttons: Rc<[(&'static str, gtk::ToggleButton)]> = [
+        ("Silent", "silent"),
+        ("Balanced", "balanced"),
+        ("Turbo", "turbo"),
     ]
     .into_iter()
     .enumerate()
-    {
+    .map(|(index, (name, id))| {
         let button = gtk::ToggleButton::with_label(name);
         button.add_css_class("mode-button");
-        button.add_css_class(class);
+        button.add_css_class(id);
         button.set_hexpand(true);
-        if let Some(group) = mode_group.as_ref() {
-            button.set_group(Some(group));
-        } else {
-            mode_group = Some(button.clone());
-        }
+        mode_grid.attach(&button, index as i32, 0, 1, 1);
+        (id, button)
+    })
+    .collect();
+    for (_, button) in &mode_buttons[1..] {
+        button.set_group(Some(&mode_buttons[0].1));
+    }
+    for &(id, ref button) in mode_buttons.iter() {
         let state_click = state.clone();
         let label = mode_label_w.clone();
         let buttons = mode_buttons.clone();
         let mode_sync = sync.clone();
-        let id_owned = id.to_string();
         button.connect_toggled(move |button| {
             if mode_sync.active() || !button.is_active() {
                 return;
             }
-            select_profile(&state_click, &id_owned);
+            power::select_profile(&state_click, id);
             label.set_label(&current_label(&state_click));
             mode_sync.run(|| {
                 refresh_active_buttons(&buttons, &state_click.config.borrow().active_profile)
             });
         });
-        mode_grid.attach(&button, index as i32, 0, 1, 1);
-        mode_buttons.borrow_mut().push((id.to_string(), button));
     }
 
     let fans = gtk::Button::with_label("Fans +\nPower");
@@ -185,7 +207,6 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
                 return glib::Propagation::Stop;
             }
             state.config.borrow_mut().panel_overdrive_always_on = enabled;
-            state.mark_config_changed();
             state.save_config();
             policy_row.set_subtitle(overdrive_policy_label(enabled));
             state.apply_panel_overdrive_policy();
@@ -201,6 +222,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         "lightbar",
         state,
         &sync,
+        &pending_writes,
         gamescope_pages.as_ref(),
     );
     let keyboard = lighting_section(
@@ -209,6 +231,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         "keyboard",
         state,
         &sync,
+        &pending_writes,
         gamescope_pages.as_ref(),
     );
     content.append(&lightbar.root);
@@ -256,7 +279,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     battery.append(&battery_charge);
     content.append(&battery);
 
-    install_battery_debounce(state, &limit, &sync);
+    install_battery_debounce(state, &limit, &sync, &pending_writes);
     let title_for_limit = batt_title.clone();
     let full_for_limit = full.clone();
     limit.connect_value_changed(move |scale| {
@@ -270,6 +293,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     let client = state.client.clone();
     let feedback = state.clone();
     let one_time_sync = sync.clone();
+    let one_time_pending = pending_writes.clone();
     let title_for_toggle = batt_title.clone();
     let limit_for_toggle = limit.clone();
     full.connect_toggled(move |button| {
@@ -284,9 +308,12 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         let button_done = button.clone();
         let title_done = title_for_toggle.clone();
         let sync_done = one_time_sync.clone();
+        let pending_done = one_time_pending.clone();
+        one_time_pending.set(one_time_pending.get() + 1);
         worker::blocking(
-            move || client.battery_one_time_charge_set(enabled),
+            move || client.send(Command::SetBatteryOneTimeCharge { enabled }),
             move |result| {
+                pending_done.set(pending_done.get() - 1);
                 if let Err(error) = result {
                     sync_done.run(|| {
                         sync_one_time_charge_button(
@@ -360,6 +387,7 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
             battery_status,
             lightbar: lightbar.view,
             keyboard: keyboard.view,
+            pending_writes,
         },
         mode: ModeView {
             label: mode_label_w,
@@ -369,7 +397,6 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
         banner: daemon_banner,
         sync,
     };
-    sync_once(state, &view);
     install_telemetry(state, view);
 
     window
@@ -394,6 +421,7 @@ struct SettingsView {
     battery_status: gtk::Label,
     lightbar: LightingView,
     keyboard: LightingView,
+    pending_writes: Rc<Cell<u32>>,
 }
 
 #[derive(Clone)]
@@ -401,6 +429,9 @@ struct LightingView {
     modes: gtk::DropDown,
     color: gtk::ColorDialogButton,
     speed: gtk::DropDown,
+    /// Last enabled daemon state; supplies the fields the GUI cannot edit.
+    lit: Rc<RefCell<LightingState>>,
+    pending_writes: Rc<Cell<u32>>,
 }
 
 struct LightingSection {
@@ -412,7 +443,7 @@ struct LightingSection {
 struct ModeView {
     label: gtk::Label,
     telemetry: gtk::Label,
-    buttons: Rc<RefCell<Vec<(String, gtk::ToggleButton)>>>,
+    buttons: Rc<[(&'static str, gtk::ToggleButton)]>,
 }
 
 impl MainView {
@@ -429,6 +460,9 @@ impl MainView {
 
 impl SettingsView {
     fn sync_from(&self, state: &AppState, daemon: &WireStatus) {
+        if self.pending_writes.get() != 0 {
+            return;
+        }
         let always_on = state.config.borrow().panel_overdrive_always_on;
         self.overdrive.set_active(always_on);
         self.overdrive.set_state(always_on);
@@ -468,28 +502,36 @@ impl SettingsView {
 }
 
 impl LightingView {
-    fn sync_from(&self, lighting: &z13helper_client::LightingState) {
-        let index = if !lighting.enabled {
-            0
-        } else {
-            match lighting.mode.as_str() {
-                "breathe" => 2,
-                "cycle" => 3,
-                "rainbow" => 4,
-                "strobe" => 5,
-                _ => 1,
-            }
-        };
-        self.modes.set_selected(index);
+    fn sync_from(&self, lighting: &LightingState) {
+        if lighting.enabled {
+            self.lit.replace(lighting.clone());
+        }
+        self.modes.set_selected(lighting_mode_index(lighting));
         if let Ok(color) = gtk::gdk::RGBA::parse(format!("#{}", lighting.color)) {
             self.color.set_rgba(&color);
         }
-        self.speed.set_selected(match lighting.speed.as_str() {
-            "slow" => 0,
-            "fast" => 2,
-            _ => 1,
-        });
+        self.speed
+            .set_selected(lighting_speed_index(&lighting.speed));
     }
+}
+
+fn lighting_mode_index(lighting: &LightingState) -> u32 {
+    if !lighting.enabled {
+        return 0;
+    }
+    LIGHTING_MODES
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, mode)| mode.wire == lighting.mode)
+        .map_or(1, |(index, _)| index as u32)
+}
+
+fn lighting_speed_index(wire: &str) -> u32 {
+    LIGHTING_SPEEDS
+        .iter()
+        .position(|&(_, speed)| speed == wire)
+        .unwrap_or(1) as u32
 }
 
 impl ModeView {
@@ -570,6 +612,7 @@ fn lighting_section(
     device: &'static str,
     state: &Rc<AppState>,
     sync: &SyncGuard,
+    pending_writes: &Rc<Cell<u32>>,
     gamescope_pages: Option<&gtk::Stack>,
 ) -> LightingSection {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -583,7 +626,7 @@ fn lighting_section(
     header.append(&heading);
     root.append(&header);
 
-    let mode_names = ["Off", "Static", "Breathe", "Cycle", "Rainbow", "Strobe"];
+    let mode_names = LIGHTING_MODES.map(|mode| mode.label);
     let modes = gtk::DropDown::from_strings(&mode_names);
     modes.set_valign(gtk::Align::Center);
     modes.set_hexpand(true);
@@ -607,7 +650,7 @@ fn lighting_section(
     let color_control = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     color_control.append(&color);
 
-    let speed_names = ["Slow", "Normal", "Fast"];
+    let speed_names = LIGHTING_SPEEDS.map(|(label, _)| label);
     let speed = gtk::DropDown::from_strings(&speed_names);
     speed.set_valign(gtk::Align::Center);
     speed.set_tooltip_text(Some("Animation speed"));
@@ -635,6 +678,12 @@ fn lighting_section(
         modes: modes.clone(),
         color: color.clone(),
         speed: speed.clone(),
+        lit: Rc::new(RefCell::new(LightingState {
+            color2: "000000".into(),
+            brightness: 3,
+            ..LightingState::default()
+        })),
+        pending_writes: pending_writes.clone(),
     };
 
     let color_control_c = color_control.clone();
@@ -643,10 +692,10 @@ fn lighting_section(
     let intent_state = state.clone();
     let intent_sync = sync.clone();
     modes.connect_selected_notify(move |drop| {
-        let mode = drop.selected();
-        // Off/cycle/rainbow hide color; Off/static hide speed.
-        color_control_c.set_visible(mode != 0 && mode != 3 && mode != 4);
-        speed_c.set_visible(mode != 0 && mode != 1);
+        if let Some(mode) = LIGHTING_MODES.get(drop.selected() as usize) {
+            color_control_c.set_visible(mode.has_color);
+            speed_c.set_visible(mode.has_speed);
+        }
         if !intent_sync.active() {
             send_lighting_intent(&intent_state, &intent_view, device);
         }
@@ -894,27 +943,15 @@ fn connect_color_chooser_response(
 }
 
 fn send_lighting_intent(state: &Rc<AppState>, view: &LightingView, device: &'static str) {
-    let mode_label = view
-        .modes
-        .selected_item()
-        .and_downcast::<gtk::StringObject>()
-        .map(|item| item.string().to_string())
-        .unwrap_or_else(|| "Off".into());
-    let (enabled, mode) = match mode_label.as_str() {
-        "Static" => (true, "static"),
-        "Breathe" => (true, "breathe"),
-        "Cycle" => (true, "cycle"),
-        "Rainbow" => (true, "rainbow"),
-        "Strobe" => (true, "strobe"),
-        _ => (false, "static"),
+    let selected = view.modes.selected() as usize;
+    let index = if selected < LIGHTING_MODES.len() {
+        selected
+    } else {
+        0
     };
-    let speed = view
-        .speed
-        .selected_item()
-        .and_downcast::<gtk::StringObject>()
-        .map(|item| item.string().to_string())
-        .map(|speed| speed.to_ascii_lowercase())
-        .unwrap_or_else(|| "normal".into());
+    let speed = LIGHTING_SPEEDS
+        .get(view.speed.selected() as usize)
+        .map_or("normal", |&(_, speed)| speed);
     let rgba = view.color.rgba();
     let color = format!(
         "{:02X}{:02X}{:02X}",
@@ -924,17 +961,24 @@ fn send_lighting_intent(state: &Rc<AppState>, view: &LightingView, device: &'sta
     );
     let client = state.client.clone();
     let feedback = state.clone();
+    let pending = view.pending_writes.clone();
+    pending.set(pending.get() + 1);
     let lighting = LightingState {
-        enabled,
-        mode: mode.into(),
+        enabled: index != 0,
+        mode: LIGHTING_MODES[index].wire.into(),
         color,
-        color2: "000000".into(),
-        speed,
-        brightness: 3,
+        speed: speed.into(),
+        ..view.lit.borrow().clone()
     };
     worker::blocking(
-        move || client.apply_lighting(device, lighting),
+        move || {
+            client.send(Command::SetLighting {
+                device: device.into(),
+                state: lighting,
+            })
+        },
         move |result| {
+            pending.set(pending.get() - 1);
             if let Err(error) = result {
                 tracing::error!(%error, %device, "lighting write failed");
                 feedback.report_error(&format!("{device} lighting failed: {error}"));
@@ -943,8 +987,14 @@ fn send_lighting_intent(state: &Rc<AppState>, view: &LightingView, device: &'sta
     );
 }
 
-fn install_battery_debounce(state: &Rc<AppState>, scale: &gtk::Scale, sync: &SyncGuard) {
+fn install_battery_debounce(
+    state: &Rc<AppState>,
+    scale: &gtk::Scale,
+    sync: &SyncGuard,
+    pending_writes: &Rc<Cell<u32>>,
+) {
     let source = Rc::new(Cell::new(None::<glib::SourceId>));
+    let pending = pending_writes.clone();
     let client = state.client.clone();
     let feedback = state.clone();
     let sync = sync.clone();
@@ -952,8 +1002,11 @@ fn install_battery_debounce(state: &Rc<AppState>, scale: &gtk::Scale, sync: &Syn
         if sync.active() {
             return;
         }
+        // One pending count spans the debounce and its write.
         if let Some(id) = source.take() {
             id.remove();
+        } else {
+            pending.set(pending.get() + 1);
         }
         // Snap to nearest 5 and clamp to [40, 100].
         let raw = scale.value().round() as i32;
@@ -964,12 +1017,14 @@ fn install_battery_debounce(state: &Rc<AppState>, scale: &gtk::Scale, sync: &Syn
         let client = client.clone();
         let feedback = feedback.clone();
         let source_done = source.clone();
+        let pending_done = pending.clone();
         source.set(Some(glib::timeout_add_local_once(
             std::time::Duration::from_millis(200),
             move || {
                 worker::blocking(
-                    move || client.battery_limit_set(value),
+                    move || client.send(Command::SetBatteryLimit { limit: value }),
                     move |result| {
+                        pending_done.set(pending_done.get() - 1);
                         if let Err(e) = result {
                             tracing::error!(%e, "battery limit write failed");
                             feedback.report_error(&format!("Battery limit failed: {e}"));
@@ -988,30 +1043,27 @@ fn reconcile_state(state: &AppState, view: &MainView, result: Result<WireStatus,
             view.banner.set_revealed(false);
             view.sync_from(state, &status);
         }
-        Err(_) => view.banner.set_revealed(true),
+        Err(error) => {
+            let message = error.to_string();
+            if !view.banner.is_revealed() || view.banner.title() != message.as_str() {
+                tracing::warn!(%error, "z13helperd state unavailable");
+            }
+            view.banner.set_title(&message);
+            view.banner.set_revealed(true);
+        }
     }
-}
-
-fn sync_once(state: &Rc<AppState>, view: &MainView) {
-    let client = state.client.clone();
-    let view = view.clone();
-    let state = state.clone();
-    worker::blocking(
-        move || client.get_state(),
-        move |result| reconcile_state(&state, &view, result),
-    );
 }
 
 fn install_telemetry(state: &Rc<AppState>, view: MainView) {
     let busy = Rc::new(Cell::new(false));
-    let state = state.clone();
-    glib::timeout_add_seconds_local(1, move || {
-        if !state.main_window_is_visible() || busy.replace(true) {
-            return glib::ControlFlow::Continue;
+    let poll_state = state.clone();
+    let poll = move || {
+        if busy.replace(true) {
+            return;
         }
-        let client = state.client.clone();
+        let client = poll_state.client.clone();
         let busy = busy.clone();
-        let state = state.clone();
+        let state = poll_state.clone();
         let view = view.clone();
         worker::blocking(
             move || client.get_state(),
@@ -1020,13 +1072,21 @@ fn install_telemetry(state: &Rc<AppState>, view: MainView) {
                 reconcile_state(&state, &view, result);
             },
         );
+    };
+    // First sync now, even while hidden; later polls only while visible.
+    poll();
+    let state = state.clone();
+    glib::timeout_add_seconds_local(1, move || {
+        if state.main_window_is_visible() {
+            poll();
+        }
         glib::ControlFlow::Continue
     });
 }
 
-fn refresh_active_buttons(buttons: &RefCell<Vec<(String, gtk::ToggleButton)>>, active_id: &str) {
-    for (id, button) in buttons.borrow().iter() {
-        button.set_active(id == active_id);
+fn refresh_active_buttons(buttons: &[(&str, gtk::ToggleButton)], active_id: &str) {
+    for (id, button) in buttons {
+        button.set_active(*id == active_id);
     }
 }
 
@@ -1037,12 +1097,6 @@ fn current_label(state: &AppState) -> String {
         .active()
         .map(mode_label)
         .unwrap_or_else(|| "Mode: Balanced".into())
-}
-
-fn select_profile(state: &Rc<AppState>, id: &str) {
-    if state.activate_profile(id) {
-        state.apply_active();
-    }
 }
 
 #[cfg(test)]
@@ -1070,5 +1124,40 @@ mod battery_tests {
             battery_limit_title(true, Some(80)),
             "Battery Charge Limit: One time to 100%"
         );
+    }
+}
+
+#[cfg(test)]
+mod lighting_tests {
+    use super::{LIGHTING_MODES, LIGHTING_SPEEDS, lighting_mode_index, lighting_speed_index};
+    use z13helper_core::LightingState;
+
+    #[test]
+    fn tables_keep_dropdown_order_and_map_daemon_state_to_rows() {
+        let rows = LIGHTING_MODES.map(|m| (m.label, m.wire, m.has_color, m.has_speed));
+        assert_eq!(rows[0], ("Off", "static", false, false));
+        assert_eq!(rows[1], ("Static", "static", true, false));
+        assert_eq!(rows[2], ("Breathe", "breathe", true, true));
+        assert_eq!(rows[3], ("Cycle", "cycle", false, true));
+        assert_eq!(rows[4], ("Rainbow", "rainbow", false, true));
+        assert_eq!(rows[5], ("Strobe", "strobe", true, true));
+        assert_eq!(
+            LIGHTING_SPEEDS,
+            [("Slow", "slow"), ("Normal", "normal"), ("Fast", "fast")]
+        );
+
+        let lit = |mode: &str, enabled| LightingState {
+            enabled,
+            mode: mode.into(),
+            ..LightingState::default()
+        };
+        assert_eq!(lighting_mode_index(&lit("rainbow", false)), 0);
+        assert_eq!(lighting_mode_index(&lit("static", true)), 1);
+        assert_eq!(lighting_mode_index(&lit("unknown", true)), 1);
+        assert_eq!(lighting_mode_index(&lit("breathe", true)), 2);
+        assert_eq!(lighting_mode_index(&lit("strobe", true)), 5);
+        assert_eq!(lighting_speed_index("slow"), 0);
+        assert_eq!(lighting_speed_index("fast"), 2);
+        assert_eq!(lighting_speed_index("bogus"), 1);
     }
 }

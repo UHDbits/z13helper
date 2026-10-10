@@ -1,38 +1,25 @@
 //! Daemon UI-event subscription with reconnect backoff.
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::app::AppState;
-use crate::services::power;
-use z13helper_core::{ControllerAction, DaemonEventKind};
+use crate::power;
+use z13helper_core::debounce::PowerDebouncer;
+use z13helper_core::{DaemonEvent, DaemonEventKind};
 
-const MAX_PENDING_CONTROLLER_ACTIONS: usize = 32;
+/// Events held while GTK is busy; the oldest is dropped beyond this.
+const MAX_PENDING_EVENTS: usize = 32;
+/// Repeated toggle presses closer together than this act once.
+const TOGGLE_DEBOUNCE: Duration = Duration::from_millis(50);
 
-#[derive(Default)]
-struct UiMailbox {
-    toggle: bool,
-    power_source: Option<bool>,
-    controller_actions: VecDeque<ControllerAction>,
-}
-
-impl UiMailbox {
-    fn push_controller(&mut self, action: ControllerAction) {
-        if self.controller_actions.len() == MAX_PENDING_CONTROLLER_ACTIONS {
-            self.controller_actions.pop_front();
-        }
-        self.controller_actions.push_back(action);
-    }
-}
-
-pub fn start(state: &Rc<AppState>) {
+pub fn start(state: &Rc<AppState>, power: Rc<RefCell<PowerDebouncer>>) {
     let client = state.client.clone();
-    let mailbox = Arc::new(Mutex::new(UiMailbox::default()));
-    let worker_mailbox = Arc::clone(&mailbox);
+    let (tx, rx) = async_channel::bounded::<DaemonEvent>(MAX_PENDING_EVENTS);
     std::thread::spawn(move || {
         let mut backoff = Duration::from_millis(250);
+        let mut last_error = None;
         loop {
             match client.subscribe(&[
                 DaemonEventKind::GuiToggle,
@@ -41,52 +28,45 @@ pub fn start(state: &Rc<AppState>) {
             ]) {
                 Ok((events, _cancel)) => {
                     backoff = Duration::from_millis(250);
+                    last_error = None;
                     while let Ok(event) = events.recv() {
-                        let mut mailbox = worker_mailbox.lock().unwrap();
-                        match event.kind {
-                            DaemonEventKind::GuiToggle => {
-                                mailbox.toggle = true;
-                            }
-                            DaemonEventKind::ControllerAction => {
-                                if let Some(action) = event.action {
-                                    mailbox.push_controller(action);
-                                }
-                            }
-                            DaemonEventKind::PowerSourceChanged => {
-                                if let Some(on_battery) = event.on_battery {
-                                    mailbox.power_source = Some(on_battery);
-                                }
-                            }
-                            _ => {}
-                        }
+                        let _ = tx.force_send(event);
                     }
                 }
-                Err(_) => std::thread::sleep(backoff),
+                Err(error) => {
+                    let error = error.to_string();
+                    if last_error.as_ref() != Some(&error) {
+                        tracing::warn!(%error, "daemon event subscription failed; retrying");
+                        last_error = Some(error);
+                    }
+                }
             }
+            // Also after a stream ends, so an ack-then-drop daemon cannot spin.
+            std::thread::sleep(backoff);
             backoff = (backoff * 2).min(Duration::from_secs(15));
         }
     });
     let state = state.clone();
-    let mut last = Instant::now() - Duration::from_secs(1);
-    glib::timeout_add_local(Duration::from_millis(50), move || {
-        let (toggle, power_source, controller_actions) = {
-            let mut mailbox = mailbox.lock().unwrap();
-            (
-                std::mem::take(&mut mailbox.toggle),
-                mailbox.power_source.take(),
-                std::mem::take(&mut mailbox.controller_actions),
-            )
-        };
-        for action in controller_actions {
-            state.handle_controller_action(action);
+    glib::MainContext::default().spawn_local(async move {
+        let mut last_toggle = Instant::now() - Duration::from_secs(1);
+        while let Ok(event) = rx.recv().await {
+            match event.kind {
+                DaemonEventKind::GuiToggle if last_toggle.elapsed() >= TOGGLE_DEBOUNCE => {
+                    last_toggle = Instant::now();
+                    state.toggle_window();
+                }
+                DaemonEventKind::ControllerAction => {
+                    if let Some(action) = event.action {
+                        state.handle_controller_action(action);
+                    }
+                }
+                DaemonEventKind::PowerSourceChanged => {
+                    if let Some(on_battery) = event.on_battery {
+                        power::on_resume(&state, &power, on_battery);
+                    }
+                }
+                _ => {}
+            }
         }
-        if let Some(on_battery) = power_source {
-            power::on_resume(&state, on_battery);
-        }
-        if toggle && last.elapsed() >= Duration::from_millis(50) {
-            last = Instant::now();
-            state.toggle_window();
-        }
-        glib::ControlFlow::Continue
     });
 }

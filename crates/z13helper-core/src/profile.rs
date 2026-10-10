@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::curve::Curve;
+use crate::protocol::{FanHysteresis, TdpState, validate_cpu_tuning, validate_fan_tuning};
 
 pub const PPD_PROFILES: [&str; 3] = ["power-saver", "balanced", "performance"];
 
@@ -174,39 +175,34 @@ impl Profile {
         {
             return Err(format!("unknown PPD profile {ppd_profile:?}"));
         }
-        for (name, value, maximum) in [
-            ("PL1", self.pl1_spl, 93),
-            ("PL2", self.pl2_sppt, 93),
-            ("FPPT", self.fppt, 120),
-        ] {
-            if !(5..=maximum).contains(&value) {
-                return Err(format!("{name} must be between 5 and {maximum} watts"));
-            }
-        }
-        if self.apply_power_limits && (self.pl2_sppt < self.pl1_spl || self.fppt < self.pl2_sppt) {
-            return Err("power limits must satisfy PL1 <= PL2 <= FPPT".into());
-        }
-        if !(1..=5).contains(&self.fan_hysteresis_up)
-            || !(1..=5).contains(&self.fan_hysteresis_down)
-        {
-            return Err("fan hysteresis values must be between 1 and 5".into());
-        }
-        if self.fan_temperature_average_seconds > 15 {
-            return Err("fan temperature averaging must be between 0 and 15 seconds".into());
-        }
+        // APU/platform SPPT mirror PL2, so they never fail ahead of it.
+        self.tdp().validate(self.apply_power_limits)?;
+        validate_fan_tuning(
+            FanHysteresis {
+                up: self.fan_hysteresis_up,
+                down: self.fan_hysteresis_down,
+            },
+            self.fan_temperature_average_seconds,
+        )?;
         if self.fan_control_mode == FanControlMode::Direct && !self.apply_fan_curve {
             return Err("direct fan mode requires fan-curve application".into());
         }
-        if !(-40..=0).contains(&self.cpu_co) {
-            return Err("Curve Optimizer offset must be between -40 and 0".into());
-        }
-        if !(80..=99).contains(&self.cpu_temp_limit) {
-            return Err("APU temperature limit must be between 80 and 99°C".into());
-        }
+        validate_cpu_tuning(Some(self.cpu_co), self.cpu_temp_limit)?;
         for curve in &self.fan_curves {
             crate::curve::validate(curve).map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    /// The PPT table this profile writes; APU and platform SPPT follow PL2.
+    pub fn tdp(&self) -> TdpState {
+        TdpState {
+            pl1_spl: self.pl1_spl as i32,
+            pl2_sppt: self.pl2_sppt as i32,
+            fppt: self.fppt as i32,
+            apu_sppt: self.pl2_sppt as i32,
+            platform_sppt: self.pl2_sppt as i32,
+        }
     }
 
     pub fn builtin(id: &str, name: &str) -> Self {

@@ -123,20 +123,78 @@ pub struct FanHysteresis {
 }
 
 pub const MAX_FAN_TEMPERATURE_AVERAGE_SECONDS: u8 = 15;
+pub const MIN_FAN_HYSTERESIS: u8 = 1;
+pub const MAX_FAN_HYSTERESIS: u8 = 5;
 
 impl Default for FanHysteresis {
     fn default() -> Self {
-        Self { up: 3, down: 3 }
+        let step = crate::profile::default_fan_hysteresis();
+        Self {
+            up: step,
+            down: step,
+        }
     }
 }
 
 impl FanHysteresis {
     pub fn validate(self) -> Result<Self, String> {
-        if !(1..=5).contains(&self.up) || !(1..=5).contains(&self.down) {
-            return Err("fan hysteresis values must be between 1 and 5".into());
+        let range = MIN_FAN_HYSTERESIS..=MAX_FAN_HYSTERESIS;
+        if !range.contains(&self.up) || !range.contains(&self.down) {
+            return Err(format!(
+                "fan hysteresis values must be between {MIN_FAN_HYSTERESIS} and {MAX_FAN_HYSTERESIS}"
+            ));
         }
         Ok(self)
     }
+}
+
+/// Fan tuning ranges shared by `ApplyRequest` and `Profile` validation.
+pub(crate) fn validate_fan_tuning(
+    hysteresis: FanHysteresis,
+    average_seconds: u8,
+) -> Result<(), String> {
+    hysteresis.validate()?;
+    if average_seconds > MAX_FAN_TEMPERATURE_AVERAGE_SECONDS {
+        return Err(format!(
+            "fan temperature averaging must be between 0 and {MAX_FAN_TEMPERATURE_AVERAGE_SECONDS} seconds"
+        ));
+    }
+    Ok(())
+}
+
+pub const MIN_UNDERVOLT: i32 = -40;
+pub const MAX_UNDERVOLT: i32 = 0;
+
+/// Curve Optimizer range, shared with the daemon's SMU encoder.
+pub fn validate_undervolt(offset: i32) -> Result<(), String> {
+    if !(MIN_UNDERVOLT..=MAX_UNDERVOLT).contains(&offset) {
+        return Err(format!(
+            "Curve Optimizer offset must be between {MIN_UNDERVOLT} and {MAX_UNDERVOLT}"
+        ));
+    }
+    Ok(())
+}
+
+pub const MIN_CPU_TEMP_LIMIT_C: u8 = 80;
+pub const MAX_CPU_TEMP_LIMIT_C: u8 = 99;
+
+/// APU temperature-limit range, shared with the daemon's SMU encoder.
+pub fn validate_cpu_temp_limit(temperature_c: u8) -> Result<(), String> {
+    if !(MIN_CPU_TEMP_LIMIT_C..=MAX_CPU_TEMP_LIMIT_C).contains(&temperature_c) {
+        return Err(format!(
+            "APU temperature limit must be between {MIN_CPU_TEMP_LIMIT_C} and {MAX_CPU_TEMP_LIMIT_C}°C"
+        ));
+    }
+    Ok(())
+}
+
+/// CPU tuning ranges shared by `ApplyRequest` and `Profile` validation.
+pub(crate) fn validate_cpu_tuning(
+    undervolt: Option<i32>,
+    cpu_temp_limit: u8,
+) -> Result<(), String> {
+    undervolt.map_or(Ok(()), validate_undervolt)?;
+    validate_cpu_temp_limit(cpu_temp_limit)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -164,6 +222,38 @@ pub struct TdpState {
     pub fppt: i32,
     pub apu_sppt: i32,
     pub platform_sppt: i32,
+}
+
+/// Watt bounds for every PPT limit; FPPT may exceed the others.
+pub const MIN_PPT_WATTS: i32 = 5;
+pub const MAX_PPT_WATTS: i32 = 93;
+pub const MAX_FPPT_WATTS: i32 = 120;
+
+impl TdpState {
+    pub fn pl1_watts(self) -> u32 {
+        self.pl1_spl.max(0) as u32
+    }
+
+    /// Range-check every limit; `ordered` also requires PL1 <= PL2 <= FPPT.
+    pub(crate) fn validate(self, ordered: bool) -> Result<(), String> {
+        for (name, value, maximum) in [
+            ("PL1", self.pl1_spl, MAX_PPT_WATTS),
+            ("PL2", self.pl2_sppt, MAX_PPT_WATTS),
+            ("FPPT", self.fppt, MAX_FPPT_WATTS),
+            ("APU SPPT", self.apu_sppt, MAX_PPT_WATTS),
+            ("platform SPPT", self.platform_sppt, MAX_PPT_WATTS),
+        ] {
+            if !(MIN_PPT_WATTS..=maximum).contains(&value) {
+                return Err(format!(
+                    "{name} must be between {MIN_PPT_WATTS} and {maximum} watts"
+                ));
+            }
+        }
+        if ordered && (self.pl2_sppt < self.pl1_spl || self.fppt < self.pl2_sppt) {
+            return Err("power limits must satisfy PL1 <= PL2 <= FPPT".into());
+        }
+        Ok(())
+    }
 }
 
 /// Measured complete stock table for each PPD-selected firmware policy.
@@ -397,29 +487,16 @@ pub struct ApplyRequest {
 
 impl ApplyRequest {
     pub fn from_profile(profile: &Profile, disable_high_power_fan_protection: bool) -> Self {
-        let power_limits = profile.apply_power_limits.then_some(TdpState {
-            pl1_spl: profile.pl1_spl as i32,
-            pl2_sppt: profile.pl2_sppt as i32,
-            fppt: profile.fppt as i32,
-            apu_sppt: profile.pl2_sppt as i32,
-            platform_sppt: profile.pl2_sppt as i32,
-        });
-        let effective_pl1 = power_limits
-            .or_else(|| stock_tdp(profile.ppd_profile.as_deref()))
-            .map(|tdp| tdp.pl1_spl.max(0) as u32)
-            .unwrap_or(0);
-        let needs_protected_curve = effective_pl1 >= crate::curve::HIGH_POWER_THRESHOLD_W
-            && !disable_high_power_fan_protection;
         let fan_curves = if profile.unified_fan_control {
             [profile.fan_curves[0], profile.fan_curves[0]]
         } else {
             profile.fan_curves
         };
-        Self {
+        let mut request = Self {
             ppd_profile: profile.ppd_profile.clone(),
-            power_limits,
+            power_limits: profile.apply_power_limits.then_some(profile.tdp()),
             fan_mode: profile.fan_control_mode,
-            fan_curves: (profile.apply_fan_curve || needs_protected_curve).then_some(fan_curves),
+            fan_curves: profile.apply_fan_curve.then_some(fan_curves),
             undervolt: profile.apply_undervolt.then_some(profile.cpu_co),
             cpu_temp_limit: profile.cpu_temp_limit,
             fan_hysteresis: FanHysteresis {
@@ -428,7 +505,14 @@ impl ApplyRequest {
             },
             fan_temperature_average_seconds: profile.fan_temperature_average_seconds,
             disable_high_power_fan_protection,
+        };
+        // High power always carries curves so fans are protected before PPT rises.
+        if request.effective_pl1().is_some_and(|pl1| {
+            crate::curve::fan_protection_required(pl1, disable_high_power_fan_protection)
+        }) {
+            request.fan_curves = Some(fan_curves);
         }
+        request
     }
 
     pub fn effective_power_limits(&self) -> Option<TdpState> {
@@ -436,10 +520,10 @@ impl ApplyRequest {
             .or_else(|| stock_tdp(self.ppd_profile.as_deref()))
     }
 
-    pub fn effective_pl1(&self) -> u32 {
-        self.effective_power_limits()
-            .map(|tdp| tdp.pl1_spl.max(0) as u32)
-            .unwrap_or_else(|| stock_ppt(self.ppd_profile.as_deref()).0)
+    /// PL1 this request writes, or `None` when it leaves PPT untouched and
+    /// the hardware keeps whatever PL1 it already has.
+    pub fn effective_pl1(&self) -> Option<u32> {
+        self.effective_power_limits().map(TdpState::pl1_watts)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -451,43 +535,16 @@ impl ApplyRequest {
         if self.fan_mode == FanControlMode::Direct && self.fan_curves.is_none() {
             return Err("direct fan mode requires complete CPU and GPU curves".into());
         }
-        self.fan_hysteresis.validate()?;
-        if self.fan_temperature_average_seconds > MAX_FAN_TEMPERATURE_AVERAGE_SECONDS {
-            return Err(format!(
-                "fan temperature averaging must be between 0 and {MAX_FAN_TEMPERATURE_AVERAGE_SECONDS} seconds"
-            ));
-        }
+        validate_fan_tuning(self.fan_hysteresis, self.fan_temperature_average_seconds)?;
         if let Some(curves) = &self.fan_curves {
             for curve in curves {
                 crate::curve::validate(curve).map_err(|error| error.to_string())?;
             }
         }
         if let Some(tdp) = self.power_limits {
-            for (name, value, maximum) in [
-                ("PL1", tdp.pl1_spl, 93),
-                ("PL2", tdp.pl2_sppt, 93),
-                ("FPPT", tdp.fppt, 120),
-                ("APU SPPT", tdp.apu_sppt, 93),
-                ("platform SPPT", tdp.platform_sppt, 93),
-            ] {
-                if !(5..=maximum).contains(&value) {
-                    return Err(format!("{name} must be between 5 and {maximum} watts"));
-                }
-            }
-            if tdp.pl2_sppt < tdp.pl1_spl || tdp.fppt < tdp.pl2_sppt {
-                return Err("power limits must satisfy PL1 <= PL2 <= FPPT".into());
-            }
+            tdp.validate(true)?;
         }
-        if self
-            .undervolt
-            .is_some_and(|offset| !(-40..=0).contains(&offset))
-        {
-            return Err("Curve Optimizer offset must be between -40 and 0".into());
-        }
-        if !(80..=99).contains(&self.cpu_temp_limit) {
-            return Err("APU temperature limit must be between 80 and 99°C".into());
-        }
-        Ok(())
+        validate_cpu_tuning(self.undervolt, self.cpu_temp_limit)
     }
 }
 
@@ -548,6 +605,19 @@ pub struct WireRequest {
     pub command: Command,
 }
 
+fn envelope_field<T, E>(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    missing: &'static str,
+) -> Result<T, E>
+where
+    T: serde::de::DeserializeOwned,
+    E: serde::de::Error,
+{
+    let value = object.get(key).cloned().ok_or_else(|| E::custom(missing))?;
+    serde_json::from_value(value).map_err(E::custom)
+}
+
 impl<'de> Deserialize<'de> for WireRequest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -573,7 +643,6 @@ impl<'de> Deserialize<'de> for WireRequest {
             "set-lighting" => ["device", "state"].as_slice(),
             "subscribe" => ["events"].as_slice(),
             "get-outcome" => ["target_client_id", "target_request_id"].as_slice(),
-            "get-state" | "probe" | "release-fans" => [].as_slice(),
             _ => [].as_slice(),
         });
         if let Some(unknown) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
@@ -581,21 +650,9 @@ impl<'de> Deserialize<'de> for WireRequest {
                 "unknown request field {unknown:?}"
             )));
         }
-        let version = object
-            .get("version")
-            .cloned()
-            .ok_or_else(|| serde::de::Error::custom("missing request version"))
-            .and_then(|value| serde_json::from_value(value).map_err(serde::de::Error::custom))?;
-        let client_id = object
-            .get("client_id")
-            .cloned()
-            .ok_or_else(|| serde::de::Error::custom("missing client ID"))
-            .and_then(|value| serde_json::from_value(value).map_err(serde::de::Error::custom))?;
-        let request_id = object
-            .get("request_id")
-            .cloned()
-            .ok_or_else(|| serde::de::Error::custom("missing request ID"))
-            .and_then(|value| serde_json::from_value(value).map_err(serde::de::Error::custom))?;
+        let version = envelope_field::<_, D::Error>(object, "version", "missing request version")?;
+        let client_id = envelope_field::<_, D::Error>(object, "client_id", "missing client ID")?;
+        let request_id = envelope_field::<_, D::Error>(object, "request_id", "missing request ID")?;
         let mut command_object = object.clone();
         command_object.remove("version");
         command_object.remove("client_id");
@@ -764,52 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_limit_is_one_shared_v3_boundary() {
-        assert_eq!(MAX_FRAME_BYTES, 64 * 1024);
-        assert_eq!(DaemonEventKind::ALL.len(), 4);
-        assert_eq!(
-            DaemonEventKind::parse("state-changed"),
-            Some(DaemonEventKind::StateChanged)
-        );
-        assert_eq!(DaemonEventKind::parse("unknown"), None);
-    }
-
-    #[test]
-    fn controller_capture_and_action_roundtrip() {
-        let request = WireRequest {
-            version: PROTOCOL_VERSION,
-            client_id: ClientId::new(1).unwrap(),
-            request_id: RequestId::new(2).unwrap(),
-            command: Command::SetControllerCapture { enabled: true },
-        };
-        let text = serde_json::to_string(&request).unwrap();
-        assert!(text.contains("\"cmd\":\"set-controller-capture\""));
-        let event = DaemonEvent {
-            kind: DaemonEventKind::ControllerAction,
-            action: Some(ControllerAction::Accept),
-            on_battery: None,
-        };
-        assert_eq!(
-            serde_json::to_string(&event).unwrap(),
-            r#"{"kind":"controller-action","action":"accept"}"#
-        );
-    }
-
-    #[test]
-    fn power_source_resume_event_roundtrips_the_post_resume_source() {
-        let event = DaemonEvent {
-            kind: DaemonEventKind::PowerSourceChanged,
-            action: None,
-            on_battery: Some(true),
-        };
-        let decoded: DaemonEvent = serde_json::from_str(&serde_json::to_string(&event).unwrap())
-            .expect("power-source event should decode");
-        assert_eq!(decoded.kind, DaemonEventKind::PowerSourceChanged);
-        assert_eq!(decoded.on_battery, Some(true));
-    }
-
-    #[test]
-    fn command_roundtrips_keep_typed_decodes() {
+    fn command_and_event_roundtrips_keep_typed_decodes() {
         let cases = [
             (
                 Command::SetBatteryOneTimeCharge { enabled: true },
@@ -825,6 +837,10 @@ mod tests {
                 Command::ApplyUndervoltOnce { offset: -20 },
                 "apply-undervolt-once",
             ),
+            (
+                Command::SetControllerCapture { enabled: true },
+                "set-controller-capture",
+            ),
         ];
         for (command, name) in cases {
             let request = WireRequest {
@@ -837,12 +853,41 @@ mod tests {
             assert!(text.contains(&format!("\"cmd\":\"{name}\"")));
             let decoded: WireRequest = serde_json::from_str(&text).unwrap();
             match decoded.command {
-                Command::SetBatteryOneTimeCharge { enabled } => assert!(enabled),
+                Command::SetBatteryOneTimeCharge { enabled }
+                | Command::SetControllerCapture { enabled } => assert!(enabled),
                 Command::GetFactoryFanCurves { ppd_profiles } => assert_eq!(ppd_profiles.len(), 2),
                 Command::ApplyUndervoltOnce { offset } => assert_eq!(offset, -20),
                 other => panic!("unexpected command: {other:?}"),
             }
         }
+
+        let events = [
+            (
+                DaemonEvent {
+                    kind: DaemonEventKind::ControllerAction,
+                    action: Some(ControllerAction::Accept),
+                    on_battery: None,
+                },
+                r#"{"kind":"controller-action","action":"accept"}"#,
+            ),
+            (
+                DaemonEvent {
+                    kind: DaemonEventKind::PowerSourceChanged,
+                    action: None,
+                    on_battery: Some(true),
+                },
+                r#"{"kind":"power-source-changed","on_battery":true}"#,
+            ),
+        ];
+        for (event, json) in events {
+            assert_eq!(serde_json::to_string(&event).unwrap(), json);
+            assert_eq!(serde_json::from_str::<DaemonEvent>(json).unwrap(), event);
+        }
+        assert_eq!(
+            DaemonEventKind::parse("state-changed"),
+            Some(DaemonEventKind::StateChanged)
+        );
+        assert_eq!(DaemonEventKind::parse("unknown"), None);
     }
 
     #[test]

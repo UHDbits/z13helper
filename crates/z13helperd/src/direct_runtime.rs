@@ -8,7 +8,7 @@ use z13helper_core::curve::Curve;
 use z13helper_core::protocol::{FanHysteresis, ProbeReply};
 
 use crate::ec::{EcMailbox, LinuxPortIo, PortIo};
-use crate::service::{Controller, DIRECT_TICK_INTERVAL};
+use crate::service::{Controller, DIRECT_TICK_INTERVAL, MODEL};
 
 const COMMAND_CAPACITY: usize = 8;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
@@ -30,47 +30,21 @@ pub struct DirectSnapshot {
     pub release_failure: Option<String>,
 }
 
-struct Fenced<T> {
-    fence: u64,
-    result: Result<T, String>,
-}
-
-type Reply<T> = SyncSender<Fenced<T>>;
+type Reply<T> = SyncSender<Result<T, String>>;
 
 enum Command {
-    SetPolicy {
-        fence: u64,
-        policy: DirectPolicy,
-        reply: Reply<()>,
-    },
-    InstallPrime {
-        fence: u64,
-        curves: [Curve; 2],
-        reply: Reply<DirectSnapshot>,
-    },
-    Hold {
-        fence: u64,
-        reply: Reply<DirectSnapshot>,
-    },
-    Resume {
-        fence: u64,
-        reply: Reply<DirectSnapshot>,
-    },
-    Release {
-        fence: u64,
-        reply: Reply<DirectSnapshot>,
-    },
-    Snapshot {
-        fence: u64,
-        reply: Reply<DirectSnapshot>,
-    },
+    SetPolicy(DirectPolicy, Reply<()>),
+    InstallPrime([Curve; 2], Reply<DirectSnapshot>),
+    Hold(Reply<DirectSnapshot>),
+    Resume(Reply<DirectSnapshot>),
+    Release(Reply<DirectSnapshot>),
+    Snapshot(Reply<DirectSnapshot>),
 }
 
 pub struct DirectRuntime {
     commands: SyncSender<Command>,
     shutdown_requested: Arc<AtomicBool>,
     shutdown_result: Receiver<Result<(), String>>,
-    next_fence: u64,
     owner: Option<JoinHandle<()>>,
     shutdown: bool,
 }
@@ -92,70 +66,46 @@ impl DirectRuntime {
         hysteresis: FanHysteresis,
         temperature_average_seconds: u8,
     ) -> Result<(), String> {
-        let fence = self.fence();
-        let (reply, receiver) = mpsc::sync_channel(1);
-        self.call(
-            Command::SetPolicy {
-                fence,
-                policy: DirectPolicy {
-                    hysteresis,
-                    temperature_average_seconds,
-                },
-                reply,
-            },
-            receiver,
-        )
+        let policy = DirectPolicy {
+            hysteresis,
+            temperature_average_seconds,
+        };
+        self.call(|reply| Command::SetPolicy(policy, reply))
     }
 
     pub fn install_and_prime(&mut self, curves: [Curve; 2]) -> Result<DirectSnapshot, String> {
-        let fence = self.fence();
-        let (reply, receiver) = mpsc::sync_channel(1);
-        self.call(
-            Command::InstallPrime {
-                fence,
-                curves,
-                reply,
-            },
-            receiver,
-        )
+        self.call(|reply| Command::InstallPrime(curves, reply))
     }
 
     /// Fence direct ticks while firmware owns the fan endpoints. This does
     /// not release EC control, so the owner retains its last known-safe duty
     /// if the firmware write must be rolled back.
     pub fn hold_for_firmware(&mut self) -> Result<DirectSnapshot, String> {
-        let fence = self.fence();
-        let (reply, receiver) = mpsc::sync_channel(1);
-        self.call(Command::Hold { fence, reply }, receiver)
+        self.call(Command::Hold).inspect_err(|_| {
+            // A timed-out Hold stays queued and may still run. Queue a
+            // Resume behind it so it cannot stop ticks for good.
+            let _ = self.resume_after_firmware_failure();
+        })
     }
 
     /// Resume direct control after a firmware curve write failed. The fenced
     /// transition makes the next tick observe the retained direct duty.
     pub fn resume_after_firmware_failure(&mut self) -> Result<DirectSnapshot, String> {
-        let fence = self.fence();
-        let (reply, receiver) = mpsc::sync_channel(1);
-        self.call(Command::Resume { fence, reply }, receiver)
+        self.call(Command::Resume)
     }
 
     pub fn release(&mut self) -> Result<DirectSnapshot, String> {
-        let fence = self.fence();
-        let (reply, receiver) = mpsc::sync_channel(1);
-        self.call(Command::Release { fence, reply }, receiver)
+        self.call(Command::Release)
     }
 
     pub fn snapshot(&mut self) -> Result<DirectSnapshot, String> {
-        let fence = self.fence();
-        let (reply, receiver) = mpsc::sync_channel(1);
-        self.call(Command::Snapshot { fence, reply }, receiver)
+        self.call(Command::Snapshot)
     }
 
     /// Stop the owner thread after releasing direct EC control. The command is
     /// idempotent because suspend uses release while final process teardown
     /// uses shutdown.
     pub fn shutdown(&mut self) -> Result<(), String> {
-        if self.shutdown {
-            return Ok(());
-        }
         self.shutdown_requested.store(true, Ordering::Release);
         self.shutdown_with_timeout(COMMAND_TIMEOUT)
     }
@@ -173,9 +123,8 @@ impl DirectRuntime {
                 return Err("direct runtime shutdown timed out; owner retained for release".into());
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return self.join_owner().map(|_| ()).and_then(|_| {
-                    Err("direct runtime owner stopped before releasing EC control".into())
-                });
+                self.join_owner()?;
+                return Err("direct runtime owner stopped before releasing EC control".into());
             }
         };
         self.join_owner()?;
@@ -192,26 +141,13 @@ impl DirectRuntime {
             .map_err(|_| "direct runtime owner thread panicked".to_owned())
     }
 
-    fn fence(&mut self) -> u64 {
-        let fence = self.next_fence;
-        self.next_fence = self.next_fence.wrapping_add(1).max(1);
-        fence
-    }
-
-    fn call<T>(&self, command: Command, receiver: Receiver<Fenced<T>>) -> Result<T, String> {
+    fn call<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T, String> {
         if self.shutdown || self.shutdown_requested.load(Ordering::Acquire) {
             return Err("direct runtime is shutting down".into());
         }
-        let expected = match &command {
-            Command::SetPolicy { fence, .. }
-            | Command::InstallPrime { fence, .. }
-            | Command::Hold { fence, .. }
-            | Command::Resume { fence, .. }
-            | Command::Release { fence, .. }
-            | Command::Snapshot { fence, .. } => *fence,
-        };
+        let (reply, receiver) = mpsc::sync_channel(1);
+        let mut command = command(reply);
         let deadline = Instant::now() + COMMAND_TIMEOUT;
-        let mut command = command;
         loop {
             match self.commands.try_send(command) {
                 Ok(()) => break,
@@ -228,13 +164,9 @@ impl DirectRuntime {
             }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let response = receiver
+        receiver
             .recv_timeout(remaining)
-            .map_err(|_| "direct runtime command timed out".to_owned())?;
-        if response.fence != expected {
-            return Err("direct runtime fence mismatch".into());
-        }
-        response.result
+            .map_err(|_| "direct runtime command timed out".to_owned())?
     }
 }
 
@@ -244,9 +176,7 @@ impl Drop for DirectRuntime {
         // A timeout only bounds the caller-facing shutdown operation. Do not
         // detach a live owner during final teardown: the owner must finish
         // the release it owns before its JoinHandle is dropped.
-        if self.owner.is_some() {
-            let _ = self.join_owner();
-        }
+        let _ = self.join_owner();
     }
 }
 
@@ -254,8 +184,8 @@ struct Owner<P, R> {
     controller: Controller<P>,
     temperature: R,
     policy: DirectPolicy,
+    /// Also the owner's state: `snapshot.held` fences direct ticks.
     snapshot: DirectSnapshot,
-    held: bool,
     release_pending: bool,
     released: bool,
     next_tick: Instant,
@@ -276,18 +206,16 @@ where
                     z13helper_core::profile::default_fan_temperature_average_seconds(),
             },
             snapshot: DirectSnapshot::default(),
-            held: false,
             release_pending: false,
             released: false,
             next_tick: Instant::now() + DIRECT_TICK_INTERVAL,
         }
     }
 
-    fn set_policy(&mut self, policy: DirectPolicy) {
-        self.policy = policy;
-    }
-
     fn install_and_prime(&mut self, curves: [Curve; 2]) -> Result<DirectSnapshot, String> {
+        // A failed enable may still have reached the EC, so its release must
+        // not be skipped as already done.
+        self.released = false;
         if let Err(error) = self.controller.enable(
             curves,
             self.policy.hysteresis,
@@ -295,8 +223,7 @@ where
         ) {
             return Err(self.fail_and_release(error));
         }
-        self.released = false;
-        self.held = false;
+        self.snapshot.held = false;
         self.release_pending = false;
         let temperature = match (self.temperature)() {
             Ok(temperature) => temperature,
@@ -310,7 +237,6 @@ where
             return Err(self.fail_and_release(error));
         }
         self.snapshot.enabled = true;
-        self.snapshot.held = false;
         self.snapshot.last_safe_duty = self.controller.last_duty();
         self.snapshot.last_error = None;
         self.snapshot.release_failure = None;
@@ -323,7 +249,6 @@ where
         }
         match self.controller.release() {
             Ok(()) => {
-                self.held = false;
                 self.released = true;
                 self.release_pending = false;
                 self.snapshot.enabled = false;
@@ -344,10 +269,7 @@ where
             let _ = self.release();
             return;
         }
-        if self.held {
-            return;
-        }
-        if !self.controller.direct_enabled() {
+        if self.snapshot.held || !self.controller.direct_enabled() {
             return;
         }
         let temperature = match (self.temperature)() {
@@ -382,85 +304,48 @@ where
     }
 
     fn fail_and_release(&mut self, error: String) -> String {
-        let release = self.release();
-        match release {
+        match self.release() {
             Ok(_) => error,
             Err(release) => format!("{error}; direct EC release failed: {release}"),
         }
     }
 
-    fn snapshot(&self) -> DirectSnapshot {
-        let mut snapshot = self.snapshot.clone();
-        snapshot.held = self.held;
-        snapshot
-    }
-
     fn hold(&mut self) -> DirectSnapshot {
         if self.controller.direct_enabled() {
-            self.held = true;
             self.snapshot.held = true;
         }
-        self.snapshot()
+        self.snapshot.clone()
     }
 
     fn resume(&mut self) -> Result<DirectSnapshot, String> {
         if self.release_pending {
             return Err("direct EC release is pending; cannot resume direct control".into());
         }
-        self.held = false;
         self.snapshot.held = false;
         self.snapshot.enabled = self.controller.direct_enabled();
-        Ok(self.snapshot())
+        Ok(self.snapshot.clone())
     }
 
-    fn command(&mut self, command: Command) -> bool {
+    fn command(&mut self, command: Command) {
         match command {
-            Command::SetPolicy {
-                fence,
-                policy,
-                reply,
-            } => {
-                self.set_policy(policy);
-                let _ = reply.send(Fenced {
-                    fence,
-                    result: Ok(()),
-                });
-                false
+            Command::SetPolicy(policy, reply) => {
+                self.policy = policy;
+                let _ = reply.send(Ok(()));
             }
-            Command::InstallPrime {
-                fence,
-                curves,
-                reply,
-            } => {
-                let result = self.install_and_prime(curves);
-                let _ = reply.send(Fenced { fence, result });
-                false
+            Command::InstallPrime(curves, reply) => {
+                let _ = reply.send(self.install_and_prime(curves));
             }
-            Command::Hold { fence, reply } => {
-                let _ = reply.send(Fenced {
-                    fence,
-                    result: Ok(self.hold()),
-                });
-                false
+            Command::Hold(reply) => {
+                let _ = reply.send(Ok(self.hold()));
             }
-            Command::Resume { fence, reply } => {
-                let _ = reply.send(Fenced {
-                    fence,
-                    result: self.resume(),
-                });
-                false
+            Command::Resume(reply) => {
+                let _ = reply.send(self.resume());
             }
-            Command::Release { fence, reply } => {
-                let result = self.release();
-                let _ = reply.send(Fenced { fence, result });
-                false
+            Command::Release(reply) => {
+                let _ = reply.send(self.release());
             }
-            Command::Snapshot { fence, reply } => {
-                let _ = reply.send(Fenced {
-                    fence,
-                    result: Ok(self.snapshot()),
-                });
-                false
+            Command::Snapshot(reply) => {
+                let _ = reply.send(Ok(self.snapshot.clone()));
             }
         }
     }
@@ -471,13 +356,8 @@ where
         shutdown_requested: Arc<AtomicBool>,
         shutdown_result: SyncSender<Result<(), String>>,
     ) {
-        loop {
+        while !shutdown_requested.load(Ordering::Acquire) {
             let now = Instant::now();
-            if shutdown_requested.load(Ordering::Acquire) {
-                let result = self.release().map(|_| ());
-                let _ = shutdown_result.send(result);
-                return;
-            }
             if now >= self.next_tick {
                 self.tick(now);
                 self.next_tick += DIRECT_TICK_INTERVAL;
@@ -487,19 +367,12 @@ where
                 continue;
             }
             match commands.recv_timeout(self.next_tick - now) {
-                Ok(command) => {
-                    if self.command(command) {
-                        return;
-                    }
-                }
+                Ok(command) => self.command(command),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let result = self.release().map(|_| ());
-                    let _ = shutdown_result.send(result);
-                    return;
-                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        let _ = shutdown_result.send(self.release().map(|_| ()));
     }
 }
 
@@ -521,64 +394,55 @@ where
     let owner = thread::Builder::new()
         .name("z13helper-direct-fan".into())
         .spawn(move || {
-            let controller = match factory() {
-                Ok(controller) => controller,
+            let mut owner = match factory() {
+                Ok(controller) => Owner::new(controller, temperature),
                 Err(error) => {
                     let _ = ready_sender.send(Err(error));
                     return;
                 }
             };
-            let mut owner = Owner::new(controller, temperature);
             let probe = if startup_probe {
-                match owner.controller.startup_release_and_probe() {
-                    Ok(probe) => {
-                        owner.released = true;
-                        Ok(probe)
-                    }
-                    Err(error) => Err(error),
-                }
+                owner
+                    .controller
+                    .startup_release_and_probe()
+                    .inspect(|_| owner.released = true)
             } else {
                 Ok(ProbeReply {
-                    model: "GZ302EA".into(),
+                    model: MODEL.into(),
                     ec_version: 0,
                     fan_count: 2,
                 })
             };
-            let probe = match probe {
-                Ok(probe) => probe,
-                Err(error) => {
-                    let _ = ready_sender.send(Err(error));
-                    return;
-                }
-            };
-            let _ = ready_sender.send(Ok(probe));
-            owner.run(receiver, owner_shutdown_requested, shutdown_result);
+            let started = probe.is_ok();
+            let _ = ready_sender.send(probe);
+            if started {
+                owner.run(receiver, owner_shutdown_requested, shutdown_result);
+            }
         })
         .map_err(|error| error.to_string())?;
 
-    let probe = match ready_receiver.recv_timeout(STARTUP_TIMEOUT) {
-        Ok(Ok(probe)) => probe,
-        Ok(Err(error)) => {
-            shutdown_requested.store(true, Ordering::Release);
-            drop(commands);
-            let _ = owner.join();
-            return Err(error);
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // The factory may have acquired raw EC ownership before the
-            // startup handshake stalled. Never detach that late owner: ask
-            // it to release, disconnect its command queue, and join it before
+    let ready = ready_receiver
+        .recv_timeout(STARTUP_TIMEOUT)
+        .unwrap_or_else(|error| {
+            Err(match error {
+                mpsc::RecvTimeoutError::Timeout => "direct runtime startup timed out",
+                mpsc::RecvTimeoutError::Disconnected => {
+                    "direct runtime owner stopped during startup"
+                }
+            }
+            .to_owned())
+        });
+    let probe = match ready {
+        Ok(probe) => probe,
+        Err(error) => {
+            // The factory may have acquired raw EC ownership before startup
+            // failed or stalled. Never detach that late owner: ask it to
+            // release, disconnect its command queue, and join it before
             // reporting startup failure.
             shutdown_requested.store(true, Ordering::Release);
             drop(commands);
             let _ = owner.join();
-            return Err("direct runtime startup timed out".to_owned());
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            shutdown_requested.store(true, Ordering::Release);
-            drop(commands);
-            let _ = owner.join();
-            return Err("direct runtime owner stopped during startup".to_owned());
+            return Err(error);
         }
     };
     Ok((
@@ -586,7 +450,6 @@ where
             commands,
             shutdown_requested,
             shutdown_result: shutdown_receiver,
-            next_fence: 1,
             owner: Some(owner),
             shutdown: false,
         },
@@ -616,6 +479,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeIo {
         writes: Arc<Mutex<Vec<(u16, u8)>>>,
+        /// Number of upcoming port writes to fail.
+        fail_writes: Arc<AtomicUsize>,
     }
 
     impl PortIo for FakeIo {
@@ -624,9 +489,38 @@ mod tests {
         }
 
         fn write_u8(&mut self, port: u16, value: u8) -> io::Result<()> {
+            if self
+                .fail_writes
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(io::Error::other("write failed"));
+            }
             self.writes.lock().unwrap().push((port, value));
             Ok(())
         }
+    }
+
+    /// Temperature source that parks the owner inside a tick while `block`
+    /// is set; `entered` reports that the owner is parked.
+    fn blocking_temperature() -> (
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        impl FnMut() -> Result<i32, String> + Send + 'static,
+    ) {
+        let block = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicBool::new(false));
+        let (block_temperature, entered_temperature) = (Arc::clone(&block), Arc::clone(&entered));
+        let temperature = move || {
+            if block_temperature.load(Ordering::SeqCst) {
+                entered_temperature.store(true, Ordering::SeqCst);
+                while block_temperature.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(60_000)
+        };
+        (block, entered, temperature)
     }
 
     fn curve(duty: i32) -> Curve {
@@ -669,35 +563,6 @@ mod tests {
     }
 
     #[test]
-    fn tick_cadence_survives_a_blocked_backend_surrogate() {
-        let ticks = Arc::new(AtomicUsize::new(0));
-        let tick_times = Arc::new(Mutex::new(Vec::new()));
-        let io = FakeIo::default();
-        let controller = Controller::new(EcMailbox::new(io));
-        let tick_counter = Arc::clone(&ticks);
-        let times = Arc::clone(&tick_times);
-        let (mut runtime, _) = DirectRuntime::fake(controller, move || {
-            tick_counter.fetch_add(1, Ordering::SeqCst);
-            times.lock().unwrap().push(Instant::now());
-            Ok(60_000)
-        });
-        runtime.set_policy(FanHysteresis::default(), 0).unwrap();
-        runtime.install_and_prime([curve(100), curve(100)]).unwrap();
-
-        let backend_surrogate = Arc::new(Mutex::new(()));
-        let guard = backend_surrogate.lock().unwrap();
-        let started = Instant::now();
-        thread::sleep(Duration::from_millis(700));
-        drop(guard);
-        assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(ticks.load(Ordering::SeqCst) >= 2);
-        let times = tick_times.lock().unwrap();
-        for pair in times.windows(2) {
-            assert!(pair[1].duration_since(pair[0]) < Duration::from_millis(500));
-        }
-    }
-
-    #[test]
     fn install_prime_and_release_are_fenced_in_owner_order() {
         let io = FakeIo::default();
         let writes = Arc::clone(&io.writes);
@@ -714,13 +579,56 @@ mod tests {
     }
 
     #[test]
+    fn failed_install_after_release_still_releases_the_ec() {
+        let io = FakeIo::default();
+        let writes = Arc::clone(&io.writes);
+        let fail_writes = Arc::clone(&io.fail_writes);
+        let controller = Controller::new(EcMailbox::new(io));
+        let (mut runtime, _) = DirectRuntime::fake(controller, || Ok(60_000));
+        runtime.set_policy(FanHysteresis::default(), 0).unwrap();
+        runtime.install_and_prime([curve(100), curve(100)]).unwrap();
+        runtime.release().unwrap();
+
+        // Both mailbox attempts of the enable fail; it may still have reached
+        // the EC, so the failure path must write automatic mode again.
+        fail_writes.store(2, Ordering::SeqCst);
+        assert!(runtime.install_and_prime([curve(100), curve(100)]).is_err());
+        assert_eq!(
+            mode_values(&writes.lock().unwrap()),
+            [true as u8, false as u8, false as u8]
+        );
+    }
+
+    #[test]
+    fn timed_out_firmware_hold_cannot_strand_direct_ticks() {
+        let (block, entered, temperature) = blocking_temperature();
+        let controller = Controller::new(EcMailbox::new(FakeIo::default()));
+        let (mut runtime, _) = DirectRuntime::fake(controller, temperature);
+        runtime.set_policy(FanHysteresis::default(), 0).unwrap();
+        runtime.install_and_prime([curve(100), curve(100)]).unwrap();
+        block.store(true, Ordering::SeqCst);
+        while !entered.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // The owner is busy past the command timeout, so the Hold is still
+        // queued when the caller gives up and skips the firmware write.
+        assert!(runtime.hold_for_firmware().is_err());
+        block.store(false, Ordering::SeqCst);
+        assert!(!runtime.snapshot().unwrap().held);
+    }
+
+    #[test]
     fn firmware_hold_fences_ticks_and_resume_keeps_last_safe_duty() {
         let temperature = Arc::new(AtomicUsize::new(60_000));
         let current_temperature = Arc::clone(&temperature);
+        let tick_times = Arc::new(Mutex::new(Vec::new()));
+        let times = Arc::clone(&tick_times);
         let io = FakeIo::default();
         let writes = Arc::clone(&io.writes);
         let controller = Controller::new(EcMailbox::new(io));
         let (mut runtime, _) = DirectRuntime::fake(controller, move || {
+            times.lock().unwrap().push(Instant::now());
             Ok(current_temperature.load(Ordering::SeqCst) as i32)
         });
         runtime.set_policy(FanHysteresis::default(), 0).unwrap();
@@ -741,10 +649,18 @@ mod tests {
 
         let resumed = runtime.resume_after_firmware_failure().unwrap();
         assert!(!resumed.held);
-        thread::sleep(Duration::from_millis(500));
+        let ticks_before_resume = tick_times.lock().unwrap().len();
+        thread::sleep(Duration::from_millis(700));
         let after_resume = runtime.snapshot().unwrap();
         assert!(after_resume.last_safe_duty[0] > before_hold.last_safe_duty[0]);
         assert_eq!(mode_values(&writes.lock().unwrap()), [true as u8]);
+        // Ticks keep their cadence once the hold is lifted.
+        let times = tick_times.lock().unwrap();
+        let resumed_ticks = &times[ticks_before_resume..];
+        assert!(resumed_ticks.len() >= 2);
+        for pair in resumed_ticks.windows(2) {
+            assert!(pair[1].duration_since(pair[0]) < Duration::from_millis(500));
+        }
     }
 
     #[test]
@@ -758,20 +674,9 @@ mod tests {
 
     #[test]
     fn shutdown_timeout_retains_owner_until_release_completes() {
-        let block = Arc::new(AtomicBool::new(false));
-        let entered = Arc::new(AtomicBool::new(false));
-        let block_temperature = Arc::clone(&block);
-        let entered_temperature = Arc::clone(&entered);
+        let (block, entered, temperature) = blocking_temperature();
         let controller = Controller::new(EcMailbox::new(FakeIo::default()));
-        let (mut runtime, _) = DirectRuntime::fake(controller, move || {
-            if block_temperature.load(Ordering::SeqCst) {
-                entered_temperature.store(true, Ordering::SeqCst);
-                while block_temperature.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-            Ok(60_000)
-        });
+        let (mut runtime, _) = DirectRuntime::fake(controller, temperature);
         runtime.set_policy(FanHysteresis::default(), 0).unwrap();
         runtime.install_and_prime([curve(100), curve(100)]).unwrap();
         block.store(true, Ordering::SeqCst);

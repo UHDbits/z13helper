@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{BuildHasher, RandomState};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -8,9 +9,8 @@ use std::time::Duration;
 use z13helper_core::curve::Curve;
 use z13helper_core::error::{DaemonError, ErrorCode};
 use z13helper_core::protocol::{
-    ApplyRequest, ApplyResponse, ClientId, Command, DaemonEvent, EventTopic, LightingState,
-    MAX_FRAME_BYTES as PROTOCOL_MAX_FRAME_BYTES, PROTOCOL_VERSION, ProbeReply, RequestId,
-    RequestOutcome, WireRequest, WireResponse, WireStatus,
+    ApplyRequest, ApplyResponse, ClientId, Command, DaemonEvent, EventTopic, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION, ProbeReply, RequestId, RequestOutcome, WireRequest, WireResponse, WireStatus,
 };
 
 const DEFAULT_SOCKET: &str = "/run/z13helper/z13helperd.sock";
@@ -31,12 +31,6 @@ impl Default for Client {
 }
 
 impl Client {
-    /// Maximum size of a single newline-delimited protocol frame.
-    ///
-    /// This is also used by the CLI when reading JSON from stdin, so callers
-    /// do not need to duplicate the transport limit.
-    pub const MAX_FRAME_BYTES: usize = PROTOCOL_MAX_FRAME_BYTES;
-
     pub fn new() -> Self {
         Self::with_path(DEFAULT_SOCKET)
     }
@@ -67,84 +61,52 @@ impl Client {
 
     fn client_id() -> ClientId {
         *CLIENT_ID.get_or_init(|| {
-            let mut bytes = [0_u8; 16];
-            let random = std::fs::File::open("/dev/urandom")
-                .and_then(|mut file| file.read_exact(&mut bytes))
-                .ok()
-                .and_then(|()| ClientId::new(u128::from_ne_bytes(bytes)));
-            random.unwrap_or_else(|| {
-                // Linux always provides /dev/urandom, but retain a non-zero,
-                // process-distinct fallback for constrained test containers.
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos();
-                let fallback = nanos ^ (u128::from(std::process::id()) << 96);
-                ClientId::new(fallback).unwrap_or_else(|| ClientId::new(1).unwrap())
-            })
+            // RandomState keys come from OS entropy; two hashes make 128 bits.
+            let hash = || u128::from(RandomState::new().hash_one(()));
+            ClientId::new((hash() << 64 | hash()).max(1)).expect("non-zero")
         })
     }
 
-    fn exchange(&self, command: Command) -> Result<WireResponse, DaemonError> {
-        self.exchange_with_id(Self::next_request_id(), command, true)
-    }
-
-    fn exchange_with_id(
-        &self,
-        request_id: RequestId,
-        command: Command,
-        wait_for_completion: bool,
-    ) -> Result<WireResponse, DaemonError> {
-        let outcome_recoverable = !matches!(command, Command::GetOutcome { .. });
-        let mut stream = self.dial()?;
-        let request = WireRequest {
+    fn request(command: Command) -> WireRequest {
+        WireRequest {
             version: PROTOCOL_VERSION,
             client_id: Self::client_id(),
-            request_id,
+            request_id: Self::next_request_id(),
             command,
-        };
+        }
+    }
+
+    fn exchange(&self, command: Command) -> Result<WireResponse, DaemonError> {
+        // A lookup only reads: it returns queued/started progress as its answer
+        // and has no outcome of its own to lose.
+        let lookup = matches!(command, Command::GetOutcome { .. });
+        let mut stream = self.dial()?;
+        let request = Self::request(command);
+        let request_id = request.request_id;
         let frame = encode_request(&request)?;
         if let Err(error) = stream.write_all(&frame) {
             // write_all may have delivered a complete request before the
             // transport error became visible. Conservatively preserve the
             // correlation ID instead of inviting a duplicate mutation.
-            return Err(if outcome_recoverable {
-                outcome_unknown(request_id)
-            } else {
+            return Err(if lookup {
                 map_io_error(error)
+            } else {
+                outcome_unknown(request_id)
             });
         }
         let mut reader = BufReader::new(stream);
         loop {
-            let line = match read_frame(&mut reader) {
-                Ok(line) => line,
-                Err(DaemonError::Timeout) if outcome_recoverable => {
-                    return Err(outcome_unknown(request_id));
+            // Once the request is sent, any failed read (timeout, reset, EOF,
+            // cut-off or oversized reply) leaves its outcome unknown.
+            let line = read_frame(&mut reader, &mut Vec::new()).map_err(|error| {
+                if lookup {
+                    error
+                } else {
+                    outcome_unknown(request_id)
                 }
-                Err(DaemonError::Protocol(message))
-                    if outcome_recoverable && message == "no response from daemon" =>
-                {
-                    return Err(outcome_unknown(request_id));
-                }
-                Err(error) => return Err(error),
-            };
-            let response: WireResponse = serde_json::from_str(&line).map_err(|error| {
-                DaemonError::Protocol(format!("invalid response JSON: {error}"))
             })?;
-            if response.version != PROTOCOL_VERSION {
-                return Err(DaemonError::Protocol(format!(
-                    "unsupported response version {}; expected {PROTOCOL_VERSION}",
-                    response.version
-                )));
-            }
-            if response.request_id != Some(request_id) {
-                return Err(DaemonError::Protocol(format!(
-                    "response request ID {:?} does not match {}",
-                    response.request_id,
-                    request_id.get()
-                )));
-            }
-            if wait_for_completion
+            let response = parse_reply(&line, request_id)?;
+            if !lookup
                 && matches!(
                     response.outcome,
                     RequestOutcome::Queued | RequestOutcome::Started
@@ -157,6 +119,11 @@ impl Client {
             }
             return Err(map_wire_error(response));
         }
+    }
+
+    /// Sends a command whose reply carries no payload.
+    pub fn send(&self, command: Command) -> Result<(), DaemonError> {
+        self.exchange(command).map(|_| ())
     }
 
     pub fn get_state(&self) -> Result<WireStatus, DaemonError> {
@@ -177,11 +144,6 @@ impl Client {
             .ok_or_else(|| DaemonError::Protocol("missing apply response".into()))
     }
 
-    pub fn apply_undervolt_once(&self, offset: i32) -> Result<(), DaemonError> {
-        self.exchange(Command::ApplyUndervoltOnce { offset })?;
-        Ok(())
-    }
-
     pub fn factory_fan_curves(
         &self,
         ppd_profiles: Vec<String>,
@@ -191,57 +153,18 @@ impl Client {
             .ok_or_else(|| DaemonError::Protocol("missing factory fan curves".into()))
     }
 
-    pub fn battery_limit_set(&self, limit: i32) -> Result<(), DaemonError> {
-        self.exchange(Command::SetBatteryLimit { limit })?;
-        Ok(())
-    }
-
-    pub fn battery_one_time_charge_set(&self, enabled: bool) -> Result<(), DaemonError> {
-        self.exchange(Command::SetBatteryOneTimeCharge { enabled })?;
-        Ok(())
-    }
-
-    pub fn panel_overdrive_set(&self, enabled: bool) -> Result<(), DaemonError> {
-        self.exchange(Command::SetPanelOverdrive { enabled })?;
-        Ok(())
-    }
-
-    pub fn apply_lighting(&self, device: &str, state: LightingState) -> Result<(), DaemonError> {
-        self.exchange(Command::SetLighting {
-            device: device.into(),
-            state,
-        })?;
-        Ok(())
-    }
-
-    pub fn release_fans(&self) -> Result<(), DaemonError> {
-        self.exchange(Command::ReleaseFans)?;
-        Ok(())
-    }
-
-    pub fn set_controller_capture(&self, enabled: bool) -> Result<(), DaemonError> {
-        self.exchange(Command::SetControllerCapture { enabled })?;
-        Ok(())
-    }
-
     /// Look up an accepted request using the complete recovery identity shown
     /// by [`DaemonError::OutcomeUnknown`]. This supports a new process after
     /// the process that submitted the request has exited.
     pub fn get_outcome_for(
         &self,
         client_id: ClientId,
-        request_id: u64,
+        target: RequestId,
     ) -> Result<WireResponse, DaemonError> {
-        let target =
-            RequestId::try_from(request_id).map_err(|error| DaemonError::Protocol(error.into()))?;
-        let response = self.exchange_with_id(
-            Self::next_request_id(),
-            Command::GetOutcome {
-                target_client_id: client_id,
-                target_request_id: target,
-            },
-            false,
-        )?;
+        let response = self.exchange(Command::GetOutcome {
+            target_client_id: client_id,
+            target_request_id: target,
+        })?;
         if response.outcome_client_id != Some(client_id)
             || response.outcome_request_id != Some(target)
         {
@@ -257,25 +180,17 @@ impl Client {
         events: &[EventTopic],
     ) -> Result<(std::sync::mpsc::Receiver<DaemonEvent>, SubscribeCancel), DaemonError> {
         let mut stream = self.dial()?;
-        let request_id = Self::next_request_id();
-        let request = WireRequest {
-            version: PROTOCOL_VERSION,
-            client_id: Self::client_id(),
-            request_id,
-            command: Command::Subscribe {
-                events: events.to_vec(),
-            },
-        };
-        write_frame(&mut stream, &request)?;
+        let request = Self::request(Command::Subscribe {
+            events: events.to_vec(),
+        });
+        stream
+            .write_all(&encode_request(&request)?)
+            .map_err(map_io_error)?;
         let mut reader = BufReader::new(stream);
-        let ack = read_frame(&mut reader)?;
-        let response: WireResponse =
-            serde_json::from_str(&ack).map_err(|error| DaemonError::Protocol(error.to_string()))?;
-        if response.version != PROTOCOL_VERSION || response.request_id != Some(request_id) {
-            return Err(DaemonError::Protocol(
-                "subscription response correlation mismatch".into(),
-            ));
-        }
+        let response = parse_reply(
+            &read_frame(&mut reader, &mut Vec::new())?,
+            request.request_id,
+        )?;
         if !response.ok {
             return Err(map_wire_error(response));
         }
@@ -286,28 +201,34 @@ impl Client {
         let (tx, rx) = std::sync::mpsc::sync_channel(EVENT_BUFFER_CAPACITY);
         let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            // Survives read timeouts so a frame split across polls is kept.
+            let mut partial = Vec::new();
             loop {
                 if cancel_rx.try_recv().is_ok() {
                     break;
                 }
-                match read_frame(&mut reader) {
-                    Ok(line) => {
-                        if let Ok(response) = serde_json::from_str::<WireResponse>(&line)
-                            && let Some(event) = response.event
-                        {
-                            match tx.try_send(event) {
-                                Ok(()) => {}
-                                // Events are notifications, not an authoritative
-                                // state log. Under a stalled consumer, retain the
-                                // bounded memory guarantee and let the next status
-                                // reconciliation recover coalescible state.
-                                Err(std::sync::mpsc::TrySendError::Full(_)) => {}
-                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
-                            }
-                        }
-                    }
-                    Err(DaemonError::Timeout) => {}
+                let line = match read_frame(&mut reader, &mut partial) {
+                    Ok(line) => line,
+                    Err(DaemonError::Timeout) => continue,
                     Err(_) => break,
+                };
+                // A malformed event frame ends the stream so the subscriber
+                // sees a disconnect instead of silently missing events.
+                let Some(event) = serde_json::from_str::<WireResponse>(&line)
+                    .ok()
+                    .filter(|response| response.version == PROTOCOL_VERSION && response.ok)
+                    .and_then(|response| response.event)
+                else {
+                    break;
+                };
+                match tx.try_send(event) {
+                    Ok(()) => {}
+                    // Events are notifications, not an authoritative
+                    // state log. Under a stalled consumer, retain the
+                    // bounded memory guarantee and let the next status
+                    // reconciliation recover coalescible state.
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {}
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                 }
             }
         });
@@ -332,17 +253,12 @@ impl Drop for SubscribeCancel {
     }
 }
 
-fn write_frame(stream: &mut impl Write, value: &WireRequest) -> Result<(), DaemonError> {
-    let frame = encode_request(value)?;
-    stream.write_all(&frame).map_err(map_io_error)
-}
-
 fn encode_request(value: &WireRequest) -> Result<Vec<u8>, DaemonError> {
     let body =
         serde_json::to_vec(value).map_err(|error| DaemonError::Protocol(error.to_string()))?;
-    if body.len() + 1 > PROTOCOL_MAX_FRAME_BYTES {
+    if body.len() + 1 > MAX_FRAME_BYTES {
         return Err(DaemonError::Protocol(format!(
-            "outgoing frame exceeds {PROTOCOL_MAX_FRAME_BYTES} bytes"
+            "outgoing frame exceeds {MAX_FRAME_BYTES} bytes"
         )));
     }
     let mut frame = body;
@@ -350,22 +266,53 @@ fn encode_request(value: &WireRequest) -> Result<Vec<u8>, DaemonError> {
     Ok(frame)
 }
 
-fn read_frame(reader: &mut impl BufRead) -> Result<String, DaemonError> {
-    let mut bytes = Vec::new();
-    let read = reader
-        .take((PROTOCOL_MAX_FRAME_BYTES + 1) as u64)
-        .read_until(b'\n', &mut bytes)
+/// Reads one frame. On error, `bytes` keeps what was read so a caller polling
+/// with a read timeout can resume the same frame.
+fn read_frame(reader: &mut impl BufRead, bytes: &mut Vec<u8>) -> Result<String, DaemonError> {
+    let limit = (MAX_FRAME_BYTES + 1).saturating_sub(bytes.len());
+    reader
+        .take(limit as u64)
+        .read_until(b'\n', bytes)
         .map_err(map_io_error)?;
-    if read == 0 {
+    let mut frame = std::mem::take(bytes);
+    if frame.is_empty() {
         return Err(DaemonError::Protocol("no response from daemon".into()));
     }
-    if bytes.last() != Some(&b'\n') || bytes.len() > PROTOCOL_MAX_FRAME_BYTES {
+    if frame.len() > MAX_FRAME_BYTES {
         return Err(DaemonError::Protocol(format!(
-            "incoming frame exceeds {PROTOCOL_MAX_FRAME_BYTES} bytes"
+            "incoming frame exceeds {MAX_FRAME_BYTES} bytes"
         )));
     }
-    bytes.pop();
-    String::from_utf8(bytes).map_err(|error| DaemonError::Protocol(error.to_string()))
+    if frame.pop() != Some(b'\n') {
+        return Err(DaemonError::Protocol(
+            "daemon closed the connection mid-frame".into(),
+        ));
+    }
+    String::from_utf8(frame).map_err(|error| DaemonError::Protocol(error.to_string()))
+}
+
+/// Decodes the reply to `request_id`. The daemon answers a request it could not
+/// parse or admit without a request ID, so that error wins over correlation.
+fn parse_reply(line: &str, request_id: RequestId) -> Result<WireResponse, DaemonError> {
+    let response: WireResponse = serde_json::from_str(line)
+        .map_err(|error| DaemonError::Protocol(format!("invalid response JSON: {error}")))?;
+    if response.version != PROTOCOL_VERSION {
+        return Err(DaemonError::Protocol(format!(
+            "unsupported response version {}; expected {PROTOCOL_VERSION}",
+            response.version
+        )));
+    }
+    if !response.ok && response.request_id.is_none() {
+        return Err(map_wire_error(response));
+    }
+    if response.request_id != Some(request_id) {
+        return Err(DaemonError::Protocol(format!(
+            "response request ID {:?} does not match {}",
+            response.request_id,
+            request_id.get()
+        )));
+    }
+    Ok(response)
 }
 
 fn map_wire_error(response: WireResponse) -> DaemonError {
@@ -375,6 +322,11 @@ fn map_wire_error(response: WireResponse) -> DaemonError {
     match error.code {
         ErrorCode::NotRunning => DaemonError::NotRunning,
         ErrorCode::PermissionDenied => DaemonError::PermissionDenied,
+        // Expired in the queue: it never started, so keep the daemon's
+        // message and report it as a plain (retry-safe) rejection.
+        ErrorCode::Timeout if response.outcome == RequestOutcome::Expired => {
+            DaemonError::Rejected(error.message)
+        }
         ErrorCode::Timeout => DaemonError::Timeout,
         ErrorCode::Protocol => DaemonError::Protocol(error.message),
         ErrorCode::Rejected | ErrorCode::Unsupported | ErrorCode::Degraded => {
@@ -406,41 +358,40 @@ fn map_io_error(error: std::io::Error) -> DaemonError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufReader, Cursor};
+    use std::io::Cursor;
     use std::os::unix::net::UnixListener;
+    use z13helper_core::error::WireError;
 
-    fn assert_command(
-        check: impl FnOnce(Command) + Send + 'static,
-        invoke: impl FnOnce(Client) -> Result<(), DaemonError>,
-    ) {
-        let dir = std::env::temp_dir().join(format!(
-            "z13helper-client-command-{}-{}",
+    /// Serves one connection: reads the request line, then hands over.
+    fn fake_daemon(
+        name: &str,
+        serve: impl FnOnce(UnixStream, WireRequest) + Send + 'static,
+    ) -> Client {
+        let directory = std::env::temp_dir().join(format!(
+            "z13helper-client-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("daemon.sock");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("daemon.sock");
         let listener = UnixListener::bind(&path).unwrap();
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let _ = std::fs::remove_dir_all(&directory);
             let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            let request: WireRequest = serde_json::from_str(line.trim()).unwrap();
-            let request_id = request.request_id;
-            check(request.command);
-            let mut stream = stream;
-            writeln!(
-                stream,
-                "{}",
-                serde_json::to_string(&WireResponse::success(request_id)).unwrap()
-            )
-            .unwrap();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            serve(stream, serde_json::from_str(line.trim()).unwrap());
         });
-        invoke(Client::with_path(path)).unwrap();
+        Client::with_path(path)
+    }
+
+    fn reply(stream: &mut UnixStream, response: &WireResponse) {
+        writeln!(stream, "{}", serde_json::to_string(response).unwrap()).unwrap();
     }
 
     #[test]
@@ -450,56 +401,10 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_response_exposes_outcome_unknown_request_id() {
-        let directory = std::env::temp_dir().join(format!(
-            "z13helper-client-outcome-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("daemon.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-        });
-        let error = Client::with_path(&path).get_state().unwrap_err();
-        assert!(matches!(
-            error,
-            DaemonError::OutcomeUnknown {
-                client_id,
-                request_id,
-            } if client_id.get() != 0 && request_id != 0
-        ));
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
     fn outcome_lookup_returns_progress_with_target_correlation() {
         let target_client_id = ClientId::new(9).unwrap();
-        let directory = std::env::temp_dir().join(format!(
-            "z13helper-client-lookup-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("daemon.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            let request: WireRequest = serde_json::from_str(request.trim()).unwrap();
-            let target = RequestId::new(77).unwrap();
+        let target = RequestId::new(77).unwrap();
+        let client = fake_daemon("lookup", move |mut stream, request| {
             let mut response = WireResponse::progress(request.request_id, RequestOutcome::Started);
             let Command::GetOutcome {
                 target_client_id,
@@ -511,52 +416,33 @@ mod tests {
             assert_eq!(target_request_id, target);
             response.outcome_client_id = Some(target_client_id);
             response.outcome_request_id = Some(target);
-            let mut stream = stream;
-            writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            reply(&mut stream, &response);
         });
-        let response = Client::with_path(&path)
-            .get_outcome_for(target_client_id, 77)
-            .unwrap();
+        let response = client.get_outcome_for(target_client_id, target).unwrap();
         assert_eq!(response.outcome, RequestOutcome::Started);
         assert_eq!(response.outcome_client_id, Some(target_client_id));
-        assert_eq!(
-            response.outcome_request_id,
-            Some(RequestId::new(77).unwrap())
-        );
-        let _ = std::fs::remove_dir_all(directory);
+        assert_eq!(response.outcome_request_id, Some(target));
     }
 
     #[test]
     fn failed_outcome_lookup_is_retryable_without_an_uncacheable_recovery_token() {
-        let directory = std::env::temp_dir().join(format!(
-            "z13helper-client-lookup-close-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("daemon.sock");
-        let listener = UnixListener::bind(&path).unwrap();
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-        });
-        let error = Client::with_path(&path)
-            .get_outcome_for(ClientId::new(9).unwrap(), 77)
+        let client = fake_daemon("lookup-close", |_, _| {});
+        let error = client
+            .get_outcome_for(ClientId::new(9).unwrap(), RequestId::new(77).unwrap())
             .unwrap_err();
         assert!(!matches!(error, DaemonError::OutcomeUnknown { .. }));
-        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
     fn frames_are_bounded_in_both_directions() {
-        let mut reader = BufReader::new(Cursor::new(vec![b'x'; PROTOCOL_MAX_FRAME_BYTES + 1]));
+        let mut exact = vec![b'x'; MAX_FRAME_BYTES - 1];
+        exact.push(b'\n');
+        let frame = read_frame(&mut BufReader::new(Cursor::new(exact)), &mut Vec::new()).unwrap();
+        assert_eq!(frame.len(), MAX_FRAME_BYTES - 1);
+
+        let mut reader = BufReader::new(Cursor::new(vec![b'x'; MAX_FRAME_BYTES + 1]));
         assert!(matches!(
-            read_frame(&mut reader),
+            read_frame(&mut reader, &mut Vec::new()),
             Err(DaemonError::Protocol(message)) if message.contains("exceeds")
         ));
 
@@ -565,158 +451,134 @@ mod tests {
             client_id: ClientId::new(1).unwrap(),
             request_id: RequestId::new(99).unwrap(),
             command: Command::GetFactoryFanCurves {
-                ppd_profiles: vec!["x".repeat(PROTOCOL_MAX_FRAME_BYTES)],
+                ppd_profiles: vec!["x".repeat(MAX_FRAME_BYTES)],
             },
         };
         assert!(matches!(
-            write_frame(&mut Vec::new(), &request),
+            encode_request(&request),
             Err(DaemonError::Protocol(message)) if message.contains("exceeds")
         ));
     }
 
     #[test]
-    fn exact_frame_boundary_is_accepted() {
-        let mut bytes = vec![b'x'; PROTOCOL_MAX_FRAME_BYTES - 1];
-        bytes.push(b'\n');
-        let mut reader = BufReader::new(Cursor::new(bytes));
-        let frame = read_frame(&mut reader).unwrap();
-        assert_eq!(frame.len(), PROTOCOL_MAX_FRAME_BYTES - 1);
-    }
-
-    #[test]
     fn get_state_uses_versioned_protocol() {
-        let dir = std::env::temp_dir().join(format!("z13helper-client-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("daemon.sock");
-        let _ = std::fs::remove_file(&path);
-        let listener = match UnixListener::bind(&path) {
-            Ok(listener) => listener,
-            // Some CI sandboxes prohibit AF_UNIX entirely. Error mapping is
-            // covered above; run this transport test on an unrestricted host.
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(error) => panic!("bind {}: {error}", path.display()),
-        };
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            assert!(request.contains("\"version\":3"));
-            assert!(request.contains("\"cmd\":\"get-state\""));
-            let request_id = serde_json::from_str::<WireRequest>(request.trim())
-                .unwrap()
-                .request_id;
-            let state = WireStatus {
+        let client = fake_daemon("get-state", |mut stream, request| {
+            let wire = serde_json::to_string(&request).unwrap();
+            assert!(wire.contains("\"version\":3"));
+            assert!(wire.contains("\"cmd\":\"get-state\""));
+            let mut response = WireResponse::success(request.request_id);
+            response.state = Some(WireStatus {
                 ppd_profile: Some("balanced".into()),
                 ..WireStatus::default()
-            };
-            let response = WireResponse {
-                version: PROTOCOL_VERSION,
-                request_id: Some(request_id),
-                outcome: RequestOutcome::Completed,
-                outcome_client_id: None,
-                outcome_request_id: None,
-                ok: true,
-                state: Some(state),
-                apply: None,
-                probe: None,
-                factory_fan_curves: None,
-                event: None,
-                error: None,
-            };
-            let mut stream = stream;
-            writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            });
+            reply(&mut stream, &response);
         });
-        let state = Client::with_path(path).get_state().unwrap();
+        let state = client.get_state().unwrap();
         assert_eq!(state.ppd_profile.as_deref(), Some("balanced"));
     }
 
     #[test]
-    fn scalar_commands_use_typed_daemon_requests() {
-        assert_command(
-            |command| {
-                assert!(matches!(
-                    command,
-                    Command::SetBatteryOneTimeCharge { enabled: true }
-                ))
-            },
-            |client| client.battery_one_time_charge_set(true),
-        );
-        assert_command(
-            |command| {
-                assert!(matches!(
-                    command,
-                    Command::SetPanelOverdrive { enabled: true }
-                ))
-            },
-            |client| client.panel_overdrive_set(true),
-        );
-        let expected = LightingState {
-            enabled: false,
-            mode: "static".into(),
-            color: "112233".into(),
-            color2: "445566".into(),
-            speed: "slow".into(),
-            brightness: 1,
-        };
-        let expected_for_check = expected.clone();
-        assert_command(
-            move |command| {
-                assert!(
-                    matches!(command, Command::SetLighting { device, state } if device == "keyboard" && state == expected_for_check)
-                )
-            },
-            move |client| client.apply_lighting("keyboard", expected),
-        );
-        assert_command(
-            |command| {
-                assert!(matches!(
-                    command,
-                    Command::ApplyUndervoltOnce { offset: -20 }
-                ))
-            },
-            |client| client.apply_undervolt_once(-20),
+    fn factory_fan_curves_are_returned_by_ppd_profile() {
+        let expected = z13helper_core::stock_fan_curves(Some("balanced"));
+        let client = fake_daemon("factory-fans", move |mut stream, request| {
+            let wire = serde_json::to_string(&request).unwrap();
+            assert!(wire.contains("\"cmd\":\"get-factory-fan-curves\""));
+            assert!(wire.contains("\"balanced\""));
+            let mut response = WireResponse::success(request.request_id);
+            response.factory_fan_curves = Some(HashMap::from([("balanced".into(), expected)]));
+            reply(&mut stream, &response);
+        });
+        let curves = client.factory_fan_curves(vec!["balanced".into()]).unwrap();
+        assert_eq!(curves["balanced"], expected);
+    }
+
+    #[test]
+    fn a_reply_cut_off_after_send_leaves_the_outcome_unknown() {
+        let client = fake_daemon("cut-off", |mut stream, _| {
+            stream.write_all(b"{\"version\":3,").unwrap();
+        });
+        assert!(matches!(
+            client.get_state(),
+            Err(DaemonError::OutcomeUnknown { .. })
+        ));
+    }
+
+    #[test]
+    fn a_frame_cut_off_at_eof_is_not_reported_as_oversized() {
+        let mut reader = BufReader::new(Cursor::new(b"{\"version\":3,".to_vec()));
+        assert!(matches!(
+            read_frame(&mut reader, &mut Vec::new()),
+            Err(DaemonError::Protocol(message)) if message.contains("closed")
+        ));
+    }
+
+    #[test]
+    fn an_expired_request_keeps_the_daemon_message() {
+        let mut response = WireResponse::success(RequestId::new(5).unwrap());
+        response.ok = false;
+        response.outcome = RequestOutcome::Expired;
+        response.error = Some(WireError {
+            code: ErrorCode::Timeout,
+            message: "request expired before start".into(),
+        });
+        assert_eq!(
+            map_wire_error(response),
+            DaemonError::Rejected("request expired before start".into())
         );
     }
 
     #[test]
-    fn factory_fan_curves_are_returned_by_ppd_profile() {
-        let dir = std::env::temp_dir().join(format!(
-            "z13helper-client-factory-fans-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("daemon.sock");
-        let listener = match UnixListener::bind(&path) {
-            Ok(listener) => listener,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(error) => panic!("bind {}: {error}", path.display()),
-        };
-        let expected = z13helper_core::stock_fan_curves(Some("balanced"));
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut request = String::new();
-            reader.read_line(&mut request).unwrap();
-            assert!(request.contains("\"cmd\":\"get-factory-fan-curves\""));
-            assert!(request.contains("\"balanced\""));
-            let request_id = serde_json::from_str::<WireRequest>(request.trim())
-                .unwrap()
-                .request_id;
-            let mut curves = HashMap::new();
-            curves.insert("balanced".into(), expected);
-            let mut response = WireResponse::success(request_id);
-            response.factory_fan_curves = Some(curves);
-            let mut stream = stream;
-            writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+    fn an_uncorrelated_daemon_error_is_reported_as_the_daemon_error() {
+        fn reject(mut stream: UnixStream, _: WireRequest) {
+            let mut response = WireResponse::success(RequestId::new(1).unwrap());
+            response.request_id = None;
+            response.ok = false;
+            response.error = Some(WireError {
+                code: ErrorCode::Rejected,
+                message: "too many active clients".into(),
+            });
+            reply(&mut stream, &response);
+        }
+        let expected = DaemonError::Rejected("too many active clients".into());
+        assert_eq!(
+            fake_daemon("uncorrelated", reject).get_state(),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            fake_daemon("uncorrelated-subscribe", reject)
+                .subscribe(&[EventTopic::StateChanged])
+                .err(),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn subscription_keeps_partial_frames_and_ends_on_malformed_ones() {
+        let client = fake_daemon("subscribe-partial", |mut stream, request| {
+            reply(&mut stream, &WireResponse::success(request.request_id));
+            let mut event = WireResponse::success(request.request_id);
+            event.request_id = None;
+            event.event = Some(DaemonEvent {
+                kind: EventTopic::GuiToggle,
+                action: None,
+                on_battery: None,
+            });
+            let frame = format!("{}\n", serde_json::to_string(&event).unwrap());
+            let (head, tail) = frame.split_at(10);
+            stream.write_all(head.as_bytes()).unwrap();
+            // Outlast the client's 500 ms poll so the frame spans a read timeout.
+            std::thread::sleep(Duration::from_millis(700));
+            stream.write_all(tail.as_bytes()).unwrap();
+            stream.write_all(b"not json\n").unwrap();
+            // Hold the connection open until the client hangs up.
+            let _ = stream.read(&mut [0_u8; 1]);
         });
-        let curves = Client::with_path(path)
-            .factory_fan_curves(vec!["balanced".into()])
-            .unwrap();
-        assert_eq!(curves["balanced"], expected);
+        let (events, _cancel) = client.subscribe(&[EventTopic::GuiToggle]).unwrap();
+        let event = events.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(event.kind, EventTopic::GuiToggle);
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(3)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 }

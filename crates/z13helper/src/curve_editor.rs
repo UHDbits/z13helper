@@ -7,9 +7,7 @@ use z13helper_core::curve::{self, Curve, POINT_COUNT};
 
 type ChangedCallback = Box<dyn Fn(Curve)>;
 
-const CHART_TEMP_MIN: i32 = 20;
-const CHART_TEMP_MAX: i32 = 100;
-const CHART_TEMP_RANGE: f64 = (CHART_TEMP_MAX - CHART_TEMP_MIN) as f64;
+const CHART_TEMP_RANGE: f64 = (curve::TEMP_MAX - curve::TEMP_MIN) as f64;
 
 #[derive(Clone)]
 pub struct CurveEditor {
@@ -101,17 +99,9 @@ impl CurveEditor {
             .unwrap_or(11.0)
     }
 
-    fn chart_geom(w: f64, h: f64, font_size: f64) -> (f64, f64, f64, f64) {
-        let pad_left = (font_size * 4.4).max(48.0);
-        let pad_right = 16.0;
-        let pad_top = (font_size * 1.8).max(20.0);
-        let pad_bottom = (font_size * 3.2).max(36.0);
-        (
-            pad_left,
-            pad_top,
-            (w - pad_left - pad_right).max(1.0),
-            (h - pad_top - pad_bottom).max(1.0),
-        )
+    fn geom(&self) -> ChartGeom {
+        let (w, h) = (self.area.width() as f64, self.area.height() as f64);
+        ChartGeom::new(w, h, Self::font_size(&self.area))
     }
 
     fn update_accessibility(&self) {
@@ -141,9 +131,10 @@ impl CurveEditor {
             let w = width as f64;
             let h = height as f64;
             let font_size = Self::font_size(area);
-            let (left, top, cw, ch) = Self::chart_geom(w, h, font_size);
-            let x = |temp: i32| left + (temp - CHART_TEMP_MIN) as f64 / CHART_TEMP_RANGE * cw;
-            let y = |pwm: i32| top + (1.0 - pwm as f64 / 255.0) * ch;
+            let geom = ChartGeom::new(w, h, font_size);
+            let (left, top, cw, ch) = (geom.left, geom.top, geom.width, geom.height);
+            let x = |temp| geom.x(temp);
+            let y = |pwm| geom.y(pwm);
             let foreground = area.color();
             let set_color = |color: &gtk::gdk::RGBA, opacity: f64| {
                 cr.set_source_rgba(
@@ -157,7 +148,7 @@ impl CurveEditor {
             // Grid.
             cr.set_line_width(1.0);
             set_color(&foreground, 0.18);
-            for t in (CHART_TEMP_MIN..=CHART_TEMP_MAX).step_by(10) {
+            for t in (curve::TEMP_MIN..=curve::TEMP_MAX).step_by(10) {
                 cr.move_to(x(t), top);
                 cr.line_to(x(t), top + ch);
             }
@@ -180,7 +171,7 @@ impl CurveEditor {
                 gtk::cairo::FontWeight::Normal,
             );
             cr.set_font_size(font_size);
-            for t in (CHART_TEMP_MIN..=CHART_TEMP_MAX).step_by(10) {
+            for t in (curve::TEMP_MIN..=curve::TEMP_MAX).step_by(10) {
                 let label = format!("{t}");
                 if let Ok(ext) = cr.text_extents(&label) {
                     cr.move_to(x(t) - ext.width() / 2.0, top + ch + 16.0);
@@ -300,18 +291,14 @@ impl CurveEditor {
     }
 
     fn closest_point(&self, px: f64, py: f64) -> usize {
-        let w = self.area.width() as f64;
-        let h = self.area.height() as f64;
-        let (left, top, cw, ch) = Self::chart_geom(w, h, Self::font_size(&self.area));
-        let x = |t: i32| left + (t - CHART_TEMP_MIN) as f64 / CHART_TEMP_RANGE * cw;
-        let y = |p: i32| top + (1.0 - p as f64 / 255.0) * ch;
+        let geom = self.geom();
         let curve = self.display_curve();
         curve
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                let da = (x(a[0]) - px).powi(2) + (y(a[1]) - py).powi(2);
-                let db = (x(b[0]) - px).powi(2) + (y(b[1]) - py).powi(2);
+                let da = (geom.x(a[0]) - px).powi(2) + (geom.y(a[1]) - py).powi(2);
+                let db = (geom.x(b[0]) - px).powi(2) + (geom.y(b[1]) - py).powi(2);
                 da.partial_cmp(&db).unwrap()
             })
             .map(|(i, _)| i)
@@ -319,28 +306,78 @@ impl CurveEditor {
     }
 
     fn move_point(&self, idx: usize, px: f64, py: f64, vertical_only: bool) {
-        let w = self.area.width() as f64;
-        let h = self.area.height() as f64;
-        let (left, top, cw, ch) = Self::chart_geom(w, h, Self::font_size(&self.area));
-        let temp = (CHART_TEMP_MIN as f64 + (px - left) / cw * CHART_TEMP_RANGE)
-            .round()
-            .clamp(CHART_TEMP_MIN as f64, CHART_TEMP_MAX as f64) as i32;
-        let pwm = ((1.0 - (py - top) / ch) * 255.0).round() as i32;
+        let geom = self.geom();
+        let temp = geom.temp_at(px);
+        let pwm = geom.pwm_at(py);
         let mut curve = self.curve.borrow_mut();
         if self.high_power_protection.get() && idx >= 6 {
             return;
         }
-        if vertical_only {
-            let delta = pwm - curve[idx][1];
-            curve::shift_curve_vertical(&mut curve, delta);
-        } else {
-            curve[idx][0] = temp;
-            curve[idx][1] = pwm;
-            curve::enforce_curve(&mut curve, idx);
-        }
+        let changed = drag_authored_point(&mut curve, idx, temp, pwm, vertical_only);
         drop(curve);
-        self.emit_changed();
+        if changed {
+            self.emit_changed();
+        }
     }
+}
+
+/// Plot area inside the drawing area, and the temp/PWM <-> pixel mapping.
+struct ChartGeom {
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+}
+
+impl ChartGeom {
+    fn new(w: f64, h: f64, font_size: f64) -> Self {
+        let left = (font_size * 4.4).max(48.0);
+        let top = (font_size * 1.8).max(20.0);
+        let bottom = (font_size * 3.2).max(36.0);
+        Self {
+            left,
+            top,
+            width: (w - left - 16.0).max(1.0),
+            height: (h - top - bottom).max(1.0),
+        }
+    }
+
+    fn x(&self, temp: i32) -> f64 {
+        self.left + (temp - curve::TEMP_MIN) as f64 / CHART_TEMP_RANGE * self.width
+    }
+
+    fn y(&self, pwm: i32) -> f64 {
+        self.top + (1.0 - pwm as f64 / 255.0) * self.height
+    }
+
+    fn temp_at(&self, px: f64) -> i32 {
+        (curve::TEMP_MIN as f64 + (px - self.left) / self.width * CHART_TEMP_RANGE)
+            .round()
+            .clamp(curve::TEMP_MIN as f64, curve::TEMP_MAX as f64) as i32
+    }
+
+    fn pwm_at(&self, py: f64) -> i32 {
+        ((1.0 - (py - self.top) / self.height) * 255.0).round() as i32
+    }
+}
+
+fn drag_authored_point(
+    curve: &mut Curve,
+    idx: usize,
+    temp: i32,
+    pwm: i32,
+    vertical_only: bool,
+) -> bool {
+    let before = *curve;
+    if vertical_only {
+        let delta = pwm - curve[idx][1];
+        curve::shift_curve_vertical(curve, delta);
+    } else {
+        curve[idx][0] = temp;
+        curve[idx][1] = pwm;
+        curve::enforce_curve(curve, idx);
+    }
+    *curve != before
 }
 
 fn adjust_authored_point(
@@ -382,7 +419,7 @@ fn curve_for_display(authored: &Curve, protection: bool) -> Curve {
 
 #[cfg(test)]
 mod tests {
-    use super::{adjust_authored_point, curve_for_display};
+    use super::{adjust_authored_point, curve_for_display, drag_authored_point};
     use z13helper_core::curve::{self, Curve};
 
     fn test_curve() -> Curve {
@@ -399,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_pwm_adjustment_uses_saturating_authored_deltas() {
+    fn keyboard_adjustment_saturates_and_preserves_authored_curve_invariants() {
         let mut curve = test_curve();
         curve[0][1] = 0;
         assert!(!adjust_authored_point(&mut curve, 0, 0, -1));
@@ -421,10 +458,7 @@ mod tests {
         assert!(adjust_authored_point(&mut curve, 0, 0, -1));
         assert_eq!(curve[0][1], 253);
         assert!(curve::validate(&curve).is_ok());
-    }
 
-    #[test]
-    fn keyboard_adjustment_preserves_authored_curve_invariants() {
         let mut curve = test_curve();
         assert!(adjust_authored_point(&mut curve, 4, 0, -5));
         assert!(curve::validate(&curve).is_ok());
@@ -432,6 +466,17 @@ mod tests {
             assert!(pair[1][0] > pair[0][0]);
             assert!(pair[1][1] >= pair[0][1]);
         }
+    }
+
+    #[test]
+    fn drag_without_movement_reports_no_change() {
+        let mut curve = test_curve();
+        let [temp, pwm] = curve[3];
+        assert!(!drag_authored_point(&mut curve, 3, temp, pwm, false));
+        assert!(!drag_authored_point(&mut curve, 3, temp, pwm, true));
+        assert_eq!(curve, test_curve());
+        assert!(drag_authored_point(&mut curve, 3, temp + 2, pwm, false));
+        assert!(drag_authored_point(&mut curve, 3, temp + 2, pwm + 10, true));
     }
 
     #[test]

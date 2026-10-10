@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::ffi::{c_char, c_int, c_long, c_void};
 use std::fs;
+use std::io;
 use std::ptr;
 
 const BLOCKER: &[u8] = include_bytes!("../bpf/hidraw_blocker.bpf.o");
@@ -82,17 +83,10 @@ impl HidrawBlocker {
             )
         };
         if object.is_null() {
-            return Err(format!(
-                "open BPF object: {}",
-                std::io::Error::last_os_error()
-            ));
+            return Err(format!("open BPF object: {}", io::Error::last_os_error()));
         }
         if unsafe { bpf_object__load(object) } != 0 {
-            unsafe { bpf_object__close(object) };
-            return Err(format!(
-                "load BPF object: {}",
-                std::io::Error::last_os_error()
-            ));
+            return Err(close_failed(object, "load BPF object"));
         }
         let config = unsafe {
             bpf_object__find_map_by_name(object, MAP_HIDRAW_CONFIG.as_ptr().cast::<c_char>())
@@ -123,19 +117,11 @@ impl HidrawBlocker {
             )
         };
         if update != 0 {
-            unsafe { bpf_object__close(object) };
-            return Err(format!(
-                "configure hidraw BPF map: {}",
-                std::io::Error::last_os_error()
-            ));
+            return Err(close_failed(object, "configure hidraw BPF map"));
         }
         let link = unsafe { bpf_program__attach_lsm(program) };
         if link.is_null() || unsafe { libbpf_get_error(link.cast::<c_void>()) } != 0 {
-            unsafe { bpf_object__close(object) };
-            return Err(format!(
-                "attach hidraw BPF LSM: {}",
-                std::io::Error::last_os_error()
-            ));
+            return Err(close_failed(object, "attach hidraw BPF LSM"));
         }
         tracing::info!(hidraw_major, "attached hidraw BPF LSM blocker");
         Ok(Self {
@@ -146,102 +132,33 @@ impl HidrawBlocker {
         })
     }
 
+    pub fn has_blocked_pids(&self) -> bool {
+        !self.blocked.is_empty()
+    }
+
     pub fn set_blocked_pids(&mut self, pids: impl IntoIterator<Item = u32>) -> Result<(), String> {
-        let target: BTreeSet<u32> = pids.into_iter().filter(|pid| *pid != 0).take(64).collect();
-        let original = self.blocked.clone();
+        let fd = self.blocked_pids_fd;
         let enabled = 1_u8;
-        let additions: BTreeSet<_> = target.difference(&self.blocked).copied().collect();
-        let removals: BTreeSet<_> = self.blocked.difference(&target).copied().collect();
-        let mut added = BTreeSet::new();
-        for pid in &additions {
-            let result = unsafe {
-                bpf_map_update_elem(
-                    self.blocked_pids_fd,
-                    (pid as *const u32).cast::<c_void>(),
-                    (&enabled as *const u8).cast::<c_void>(),
-                    0,
-                )
-            };
-            if result != 0 {
-                let error = std::io::Error::last_os_error();
-                added.insert(*pid);
-                return self.rollback_or_error(
-                    &original,
-                    &added,
-                    &BTreeSet::new(),
-                    format!("block hidraw PID {pid}: {error}"),
-                );
-            }
-            added.insert(*pid);
-        }
-        let mut removed = BTreeSet::new();
-        for pid in &removals {
-            let result = unsafe {
-                bpf_map_delete_elem(self.blocked_pids_fd, (pid as *const u32).cast::<c_void>())
-            };
-            let error = std::io::Error::last_os_error();
-            if result != 0 && error.raw_os_error() != Some(libc::ENOENT) {
-                return self.rollback_or_error(
-                    &original,
-                    &added,
-                    &removed,
-                    format!("unblock hidraw PID {pid}: {error}"),
-                );
-            }
-            removed.insert(*pid);
-        }
-        self.blocked = target;
-        Ok(())
-    }
-
-    fn rollback_or_error(
-        &mut self,
-        original: &BTreeSet<u32>,
-        added: &BTreeSet<u32>,
-        removed: &BTreeSet<u32>,
-        error: String,
-    ) -> Result<(), String> {
-        match self.rollback(added, removed) {
-            Ok(()) => Err(error),
-            Err(rollback) => {
-                self.blocked = original
-                    .union(added)
-                    .copied()
-                    .chain(removed.iter().copied())
-                    .collect();
-                Err(format!("{error}; BPF PID-map rollback failed: {rollback}"))
-            }
-        }
-    }
-
-    fn rollback(&self, added: &BTreeSet<u32>, removed: &BTreeSet<u32>) -> Result<(), String> {
-        let enabled = 1_u8;
-        for pid in removed {
-            let result = unsafe {
-                bpf_map_update_elem(
-                    self.blocked_pids_fd,
-                    (pid as *const u32).cast::<c_void>(),
-                    (&enabled as *const u8).cast::<c_void>(),
-                    0,
-                )
-            };
-            if result != 0 {
-                return Err(format!(
-                    "restore hidraw PID {pid}: {}",
-                    std::io::Error::last_os_error()
-                ));
-            }
-        }
-        for pid in added {
-            let result = unsafe {
-                bpf_map_delete_elem(self.blocked_pids_fd, (pid as *const u32).cast::<c_void>())
-            };
-            let error = std::io::Error::last_os_error();
-            if result != 0 && error.raw_os_error() != Some(libc::ENOENT) {
-                return Err(format!("remove partially-added hidraw PID {pid}: {error}"));
-            }
-        }
-        Ok(())
+        sync_blocked_pids(
+            &mut self.blocked,
+            pids,
+            |pid| {
+                map_result(unsafe {
+                    bpf_map_update_elem(
+                        fd,
+                        (&pid as *const u32).cast::<c_void>(),
+                        (&enabled as *const u8).cast::<c_void>(),
+                        0,
+                    )
+                })
+            },
+            |pid| match map_result(unsafe {
+                bpf_map_delete_elem(fd, (&pid as *const u32).cast::<c_void>())
+            }) {
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+                result => result,
+            },
+        )
     }
 }
 
@@ -254,6 +171,62 @@ impl Drop for HidrawBlocker {
             unsafe { bpf_object__close(self.object) };
         }
     }
+}
+
+fn map_result(result: c_int) -> io::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Moves the PID map from `blocked` to the first 64 non-zero `pids` in caller
+/// order. Additions go first and a failed one undoes the partial step. Removals
+/// are best-effort so a release clears every PID it can; `blocked` keeps the
+/// ones still in the map for the next call.
+fn sync_blocked_pids(
+    blocked: &mut BTreeSet<u32>,
+    pids: impl IntoIterator<Item = u32>,
+    mut insert: impl FnMut(u32) -> io::Result<()>,
+    mut remove: impl FnMut(u32) -> io::Result<()>,
+) -> Result<(), String> {
+    let target: BTreeSet<u32> = pids.into_iter().filter(|pid| *pid != 0).take(64).collect();
+    let additions: Vec<u32> = target.difference(blocked).copied().collect();
+    for (index, &pid) in additions.iter().enumerate() {
+        if let Err(error) = insert(pid) {
+            for &added in &additions[..index] {
+                if remove(added).is_err() {
+                    blocked.insert(added);
+                }
+            }
+            return Err(format!("block hidraw PID {pid}: {error}"));
+        }
+    }
+    blocked.extend(additions);
+    let removals: Vec<u32> = blocked.difference(&target).copied().collect();
+    let mut failed = Vec::new();
+    for pid in removals {
+        match remove(pid) {
+            Ok(()) => {
+                blocked.remove(&pid);
+            }
+            Err(error) => failed.push(format!("hidraw PID {pid}: {error}")),
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("unblock {}", failed.join(", ")))
+    }
+}
+
+/// Closes `object` after capturing errno from the libbpf call that just
+/// failed, so cleanup cannot clobber the reported cause.
+fn close_failed(object: *mut BpfObject, context: &str) -> String {
+    let error = io::Error::last_os_error();
+    unsafe { bpf_object__close(object) };
+    format!("{context}: {error}")
 }
 
 fn bpf_lsm_enabled() -> bool {
@@ -282,7 +255,61 @@ fn hidraw_major() -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::hidraw_major;
+    use super::{hidraw_major, sync_blocked_pids};
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+    use std::io;
+
+    #[test]
+    fn release_clears_every_pid_it_can_and_tracks_only_the_rest() {
+        let map = RefCell::new(BTreeSet::from([1, 2, 3]));
+        let mut blocked = map.borrow().clone();
+        let result = sync_blocked_pids(
+            &mut blocked,
+            [],
+            |pid| {
+                map.borrow_mut().insert(pid);
+                Ok(())
+            },
+            |pid| {
+                if pid == 2 {
+                    return Err(io::Error::from_raw_os_error(libc::EBUSY));
+                }
+                map.borrow_mut().remove(&pid);
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().contains("hidraw PID 2"));
+        assert_eq!(*map.borrow(), BTreeSet::from([2]));
+        assert_eq!(blocked, BTreeSet::from([2]));
+    }
+
+    #[test]
+    fn capacity_cut_keeps_caller_order_and_failed_block_restores_the_map() {
+        let mut blocked = BTreeSet::new();
+        sync_blocked_pids(&mut blocked, (1..=100).rev(), |_| Ok(()), |_| Ok(())).unwrap();
+        assert_eq!(blocked, (37..=100).collect());
+
+        let map = RefCell::new(blocked.clone());
+        let result = sync_blocked_pids(
+            &mut blocked,
+            [200, 201, 202],
+            |pid| {
+                if pid == 202 {
+                    return Err(io::Error::from_raw_os_error(libc::E2BIG));
+                }
+                map.borrow_mut().insert(pid);
+                Ok(())
+            },
+            |pid| {
+                map.borrow_mut().remove(&pid);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(*map.borrow(), (37..=100).collect());
+        assert_eq!(blocked, (37..=100).collect());
+    }
 
     #[test]
     fn reads_hidraw_major_from_proc_devices() {

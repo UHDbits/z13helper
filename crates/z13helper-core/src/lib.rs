@@ -11,7 +11,7 @@ pub mod protocol;
 
 pub use apply::{Daemon, apply_request};
 pub use config::Config;
-pub use curve::HIGH_POWER_THRESHOLD_W;
+pub use curve::fan_protection_required;
 pub use error::DaemonError;
 pub use profile::{FanControlMode, Profile, stock_fan_curves, stock_ppt};
 pub use protocol::*;

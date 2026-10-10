@@ -112,13 +112,14 @@ impl PowerDebouncer {
 
     /// Cancel an unconfirmed transition when the observation source becomes
     /// unknown. The last confirmed state remains authoritative.
-    pub fn invalidate_pending(&mut self) {
+    fn invalidate_pending(&mut self) {
         if self.pending.take().is_some() {
             self.next_generation();
         }
     }
 
-    pub fn confirmed(&self) -> Option<bool> {
+    #[cfg(test)]
+    fn confirmed(&self) -> Option<bool> {
         self.confirmed
     }
 

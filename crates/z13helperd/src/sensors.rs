@@ -79,29 +79,26 @@ fn credible_temperature(temperature_millic: i32) -> Result<i32, SensorError> {
     Ok(temperature_millic)
 }
 
-pub fn read_temperature_millic_from(root: &Path) -> Result<i32, SensorError> {
-    let mut entries = fs::read_dir(root)
+/// Hwmon directories under `root` whose `name` is `name`, sorted.
+fn hwmon_dirs(root: &Path, name: &str) -> Result<Vec<PathBuf>, SensorError> {
+    let mut directories = fs::read_dir(root)
         .map_err(SensorError::Enumerate)?
+        .map(|entry| entry.map(|entry| entry.path()))
         .collect::<Result<Vec<_>, _>>()
         .map_err(SensorError::Enumerate)?;
-    entries.sort_by_key(|entry| entry.file_name());
+    directories.sort();
+    directories
+        .retain(|directory| read_trimmed(&directory.join("name")).is_ok_and(|value| value == name));
+    Ok(directories)
+}
+
+pub fn read_temperature_millic_from(root: &Path) -> Result<i32, SensorError> {
     let mut temperature = None;
     let mut fallback_temperature = None;
-    for entry in entries {
-        let directory = entry.path();
-        let Ok(name) = read_trimmed(&directory.join("name")) else {
-            continue;
-        };
-        if name != "k10temp" {
-            continue;
-        }
+    for directory in hwmon_dirs(root, "k10temp")? {
         for input in indexed_inputs(&directory, "temp")? {
-            let stem = input
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("hwmon filename is valid UTF-8")
-                .trim_end_matches("_input");
-            let label = fs::read_to_string(directory.join(format!("{stem}_label")))
+            let name = input.file_name().unwrap_or_default().to_string_lossy();
+            let label = fs::read_to_string(directory.join(name.replace("_input", "_label")))
                 .unwrap_or_default()
                 .trim()
                 .to_ascii_lowercase();
@@ -121,32 +118,13 @@ pub fn read_temperature_millic_from(root: &Path) -> Result<i32, SensorError> {
 }
 
 pub fn read_fan_rpms_from(root: &Path) -> Result<[u32; 2], SensorError> {
-    let mut entries = fs::read_dir(root)
-        .map_err(SensorError::Enumerate)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(SensorError::Enumerate)?;
-    entries.sort_by_key(|entry| entry.file_name());
-    let mut preferred_rpms = Vec::new();
-    let mut fallback_rpms = Vec::new();
-    for entry in entries {
-        let directory = entry.path();
-        let Ok(name) = read_trimmed(&directory.join("name")) else {
-            continue;
-        };
-        let fans = indexed_inputs(&directory, "fan")?;
-        if name == "asus" {
-            preferred_rpms.extend(fans);
-        } else {
-            fallback_rpms.extend(fans);
-        }
+    // Only the asus-wmi hwmon reports the Z13 fans; other devices' fanN_input
+    // (and their read errors) are unrelated.
+    let mut rpms = Vec::new();
+    for directory in hwmon_dirs(root, "asus")? {
+        rpms.extend(indexed_inputs(&directory, "fan")?);
     }
-    preferred_rpms.sort();
-    fallback_rpms.sort();
-    let rpms = if preferred_rpms.len() >= 2 {
-        preferred_rpms
-    } else {
-        fallback_rpms
-    };
+    rpms.sort();
     if rpms.len() < 2 {
         return Err(SensorError::FansMissing);
     }
@@ -203,6 +181,21 @@ mod tests {
         tree.write("hwmon2/fan2_input", "2800\n");
 
         assert_eq!(read_fan_rpms_from(&tree.0).unwrap(), [2400, 2800]);
+    }
+
+    #[test]
+    fn fan_rpms_never_come_from_unrelated_hwmon_devices() {
+        let tree = TempTree::new();
+        tree.write("hwmon0/name", "asus\n");
+        tree.write("hwmon0/fan1_input", "2400\n");
+        tree.write("hwmon1/name", "nvme\n");
+        tree.write("hwmon1/fan1_input", "111\n");
+        tree.write("hwmon1/fan2_input", "222\n");
+
+        assert!(matches!(
+            read_fan_rpms_from(&tree.0),
+            Err(SensorError::FansMissing)
+        ));
     }
 
     #[test]
