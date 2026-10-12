@@ -890,7 +890,10 @@ impl Backend {
             }
         }
         self.record_direct_release_failure("direct fan observation");
-        if let Ok(tdp) = self.hardware.sysfs.read_tdp() {
+        // An applied table is exact; the measured one cannot report PL2.
+        if self.persisted.state.tdp.is_none()
+            && let Ok(tdp) = self.hardware.sysfs.read_tdp()
+        {
             self.persisted.state.tdp = Some(tdp);
         }
         if !self.persisted.state.battery_one_time_charge
@@ -1695,6 +1698,43 @@ mod tests {
         assert!(!backend.persisted.state.degraded);
     }
 
+    fn armoury_fixture(root: &std::path::Path, watts: i32) {
+        for name in ["ppt_pl1_spl", "ppt_pl2_sppt", "ppt_pl3_fppt"] {
+            let attribute = root
+                .join("class/firmware-attributes/asus-armoury/attributes")
+                .join(name);
+            fs::create_dir_all(&attribute).unwrap();
+            fs::write(attribute.join("current_value"), format!("{watts}\n")).unwrap();
+        }
+    }
+
+    #[test]
+    fn observe_keeps_the_exact_applied_power_table() {
+        let root = std::env::temp_dir().join(format!(
+            "z13helper-observe-tdp-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        // Armoury holds the firmware-clamped copy of a sub-minimum request.
+        armoury_fixture(&root, 32);
+        let applied = TdpState {
+            pl1_spl: 18,
+            pl2_sppt: 18,
+            fppt: 93,
+            apu_sppt: 18,
+            platform_sppt: 18,
+        };
+        let mut persisted = PersistedState::default();
+        persisted.state.tdp = Some(applied);
+        let mut backend = test_backend(persisted, memory_store());
+        backend.hardware.sysfs = Sysfs::new(&root);
+
+        backend.observe();
+
+        assert_eq!(backend.persisted.state.tdp, Some(applied));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn released_fans_return_the_desired_request_to_firmware_mode() {
         let root = std::env::temp_dir().join(format!(
@@ -1702,19 +1742,9 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let ppt = root.join("devices/platform/asus-nb-wmi");
         let hwmon = root.join("class/hwmon/hwmon0");
-        fs::create_dir_all(&ppt).unwrap();
+        armoury_fixture(&root, 50);
         fs::create_dir_all(&hwmon).unwrap();
-        for name in [
-            "ppt_pl1_spl",
-            "ppt_pl2_sppt",
-            "ppt_fppt",
-            "ppt_apu_sppt",
-            "ppt_platform_sppt",
-        ] {
-            fs::write(ppt.join(name), "50\n").unwrap();
-        }
         fs::write(hwmon.join("name"), "asus_custom_fan_curve\n").unwrap();
         let mut request = high_power_request(false);
         request.power_limits = None;

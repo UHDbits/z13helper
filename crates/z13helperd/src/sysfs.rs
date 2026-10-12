@@ -25,6 +25,10 @@ const STRIX_HALO_APU_SLOW_LIMIT_PM_TABLE_OFFSET: usize = 6 * size_of::<f32>();
 const STRIX_HALO_TCTL_PM_TABLE_OFFSET: usize = 22 * size_of::<f32>();
 const STRIX_HALO_POWER_LIMIT_SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
 const STRIX_HALO_POWER_LIMIT_SETTLE_INTERVAL: Duration = Duration::from_millis(25);
+// The BIOS lands asus-armoury PPT writes in the SMU up to ~1.2 s later, so
+// limits must hold this long before an apply counts as verified.
+const STRIX_HALO_POWER_LIMIT_HOLD: Duration = Duration::from_millis(1500);
+const ARMOURY_PPT: [&str; 3] = ["ppt_pl1_spl", "ppt_pl2_sppt", "ppt_pl3_fppt"];
 
 #[derive(Clone, Debug)]
 pub struct Sysfs {
@@ -73,43 +77,77 @@ impl Sysfs {
         Ok(())
     }
 
-    fn ppt_path(&self, name: &str) -> PathBuf {
-        self.path("/sys/devices/platform/asus-nb-wmi").join(name)
+    fn armoury_read(&self, name: &str, field: &str) -> Result<i32, String> {
+        self.read_text(
+            self.path("/sys/class/firmware-attributes/asus-armoury/attributes")
+                .join(name)
+                .join(field),
+        )?
+        .parse()
+        .map_err(|error| format!("parse {name} {field}: {error}"))
+    }
+
+    fn has_smu(&self) -> bool {
+        self.smu_path("mp1_smu_cmd").exists() && self.smu_path("pm_table").exists()
     }
 
     pub fn set_tdp(&self, state: TdpState) -> Result<(), String> {
-        for (name, value) in [
-            ("ppt_pl1_spl", state.pl1_spl),
-            ("ppt_pl2_sppt", state.pl2_sppt),
-            ("ppt_fppt", state.fppt),
-            ("ppt_apu_sppt", state.apu_sppt),
-            ("ppt_platform_sppt", state.platform_sppt),
-        ] {
-            self.write_text(self.ppt_path(name), value)?;
+        let smu = self.has_smu();
+        for (name, requested) in
+            ARMOURY_PPT
+                .into_iter()
+                .zip([state.pl1_spl, state.pl2_sppt, state.fppt])
+        {
+            let value = requested.clamp(
+                self.armoury_read(name, "min_value")?,
+                self.armoury_read(name, "max_value")?,
+            );
+            if value != requested && !smu {
+                return Err(format!(
+                    "{name} {requested} W is outside the firmware range and ryzen_smu is unavailable"
+                ));
+            }
+            // Every asus-armoury write starts an asynchronous BIOS PPT update.
+            if self.armoury_read(name, "current_value")? != value {
+                self.write_text(
+                    self.path("/sys/class/firmware-attributes/asus-armoury/attributes")
+                        .join(name)
+                        .join("current_value"),
+                    value,
+                )?;
+            }
         }
-        // The ASUS WMI attributes are writable echoes on this platform. They
-        // do not reliably update the effective SMU limits after PPD changes,
-        // so reassert the limits through the same MP1 interface used by
-        // ryzenadj and verify the PM table before reporting success.
-        if self.smu_path("mp1_smu_cmd").exists() && self.smu_path("pm_table").exists() {
+        // asus-armoury enforces a firmware range and lacks the APU limit, so
+        // the exact limits go through the same MP1 interface ryzenadj uses.
+        if smu {
             self.set_strix_halo_tdp(state)?;
         }
         Ok(())
     }
 
+    /// Effective limits: the SMU PM table where it reports them, else asus-armoury.
     pub fn read_tdp(&self) -> Result<TdpState, String> {
-        let read = |name: &str| -> Result<i32, String> {
-            self.read_text(self.ppt_path(name))?
-                .parse()
-                .map_err(|error| format!("parse {name}: {error}"))
+        let [pl1_spl, pl2_sppt, fppt] = [
+            self.armoury_read(ARMOURY_PPT[0], "current_value")?,
+            self.armoury_read(ARMOURY_PPT[1], "current_value")?,
+            self.armoury_read(ARMOURY_PPT[2], "current_value")?,
+        ];
+        let mut state = TdpState {
+            pl1_spl,
+            pl2_sppt,
+            fppt,
+            apu_sppt: pl2_sppt,
+            platform_sppt: pl2_sppt,
         };
-        let state = TdpState {
-            pl1_spl: read("ppt_pl1_spl")?,
-            pl2_sppt: read("ppt_pl2_sppt")?,
-            fppt: read("ppt_fppt")?,
-            apu_sppt: read("ppt_apu_sppt")?,
-            platform_sppt: read("ppt_platform_sppt")?,
-        };
+        if self.has_smu() {
+            // The STAPM command's value is not reported, so PL2 stays the armoury value.
+            let [_, fast, slow, apu] = self
+                .read_strix_halo_power_limits()?
+                .map(|value| value.round() as i32);
+            state.pl1_spl = slow;
+            state.fppt = fast;
+            state.apu_sppt = apu;
+        }
         Ok(state)
     }
 
@@ -401,9 +439,9 @@ impl Sysfs {
                 Err(error) => {
                     last_error = error;
                     if attempt < 2 {
-                        // PPD can asynchronously restore its policy for a
-                        // short period after ActiveProfile changes.
-                        thread::sleep(Duration::from_millis(50));
+                        // PPD profile changes and asus-armoury writes make the
+                        // BIOS rewrite limits in steps; let it finish first.
+                        thread::sleep(Duration::from_millis(500));
                     }
                 }
             }
@@ -416,6 +454,7 @@ impl Sysfs {
             || self.read_strix_halo_power_limits(),
             [state.pl2_sppt, state.fppt, state.pl1_spl, state.apu_sppt],
             STRIX_HALO_POWER_LIMIT_SETTLE_TIMEOUT,
+            STRIX_HALO_POWER_LIMIT_HOLD,
             STRIX_HALO_POWER_LIMIT_SETTLE_INTERVAL,
         )
     }
@@ -448,13 +487,14 @@ fn poll_smu_power_limits(
     mut read_actual: impl FnMut() -> Result<[f32; 4], String>,
     expected: [i32; 4],
     timeout: Duration,
+    hold: Duration,
     interval: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
-    loop {
+    let held_until = loop {
         let error = match read_actual().and_then(|actual| verify_smu_power_limits(actual, expected))
         {
-            Ok(()) => return Ok(()),
+            Ok(()) => break Instant::now() + hold,
             Err(error) => error,
         };
 
@@ -462,7 +502,12 @@ fn poll_smu_power_limits(
             return Err(error);
         }
         thread::sleep(interval);
+    };
+    while Instant::now() < held_until {
+        thread::sleep(interval);
+        read_actual().and_then(|actual| verify_smu_power_limits(actual, expected))?;
     }
+    Ok(())
 }
 
 fn verify_smu_power_limits(actual: [f32; 4], expected: [i32; 4]) -> Result<(), String> {
@@ -544,21 +589,90 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn reads_five_watt_tdp_without_inventing_a_platform_profile() {
-        let root = root();
-        let ppt = root.join("devices/platform/asus-nb-wmi");
-        fs::create_dir_all(&ppt).unwrap();
-        for name in [
-            "ppt_pl1_spl",
-            "ppt_pl2_sppt",
-            "ppt_fppt",
-            "ppt_apu_sppt",
-            "ppt_platform_sppt",
-        ] {
-            fs::write(ppt.join(name), "5\n").unwrap();
+    fn armoury_fixture(root: &Path, values: [i32; 3]) {
+        for (name, value) in ARMOURY_PPT.iter().zip(values) {
+            let attribute = root
+                .join("class/firmware-attributes/asus-armoury/attributes")
+                .join(name);
+            fs::create_dir_all(&attribute).unwrap();
+            fs::write(attribute.join("current_value"), format!("{value}\n")).unwrap();
+            fs::write(attribute.join("min_value"), "28\n").unwrap();
+            fs::write(attribute.join("max_value"), "93\n").unwrap();
         }
-        assert_eq!(Sysfs::new(&root).read_tdp().unwrap().pl1_spl, 5);
+    }
+
+    fn armoury_value(root: &Path, name: &str) -> String {
+        fs::read_to_string(
+            root.join("class/firmware-attributes/asus-armoury/attributes")
+                .join(name)
+                .join("current_value"),
+        )
+        .unwrap()
+    }
+
+    fn tdp(pl1: i32, pl2: i32, fppt: i32) -> TdpState {
+        TdpState {
+            pl1_spl: pl1,
+            pl2_sppt: pl2,
+            fppt,
+            apu_sppt: pl2,
+            platform_sppt: pl2,
+        }
+    }
+
+    #[test]
+    fn tdp_is_written_to_armoury_without_legacy_wmi_nodes() {
+        let root = root();
+        armoury_fixture(&root, [60, 75, 86]);
+        Sysfs::new(&root).set_tdp(tdp(30, 40, 50)).unwrap();
+        assert_eq!(armoury_value(&root, "ppt_pl1_spl"), "30\n");
+        assert_eq!(armoury_value(&root, "ppt_pl2_sppt"), "40\n");
+        assert_eq!(armoury_value(&root, "ppt_pl3_fppt"), "50\n");
+        assert!(!root.join("devices/platform/asus-nb-wmi").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tdp_below_armoury_minimum_needs_smu() {
+        let root = root();
+        armoury_fixture(&root, [60, 75, 86]);
+        let error = Sysfs::new(&root).set_tdp(tdp(18, 18, 50)).unwrap_err();
+        assert!(error.contains("ryzen_smu"), "{error}");
+        assert_eq!(armoury_value(&root, "ppt_pl1_spl"), "60\n");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reads_tdp_from_armoury_without_smu() {
+        let root = root();
+        armoury_fixture(&root, [30, 40, 50]);
+        assert_eq!(Sysfs::new(&root).read_tdp().unwrap(), tdp(30, 40, 50));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reads_effective_smu_limits_over_armoury() {
+        let root = root();
+        armoury_fixture(&root, [28, 32, 45]);
+        let smu = root.join("kernel/ryzen_smu_drv");
+        fs::create_dir_all(&smu).unwrap();
+        fs::write(smu.join("mp1_smu_cmd"), [1, 0, 0, 0]).unwrap();
+        // stapm, fast, slow, apu-slow limit/value pairs.
+        let table: Vec<u8> = [86.0f32, 0.0, 93.0, 0.0, 18.0, 0.0, 20.0, 0.0]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        fs::write(smu.join("pm_table"), table).unwrap();
+        assert_eq!(
+            Sysfs::new(&root).read_tdp().unwrap(),
+            TdpState {
+                pl1_spl: 18,
+                pl2_sppt: 32,
+                fppt: 93,
+                apu_sppt: 20,
+                platform_sppt: 32,
+            }
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -810,9 +924,33 @@ mod tests {
                 [86, 86, 70, 70],
                 Duration::from_millis(10),
                 Duration::ZERO,
+                Duration::ZERO,
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn smu_power_limit_verification_rejects_a_firmware_revert_during_hold() {
+        // The BIOS applies ASUS WMI PPT writes asynchronously and can replace
+        // freshly written SMU limits a few hundred milliseconds later.
+        let mut reads = 0;
+        let error = poll_smu_power_limits(
+            || {
+                reads += 1;
+                Ok(if reads < 3 {
+                    [86.0, 93.0, 18.0, 18.0]
+                } else {
+                    [86.0, 86.0, 70.0, 18.0]
+                })
+            },
+            [18, 93, 18, 18],
+            Duration::from_millis(10),
+            Duration::from_secs(5),
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.contains("firmware reports [86, 70, 18]"), "{error}");
     }
 
     #[test]

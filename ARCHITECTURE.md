@@ -63,6 +63,9 @@ For an ordinary or lower-power apply:
 1. Select PPD. Missing PPD produces a visible warning; an unknown
    advertised selection is rejected.
 2. Lower/write optional PPT before relaxing prior high-power fan protection.
+   PPT goes to asus-armoury (clamped to its firmware range), then exactly to
+   the SMU; the PM-table limits must hold for 1.5 s, since the BIOS applies
+   armoury writes asynchronously and may overwrite them.
 3. Install firmware or direct fan control.
 4. Restore the requested 80–99°C APU thermal limit through paired Strix Halo
    Tctl/cHTC SMU commands and verify the effective PM-table value.
