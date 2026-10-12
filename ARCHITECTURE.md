@@ -66,7 +66,8 @@ For an ordinary or lower-power apply:
    PPT goes to asus-armoury (clamped to its firmware range), then exactly to
    the SMU; the PM-table limits must hold for 1.5 s, since the BIOS applies
    armoury writes asynchronously and may overwrite them.
-3. Install firmware or direct fan control.
+3. Install firmware or direct fan control, then reassert PPT: ASUS fan-mode
+   WMI writes make the BIOS reapply its own PPT table.
 4. Restore the requested 80–99°C APU thermal limit through paired Strix Halo
    Tctl/cHTC SMU commands and verify the effective PM-table value.
 5. Restore the requested undervolt offset last.

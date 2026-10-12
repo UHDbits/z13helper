@@ -81,6 +81,10 @@ pub fn apply_request(
         } else {
             daemon.fans_release()?;
         }
+        // ASUS fan-mode WMI writes make the BIOS reapply its own PPT table.
+        if let Some(limits) = limits {
+            daemon.tdp_set(limits)?;
+        }
     }
 
     if daemon.undervolt_available() {
