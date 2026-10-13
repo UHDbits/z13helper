@@ -170,6 +170,14 @@ pub fn build(state: &Rc<AppState>) -> adw::ApplicationWindow {
     mode_grid.attach(&fans, 3, 0, 1, 1);
 
     sync.run(|| refresh_active_buttons(&mode_buttons, &state.config.borrow().active_profile));
+    // Daemon status lags behind an in-flight apply; the active profile is local.
+    let label = mode_label_w.clone();
+    let buttons = mode_buttons.clone();
+    let mode_sync = sync.clone();
+    state.set_active_profile_listener(Rc::new(move |state| {
+        label.set_label(&current_label(state));
+        mode_sync.run(|| refresh_active_buttons(&buttons, &state.config.borrow().active_profile));
+    }));
 
     // --- Display ---
     let display = gtk::Box::new(gtk::Orientation::Vertical, 6);

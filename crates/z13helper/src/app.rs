@@ -15,6 +15,7 @@ use crate::profile_coordinator::{ApplyToken, ProfileCoordinator, ProfileOperatio
 use crate::{hud, main_window, power, subscribe, worker};
 
 type ControllerActivation = (glib::WeakRef<gtk4::Widget>, Rc<dyn Fn()>);
+type ActiveProfileListener = Rc<dyn Fn(&AppState)>;
 
 /// UI-owned state. The client is cloneable; every daemon call is moved to a
 /// worker thread by the individual views.
@@ -35,6 +36,8 @@ pub struct AppState {
     pub(crate) notification_owner: hud::NotificationOwner,
     controller_capture: Option<ControllerCapture>,
     controller_activations: RefCell<Vec<ControllerActivation>>,
+    /// Refreshes views that show the active profile without a daemon round-trip.
+    active_profile_listener: RefCell<Option<ActiveProfileListener>>,
     pub persistent_banner: RefCell<Option<adw::Banner>>,
     toast_overlays: RefCell<Vec<glib::WeakRef<adw::ToastOverlay>>>,
     pending_persistent_error: RefCell<Option<String>>,
@@ -83,6 +86,7 @@ impl AppState {
             notification_owner: hud::NotificationOwner::start(),
             controller_capture,
             controller_activations: RefCell::new(Vec::new()),
+            active_profile_listener: RefCell::new(None),
             persistent_banner: RefCell::new(None),
             toast_overlays: RefCell::new(Vec::new()),
             pending_persistent_error: RefCell::new(pending_error),
@@ -105,8 +109,20 @@ impl AppState {
         let changed = self.coordinator.borrow_mut().activate(id);
         if changed {
             self.config.borrow_mut().active_profile = id.into();
+            self.notify_active_profile();
         }
         changed
+    }
+
+    pub fn set_active_profile_listener(&self, listener: ActiveProfileListener) {
+        *self.active_profile_listener.borrow_mut() = Some(listener);
+    }
+
+    fn notify_active_profile(&self) {
+        let listener = self.active_profile_listener.borrow().clone();
+        if let Some(listener) = listener {
+            listener(self);
+        }
     }
 
     pub fn select_editing_profile(&self, id: &str) -> bool {
@@ -165,6 +181,9 @@ impl AppState {
             .borrow_mut()
             .remove_profile(id, &active, &fallback_editing);
         debug_assert_eq!(old_active == id, self.active_profile_id() != old_active);
+        if old_active == id {
+            self.notify_active_profile();
+        }
         true
     }
 

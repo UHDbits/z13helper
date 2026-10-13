@@ -419,7 +419,8 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
         });
     }
 
-    // Switching profiles in the dropdown: save previous, load next into editors.
+    // Switching profiles in the dropdown: save previous, load next into
+    // editors, and make it the active profile.
     let state_sel = state.clone();
     let schedule_sel = apply_schedule.clone();
     let editors_sel = editors.clone();
@@ -441,6 +442,7 @@ pub fn present(state: &Rc<AppState>, parent: &impl IsA<gtk::Window>) {
             state_sel.config.borrow().disable_high_power_fan_protection,
         );
         set_profile_action_sensitivity(&state_sel, &next.id, &rename_sel, &remove_sel);
+        crate::power::select_profile(&state_sel, &next.id);
     });
 
     let state_def = state.clone();
