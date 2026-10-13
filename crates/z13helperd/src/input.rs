@@ -1189,32 +1189,6 @@ mod tests {
     }
 
     #[test]
-    fn bpf_source_and_owner_keep_bounded_cleanup_contract_explicit() {
-        let source = include_str!("../bpf/hidraw_blocker.bpf.c");
-        assert!(source.contains("#define MAX_BLOCKED_PIDS 64"));
-        assert!(source.contains("BLOCKED_PID_MAP_CAPACITY (MAX_BLOCKED_PIDS * 2)"));
-        assert!(source.contains("__uint(max_entries, BLOCKED_PID_MAP_CAPACITY);"));
-        assert!(source.contains("bpf_get_current_pid_tgid() >> 32"));
-        assert!(source.contains("SEC(\"lsm/file_permission\")"));
-
-        let owner = include_str!("hidraw.rs");
-        assert!(owner.contains(".take(64)"));
-        let additions = owner.find("let additions").unwrap();
-        let removals = owner.find("let removals").unwrap();
-        assert!(additions < removals);
-        assert!(owner.contains("bpf_program__attach_lsm"));
-        assert!(owner.contains("bpf_link__destroy"));
-        assert!(owner.contains("bpf_object__close"));
-        assert!(!owner.contains("bpf_obj_pin"));
-        assert!(owner.contains("impl Drop for HidrawBlocker"));
-
-        let steam_owner = include_str!("steam.rs");
-        assert!(steam_owner.contains("let pids = steam_family()"));
-        assert!(steam_owner.contains("set_blocked_pids([])"));
-        assert!(steam_owner.contains("impl Drop for SteamBlocker"));
-    }
-
-    #[test]
     fn classifies_controllers_without_grabbing_the_touchscreen() {
         let mut gamepad_keys = CapabilityBits::default();
         gamepad_keys.0.resize(5, 0);

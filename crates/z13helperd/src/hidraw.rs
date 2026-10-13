@@ -181,7 +181,10 @@ fn map_result(result: c_int) -> io::Result<()> {
     }
 }
 
-/// Moves the PID map from `blocked` to the first 64 non-zero `pids` in caller
+/// Matches `MAX_BLOCKED_PIDS` in the BPF program.
+const MAX_BLOCKED_PIDS: usize = 64;
+
+/// Moves the PID map from `blocked` to the first `MAX_BLOCKED_PIDS` non-zero `pids` in caller
 /// order. Additions go first and a failed one undoes the partial step. Removals
 /// are best-effort so a release clears every PID it can; `blocked` keeps the
 /// ones still in the map for the next call.
@@ -191,7 +194,11 @@ fn sync_blocked_pids(
     mut insert: impl FnMut(u32) -> io::Result<()>,
     mut remove: impl FnMut(u32) -> io::Result<()>,
 ) -> Result<(), String> {
-    let target: BTreeSet<u32> = pids.into_iter().filter(|pid| *pid != 0).take(64).collect();
+    let target: BTreeSet<u32> = pids
+        .into_iter()
+        .filter(|pid| *pid != 0)
+        .take(MAX_BLOCKED_PIDS)
+        .collect();
     let additions: Vec<u32> = target.difference(blocked).copied().collect();
     for (index, &pid) in additions.iter().enumerate() {
         if let Err(error) = insert(pid) {
@@ -255,7 +262,7 @@ fn hidraw_major() -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hidraw_major, sync_blocked_pids};
+    use super::{MAX_BLOCKED_PIDS, hidraw_major, sync_blocked_pids};
     use std::cell::RefCell;
     use std::collections::BTreeSet;
     use std::io;
@@ -323,5 +330,11 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pid_cap_matches_the_bpf_program() {
+        let source = include_str!("../bpf/hidraw_blocker.bpf.c");
+        assert!(source.contains(&format!("#define MAX_BLOCKED_PIDS {MAX_BLOCKED_PIDS}\n")));
     }
 }

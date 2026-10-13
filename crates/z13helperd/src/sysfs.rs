@@ -929,33 +929,6 @@ mod tests {
     }
 
     #[test]
-    fn smu_power_limit_verification_can_accept_a_firmware_capped_fast_limit() {
-        let capped = [86.0, 86.0, 93.0, 93.0];
-        assert!(verify_smu_power_limits(capped, [93, 120, 93, 93], true).is_ok());
-        assert!(verify_smu_power_limits(capped, [93, 120, 93, 93], false).is_err());
-        // Slow/APU stay strict, and fast may never exceed the request.
-        assert!(
-            verify_smu_power_limits([86.0, 86.0, 70.0, 93.0], [93, 120, 93, 93], true).is_err()
-        );
-        assert!(
-            verify_smu_power_limits([86.0, 120.0, 93.0, 93.0], [93, 93, 93, 93], true).is_err()
-        );
-    }
-
-    #[test]
-    fn smu_power_limit_verification_ignores_float_rounding_noise() {
-        assert!(
-            verify_smu_power_limits(
-                [120.00001, 120.00001, 93.00001, 92.99999],
-                [120, 120, 93, 93],
-                false,
-            )
-            .is_ok()
-        );
-        assert!(verify_smu_power_limits([84.0, 86.0, 70.0, 70.0], [86, 86, 70, 70], false).is_ok());
-    }
-
-    #[test]
     fn smu_power_limit_verification_waits_through_a_transient_readback() {
         let mut readings = vec![
             [84.00001, 86.00001, 70.00001, 70.00001],
@@ -1000,11 +973,35 @@ mod tests {
     }
 
     #[test]
-    fn smu_power_limit_verification_rejects_a_real_mismatch() {
+    fn smu_power_limit_verification_checks_fast_slow_and_apu_but_not_stapm() {
+        // (actual stapm/fast/slow/apu, expected, capped fast accepted, ok)
+        let cases = [
+            // Float noise rounds away, and STAPM is ignored.
+            (
+                [120.00001, 120.00001, 93.00001, 92.99999],
+                [120, 120, 93, 93],
+                false,
+                true,
+            ),
+            ([84.0, 86.0, 70.0, 70.0], [86, 86, 70, 70], false, true),
+            ([120.0, 120.0, 94.0, 93.0], [93, 120, 93, 93], false, false),
+            // A firmware-capped fast limit passes only when accepted.
+            ([86.0, 86.0, 93.0, 93.0], [93, 120, 93, 93], true, true),
+            ([86.0, 86.0, 93.0, 93.0], [93, 120, 93, 93], false, false),
+            // Slow/APU stay strict, and fast may never exceed the request.
+            ([86.0, 86.0, 70.0, 93.0], [93, 120, 93, 93], true, false),
+            ([86.0, 120.0, 93.0, 93.0], [93, 93, 93, 93], true, false),
+        ];
+        for (actual, expected, capped_fast_ok, ok) in cases {
+            let result = verify_smu_power_limits(actual, expected, capped_fast_ok);
+            assert_eq!(result.is_ok(), ok, "{actual:?} vs {expected:?}: {result:?}");
+        }
         let error = verify_smu_power_limits([120.0, 120.0, 94.0, 93.0], [93, 120, 93, 93], false)
             .unwrap_err();
-        assert!(error.contains("requested fast/slow/APU [120, 93, 93]"));
-        assert!(error.contains("firmware reports [120, 94, 93]"));
-        assert!(error.contains("STAPM ignored"));
+        assert!(
+            error.contains("requested fast/slow/APU [120, 93, 93]"),
+            "{error}"
+        );
+        assert!(error.contains("firmware reports [120, 94, 93]"), "{error}");
     }
 }

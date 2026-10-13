@@ -343,52 +343,46 @@ mod tests {
     }
 
     #[test]
-    fn sysfs_fake_ignores_peripheral_and_vanished_supplies() {
+    fn classify_supplies_ignores_peripherals_and_needs_a_definite_state() {
         let mut stylus = supply("Battery", None, Some("Discharging"));
         stylus.scope = Some("Device\n".into());
-        assert_eq!(
-            classify_supplies(&[stylus, supply("Battery", None, Some("Charging"))]),
-            Some(false)
-        );
-        assert_eq!(
-            classify_supplies(&[
-                supply("Mains", None, None),
-                supply("Battery", None, None),
-                supply("Battery", None, Some("Discharging")),
-            ]),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn sysfs_fake_is_unknown_for_missing_or_malformed_power_state() {
-        assert_eq!(classify_supplies(&[]), None);
-        assert_eq!(
-            classify_supplies(&[supply("Mains", Some("wat"), None)]),
-            None
-        );
-        assert_eq!(
-            classify_supplies(&[supply("Battery", None, Some("Unknown"))]),
-            None
-        );
-    }
-
-    #[test]
-    fn sysfs_fake_uses_all_line_power_supplies() {
-        assert_eq!(
-            classify_supplies(&[
-                supply("Mains", Some("0"), None),
-                supply("Mains", Some("1"), None),
-                supply("Battery", None, Some("Charging")),
-            ]),
-            Some(false)
-        );
-        assert_eq!(
-            classify_supplies(&[
-                supply("Mains", Some("0"), None),
-                supply("Mains", Some("0"), None),
-            ]),
-            Some(true)
-        );
+        let cases = [
+            // Peripheral batteries and vanished entries are skipped.
+            (
+                vec![stylus, supply("Battery", None, Some("Charging"))],
+                Some(false),
+            ),
+            (
+                vec![
+                    supply("Mains", None, None),
+                    supply("Battery", None, None),
+                    supply("Battery", None, Some("Discharging")),
+                ],
+                Some(true),
+            ),
+            // Any online line-power supply means AC.
+            (
+                vec![
+                    supply("Mains", Some("0"), None),
+                    supply("Mains", Some("1"), None),
+                    supply("Battery", None, Some("Charging")),
+                ],
+                Some(false),
+            ),
+            (
+                vec![
+                    supply("Mains", Some("0"), None),
+                    supply("Mains", Some("0"), None),
+                ],
+                Some(true),
+            ),
+            // Missing or malformed state is unknown, not a guess.
+            (vec![], None),
+            (vec![supply("Mains", Some("wat"), None)], None),
+            (vec![supply("Battery", None, Some("Unknown"))], None),
+        ];
+        for (supplies, on_battery) in cases {
+            assert_eq!(classify_supplies(&supplies), on_battery, "{supplies:?}");
+        }
     }
 }
