@@ -258,6 +258,26 @@ mod tests {
     }
 
     #[test]
+    fn safe_power_is_reasserted_after_fan_writes() {
+        // ASUS fan-mode WMI writes make the BIOS reapply its own PPT table.
+        for fan_curves in [true, false] {
+            let mut request = request(18);
+            if !fan_curves {
+                request.fan_curves = None;
+            }
+            let mut daemon = RecordingDaemon::default();
+            apply_request(&mut daemon, &request).unwrap();
+            let calls = daemon.calls.into_inner();
+            let fan = calls
+                .iter()
+                .position(|v| v.starts_with("firmware-fans:") || v == "fans-release")
+                .unwrap();
+            let last_tdp = calls.iter().rposition(|v| v.starts_with("tdp:")).unwrap();
+            assert!(fan < last_tdp, "{calls:?}");
+        }
+    }
+
+    #[test]
     fn temperature_limit_is_applied_before_undervolt() {
         let mut request = request(60);
         request.cpu_temp_limit = 88;
@@ -289,7 +309,7 @@ mod tests {
             apply_request(&mut daemon, &request).unwrap();
             assert_eq!(
                 daemon.calls.into_inner(),
-                [format!("ppd:{ppd}").as_str(), tdp, "fans-release"],
+                [format!("ppd:{ppd}").as_str(), tdp, "fans-release", tdp],
                 "{id}"
             );
         }
