@@ -29,10 +29,11 @@ Some of the features include:
 ### Requirements
 
 - ASUS ROG Flow Z13 **GZ302EA** (2025)
-- Linux with systemd
+- Linux with systemd and the `asus-armoury` kernel driver (power limits)
 - Rust **1.92+** (edition 2024)
 - GTK **4.14+**, libadwaita **1.5+**, and `gtk4-layer-shell`
-- Optional: `power-profiles-daemon`, `ryzen_smu` (for undervolt)
+- Optional: `power-profiles-daemon`, `ryzen_smu` (undervolt, APU temperature
+  limit, and power limits outside the firmware's asus-armoury range)
 
 ### Build and install
 
