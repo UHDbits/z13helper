@@ -91,7 +91,7 @@ impl Sysfs {
         self.smu_path("mp1_smu_cmd").exists() && self.smu_path("pm_table").exists()
     }
 
-    pub fn set_tdp(&self, state: TdpState) -> Result<(), String> {
+    pub fn set_tdp(&self, state: TdpState) -> Result<Option<String>, String> {
         let smu = self.has_smu();
         for (name, requested) in
             ARMOURY_PPT
@@ -120,9 +120,9 @@ impl Sysfs {
         // asus-armoury enforces a firmware range and lacks the APU limit, so
         // the exact limits go through the same MP1 interface ryzenadj uses.
         if smu {
-            self.set_strix_halo_tdp(state)?;
+            return self.set_strix_halo_tdp(state);
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Effective limits: the SMU PM table where it reports them, else asus-armoury.
@@ -406,7 +406,7 @@ impl Sysfs {
         decode_strix_halo_tctl(&table)
     }
 
-    fn set_strix_halo_tdp(&self, state: TdpState) -> Result<(), String> {
+    fn set_strix_halo_tdp(&self, state: TdpState) -> Result<Option<String>, String> {
         let expected = [
             (STRIX_HALO_STAPM_COMMAND, state.pl2_sppt, "STAPM limit"),
             (STRIX_HALO_FAST_LIMIT_COMMAND, state.fppt, "PPT fast limit"),
@@ -423,6 +423,7 @@ impl Sysfs {
         ];
 
         let mut last_error = String::from("SMU power-limit verification failed");
+        let mut capped_fast_ok = false;
         for attempt in 0..3 {
             let result = (|| {
                 for &(command, watts, operation) in &expected {
@@ -432,12 +433,25 @@ impl Sysfs {
                         .ok_or_else(|| format!("{operation} is outside the SMU range"))?;
                     self.send_smu_command(command, encode_smu_u32(milliwatts), operation)?;
                 }
-                self.verify_strix_halo_tdp(state)
+                self.verify_strix_halo_tdp(state, capped_fast_ok)
             })();
             match result {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    let fast = self.read_strix_halo_power_limits()?[1].round() as i32;
+                    return Ok((fast < state.fppt).then(|| {
+                        format!(
+                            "firmware capped fast PPT at {fast} W (requested {} W)",
+                            state.fppt
+                        )
+                    }));
+                }
                 Err(error) => {
                     last_error = error;
+                    // Fast alone dropping again after a resend is a firmware
+                    // cap rather than a BIOS update still in flight.
+                    capped_fast_ok = self.read_strix_halo_power_limits().is_ok_and(|actual| {
+                        verify_smu_power_limits(actual, strix_halo_expected(state), true).is_ok()
+                    });
                     if attempt < 2 {
                         // PPD profile changes and asus-armoury writes make the
                         // BIOS rewrite limits in steps; let it finish first.
@@ -449,10 +463,11 @@ impl Sysfs {
         Err(last_error)
     }
 
-    fn verify_strix_halo_tdp(&self, state: TdpState) -> Result<(), String> {
+    fn verify_strix_halo_tdp(&self, state: TdpState, capped_fast_ok: bool) -> Result<(), String> {
         poll_smu_power_limits(
             || self.read_strix_halo_power_limits(),
-            [state.pl2_sppt, state.fppt, state.pl1_spl, state.apu_sppt],
+            strix_halo_expected(state),
+            capped_fast_ok,
             STRIX_HALO_POWER_LIMIT_SETTLE_TIMEOUT,
             STRIX_HALO_POWER_LIMIT_HOLD,
             STRIX_HALO_POWER_LIMIT_SETTLE_INTERVAL,
@@ -483,16 +498,23 @@ impl Sysfs {
     }
 }
 
+/// PM-table order: STAPM, fast, slow, APU slow.
+fn strix_halo_expected(state: TdpState) -> [i32; 4] {
+    [state.pl2_sppt, state.fppt, state.pl1_spl, state.apu_sppt]
+}
+
 fn poll_smu_power_limits(
     mut read_actual: impl FnMut() -> Result<[f32; 4], String>,
     expected: [i32; 4],
+    capped_fast_ok: bool,
     timeout: Duration,
     hold: Duration,
     interval: Duration,
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     let held_until = loop {
-        let error = match read_actual().and_then(|actual| verify_smu_power_limits(actual, expected))
+        let error = match read_actual()
+            .and_then(|actual| verify_smu_power_limits(actual, expected, capped_fast_ok))
         {
             Ok(()) => break Instant::now() + hold,
             Err(error) => error,
@@ -505,16 +527,23 @@ fn poll_smu_power_limits(
     };
     while Instant::now() < held_until {
         thread::sleep(interval);
-        read_actual().and_then(|actual| verify_smu_power_limits(actual, expected))?;
+        read_actual()
+            .and_then(|actual| verify_smu_power_limits(actual, expected, capped_fast_ok))?;
     }
     Ok(())
 }
 
-fn verify_smu_power_limits(actual: [f32; 4], expected: [i32; 4]) -> Result<(), String> {
+fn verify_smu_power_limits(
+    actual: [f32; 4],
+    expected: [i32; 4],
+    capped_fast_ok: bool,
+) -> Result<(), String> {
     let rounded_actual = actual.map(|value| value.round() as i32);
+    let fast_ok =
+        rounded_actual[1] == expected[1] || (capped_fast_ok && rounded_actual[1] < expected[1]);
     // STAPM is a firmware-managed skin-temperature limit and may be
     // recalculated independently while the other PPT limits remain fixed.
-    if rounded_actual[1..] == expected[1..] {
+    if fast_ok && rounded_actual[2..] == expected[2..] {
         Ok(())
     } else {
         Err(format!(
@@ -900,15 +929,30 @@ mod tests {
     }
 
     #[test]
+    fn smu_power_limit_verification_can_accept_a_firmware_capped_fast_limit() {
+        let capped = [86.0, 86.0, 93.0, 93.0];
+        assert!(verify_smu_power_limits(capped, [93, 120, 93, 93], true).is_ok());
+        assert!(verify_smu_power_limits(capped, [93, 120, 93, 93], false).is_err());
+        // Slow/APU stay strict, and fast may never exceed the request.
+        assert!(
+            verify_smu_power_limits([86.0, 86.0, 70.0, 93.0], [93, 120, 93, 93], true).is_err()
+        );
+        assert!(
+            verify_smu_power_limits([86.0, 120.0, 93.0, 93.0], [93, 93, 93, 93], true).is_err()
+        );
+    }
+
+    #[test]
     fn smu_power_limit_verification_ignores_float_rounding_noise() {
         assert!(
             verify_smu_power_limits(
                 [120.00001, 120.00001, 93.00001, 92.99999],
                 [120, 120, 93, 93],
+                false,
             )
             .is_ok()
         );
-        assert!(verify_smu_power_limits([84.0, 86.0, 70.0, 70.0], [86, 86, 70, 70],).is_ok());
+        assert!(verify_smu_power_limits([84.0, 86.0, 70.0, 70.0], [86, 86, 70, 70], false).is_ok());
     }
 
     #[test]
@@ -922,6 +966,7 @@ mod tests {
             poll_smu_power_limits(
                 || Ok(readings.next().expect("test readback")),
                 [86, 86, 70, 70],
+                false,
                 Duration::from_millis(10),
                 Duration::ZERO,
                 Duration::ZERO,
@@ -945,6 +990,7 @@ mod tests {
                 })
             },
             [18, 93, 18, 18],
+            false,
             Duration::from_millis(10),
             Duration::from_secs(5),
             Duration::ZERO,
@@ -955,8 +1001,8 @@ mod tests {
 
     #[test]
     fn smu_power_limit_verification_rejects_a_real_mismatch() {
-        let error =
-            verify_smu_power_limits([120.0, 120.0, 94.0, 93.0], [93, 120, 93, 93]).unwrap_err();
+        let error = verify_smu_power_limits([120.0, 120.0, 94.0, 93.0], [93, 120, 93, 93], false)
+            .unwrap_err();
         assert!(error.contains("requested fast/slow/APU [120, 93, 93]"));
         assert!(error.contains("firmware reports [120, 94, 93]"));
         assert!(error.contains("STAPM ignored"));

@@ -235,7 +235,7 @@ impl Daemon for PlatformHardware {
         Ok(None)
     }
 
-    fn tdp_set(&mut self, limits: TdpState) -> Result<(), DaemonError> {
+    fn tdp_set(&mut self, limits: TdpState) -> Result<Option<String>, DaemonError> {
         self.sysfs.set_tdp(limits).map_err(DaemonError::Rejected)
     }
 
@@ -628,7 +628,8 @@ impl Backend {
                 PlatformHardware::ppd_set_blocking(&original_ppd)
                     .and_then(|_| self.hardware.sysfs.set_tdp(tdp))
                     .map_err(DaemonError::Rejected)
-                    .map(|()| {
+                    // Stock fast PPT (<= 86 W) sits at or below the observed firmware cap.
+                    .map(|_| {
                         self.hardware.ppd_profile = Some(original_ppd);
                     })
             }

@@ -8,7 +8,8 @@ use crate::protocol::{ApplyRequest, TdpState};
 /// Hardware operations owned by `z13helperd`.
 pub trait Daemon {
     fn ppd_set(&mut self, profile: Option<&str>) -> Result<Option<String>, DaemonError>;
-    fn tdp_set(&mut self, limits: TdpState) -> Result<(), DaemonError>;
+    /// Returns a warning when firmware held the limits but capped fast PPT.
+    fn tdp_set(&mut self, limits: TdpState) -> Result<Option<String>, DaemonError>;
     fn firmware_fans_set(
         &mut self,
         curves: &[Curve; 2],
@@ -64,13 +65,14 @@ pub fn apply_request(
     }
 
     let limits = request.effective_power_limits();
+    let mut tdp_warning = None;
     if request
         .effective_pl1()
         .is_some_and(|pl1| fan_protection_required(pl1, request.disable_high_power_fan_protection))
     {
         set_fans(daemon, request)?;
         if let Some(limits) = limits {
-            daemon.tdp_set(limits)?;
+            tdp_warning = daemon.tdp_set(limits)?;
         }
     } else {
         if let Some(limits) = limits {
@@ -83,9 +85,10 @@ pub fn apply_request(
         }
         // ASUS fan-mode WMI writes make the BIOS reapply its own PPT table.
         if let Some(limits) = limits {
-            daemon.tdp_set(limits)?;
+            tdp_warning = daemon.tdp_set(limits)?;
         }
     }
+    warnings.extend(tdp_warning);
 
     if daemon.undervolt_available() {
         daemon.cpu_temp_limit_set(request.cpu_temp_limit)?;
@@ -114,6 +117,7 @@ mod tests {
         fail_at: Option<&'static str>,
         uv: bool,
         pl1: u32,
+        tdp_warning: Option<&'static str>,
     }
 
     impl RecordingDaemon {
@@ -134,11 +138,12 @@ mod tests {
             self.call(format!("ppd:{}", profile.unwrap_or("off")))?;
             Ok(None)
         }
-        fn tdp_set(&mut self, limits: TdpState) -> Result<(), DaemonError> {
+        fn tdp_set(&mut self, limits: TdpState) -> Result<Option<String>, DaemonError> {
             self.call(format!(
                 "tdp:{}/{}/{}/{}/{}",
                 limits.pl1_spl, limits.pl2_sppt, limits.fppt, limits.apu_sppt, limits.platform_sppt
-            ))
+            ))?;
+            Ok(self.tdp_warning.map(str::to_owned))
         }
         fn firmware_fans_set(&mut self, _: &[Curve; 2], pl1: u32) -> Result<(), DaemonError> {
             self.call(format!("firmware-fans:{pl1}"))
@@ -255,6 +260,19 @@ mod tests {
             .unwrap();
         let tdp = calls.iter().position(|v| v.starts_with("tdp:")).unwrap();
         assert!(tdp < fan);
+    }
+
+    #[test]
+    fn capped_power_limit_is_reported_once_as_a_warning() {
+        for pl1 in [18, 80] {
+            let mut daemon = RecordingDaemon {
+                tdp_warning: Some("firmware capped fast PPT at 86 W"),
+                uv: true,
+                ..Default::default()
+            };
+            let warnings = apply_request(&mut daemon, &request(pl1)).unwrap();
+            assert_eq!(warnings, ["firmware capped fast PPT at 86 W"], "PL1 {pl1}");
+        }
     }
 
     #[test]
