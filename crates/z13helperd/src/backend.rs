@@ -20,6 +20,7 @@ use crate::sysfs::Sysfs;
 const MAX_WARNINGS: usize = 32;
 const MAX_WARNING_CHARS: usize = 1024;
 const MAX_FACTORY_CURVE_PROFILES: usize = 8;
+const BATTERY_LIMIT_RANGE: std::ops::RangeInclusive<i32> = 40..=100;
 
 fn push_warning(warnings: &mut Vec<String>, warning: impl Into<String>) {
     let warning = warning
@@ -653,7 +654,7 @@ impl Backend {
 
     pub fn set_battery_limit(&mut self, limit: i32) -> Result<(), DaemonError> {
         self.persistence.require_writable()?;
-        if !(40..=100).contains(&limit) {
+        if !BATTERY_LIMIT_RANGE.contains(&limit) {
             return Err(DaemonError::Rejected(
                 "battery limit must be between 40 and 100".into(),
             ));
@@ -899,6 +900,7 @@ impl Backend {
         }
         if !self.persisted.state.battery_one_time_charge
             && let Ok(limit) = self.hardware.sysfs.battery_limit()
+            && BATTERY_LIMIT_RANGE.contains(&limit)
         {
             self.persisted.state.battery_limit = Some(limit);
         }
@@ -1153,7 +1155,12 @@ impl Backend {
         let target = effective_battery_limit(
             self.persisted.state.battery_one_time_charge,
             self.persisted.state.battery_limit,
-        );
+        )
+        .or_else(|| {
+            // Nothing saved: only replace a reading that is not a real limit.
+            matches!(self.hardware.sysfs.battery_limit(), Ok(limit) if !BATTERY_LIMIT_RANGE.contains(&limit))
+                .then_some(100)
+        });
         if let Some(target) = target
             && let Err(error) = self.hardware.sysfs.set_battery_limit(target)
         {
@@ -1706,6 +1713,49 @@ mod tests {
                 .join(name);
             fs::create_dir_all(&attribute).unwrap();
             fs::write(attribute.join("current_value"), format!("{watts}\n")).unwrap();
+        }
+    }
+
+    /// Fake sysfs root whose battery reports `threshold` as its charge limit.
+    fn battery_fixture(name: &str, threshold: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "z13helper-battery-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let battery = root.join("class/power_supply/BAT0");
+        fs::create_dir_all(&battery).unwrap();
+        let file = battery.join("charge_control_end_threshold");
+        fs::write(&file, threshold).unwrap();
+        (root, file)
+    }
+
+    #[test]
+    fn observe_ignores_an_out_of_range_external_battery_limit() {
+        // Some kernels/tools (seen on Bazzite) report 0; it is never a real limit.
+        let (root, _) = battery_fixture("observe", "0\n");
+        let mut persisted = PersistedState::default();
+        persisted.state.battery_limit = Some(80);
+        let mut backend = test_backend(persisted, memory_store());
+        backend.hardware.sysfs = Sysfs::new(&root);
+
+        backend.observe();
+
+        assert_eq!(backend.persisted.state.battery_limit, Some(80));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_without_a_saved_limit_only_replaces_an_invalid_one() {
+        for (threshold, restored) in [("0\n", "100\n"), ("80\n", "80\n")] {
+            let (root, file) = battery_fixture("restore", threshold);
+            let mut backend = test_backend(PersistedState::default(), memory_store());
+            backend.hardware.sysfs = Sysfs::new(&root);
+
+            backend.restore_battery_policy();
+
+            assert_eq!(fs::read_to_string(&file).unwrap(), restored);
+            let _ = fs::remove_dir_all(root);
         }
     }
 
