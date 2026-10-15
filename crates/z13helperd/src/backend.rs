@@ -139,16 +139,23 @@ impl PlatformHardware {
     }
 
     fn ppd_proxy() -> Result<zbus::blocking::Proxy<'static>, String> {
-        zbus::blocking::Connection::system()
-            .and_then(|connection| {
-                zbus::blocking::Proxy::new(
-                    &connection,
-                    "net.hadess.PowerProfiles",
-                    "/net/hadess/PowerProfiles",
-                    "net.hadess.PowerProfiles",
-                )
-            })
-            .map_err(|error| error.to_string())
+        const NAME: &str = "net.hadess.PowerProfiles";
+        const PATH: &str = "/net/hadess/PowerProfiles";
+        let connection = zbus::blocking::Connection::system().map_err(|error| error.to_string())?;
+        let running = zbus::blocking::fdo::DBusProxy::new(&connection)
+            .and_then(|dbus| Ok(dbus.name_has_owner(NAME.try_into()?)?))
+            .map_err(|error| error.to_string())?;
+        if !running {
+            // PPD's stock unit is After=multi-user.target, so blocking on its
+            // D-Bus activation during startup deadlocks the apply-settings unit
+            // that multi-user.target waits for. Activate it without waiting;
+            // the next observe tick reads it once it is up.
+            let _ =
+                zbus::blocking::Proxy::new(&connection, NAME, PATH, "org.freedesktop.DBus.Peer")
+                    .and_then(|peer| peer.call_noreply("Ping", &()));
+            return Err("power-profiles-daemon is not running yet".into());
+        }
+        zbus::blocking::Proxy::new(&connection, NAME, PATH, NAME).map_err(|error| error.to_string())
     }
 
     fn ppd_set_blocking(profile: &str) -> Result<(), String> {
