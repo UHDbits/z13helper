@@ -37,6 +37,7 @@ pub fn spawn_resume_watcher(sender: SyncSender<SleepEvent>, terminate: Arc<Atomi
                     {
                         return Ok(());
                     }
+                    crate::wake::notify();
                 }
                 Ok(())
             })();

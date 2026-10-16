@@ -515,6 +515,20 @@ impl ApplyRequest {
         request
     }
 
+    /// The `profile` label the daemon reports after applying this request:
+    /// the PPD base, or `custom` once any override departs from that base.
+    pub fn profile_label(&self) -> &str {
+        if self.power_limits.is_some()
+            || self.fan_curves.is_some()
+            || self.undervolt.is_some()
+            || self.cpu_temp_limit != crate::profile::default_cpu_temp_limit()
+        {
+            "custom"
+        } else {
+            self.ppd_profile.as_deref().unwrap_or("unmanaged")
+        }
+    }
+
     pub fn effective_power_limits(&self) -> Option<TdpState> {
         self.power_limits
             .or_else(|| stock_tdp(self.ppd_profile.as_deref()))
@@ -795,6 +809,20 @@ mod tests {
         assert!(FanHysteresis { up: 1, down: 5 }.validate().is_ok());
         assert!(FanHysteresis { up: 0, down: 3 }.validate().is_err());
         assert!(FanHysteresis { up: 3, down: 6 }.validate().is_err());
+    }
+
+    #[test]
+    fn profile_label_names_the_base_until_an_override_applies() {
+        let mut profile = Profile::builtin("silent", "Silent");
+        assert_eq!(
+            ApplyRequest::from_profile(&profile, false).profile_label(),
+            "power-saver"
+        );
+        profile.apply_power_limits = true;
+        assert_eq!(
+            ApplyRequest::from_profile(&profile, false).profile_label(),
+            "custom"
+        );
     }
 
     #[test]

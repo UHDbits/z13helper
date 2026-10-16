@@ -29,6 +29,7 @@ use z13helperd::protocol::{Dispatch, Effect, Reply, failure, parse_line};
 use z13helperd::resume::{SleepEvent, spawn_resume_watcher};
 use z13helperd::service::{Controller, MODEL};
 use z13helperd::steam::SteamBlocker;
+use z13helperd::wake;
 
 mod logging;
 
@@ -46,6 +47,11 @@ const SLEEP_EVENT_CAPACITY: usize = 4;
 const CONTROLLER_CAPTURE_LEASE: Duration = Duration::from_secs(3);
 const CAPTURE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const CAPTURE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+/// Pump cadence while controller capture needs its timers driven.
+const CAPTURE_PUMP_INTERVAL: Duration = Duration::from_millis(25);
+/// Background telemetry cadence; GetState observes on demand while read.
+const OBSERVE_INTERVAL: Duration = Duration::from_secs(10);
+const HOTPLUG_INTERVAL: Duration = Duration::from_secs(2);
 
 struct Subscriber {
     events: Vec<EventTopic>,
@@ -105,6 +111,12 @@ impl CaptureCoordinator {
             bpf_blocked: false,
             retry_at: None,
         }
+    }
+
+    /// Nothing is captured, pending, or awaiting a retry, so the pump may
+    /// sleep until its next background deadline.
+    fn is_idle(&self) -> bool {
+        !self.desired && self.phase == CapturePhase::Released && !self.bpf_blocked
     }
 
     fn set_desired(&mut self, desired: bool, now: Instant) -> BpfAction {
@@ -596,6 +608,7 @@ fn commit_effects(
             Effect::ControllerCapture(enabled) => {
                 *controller_capture_deadline.lock().unwrap() =
                     enabled.then(|| Instant::now() + CONTROLLER_CAPTURE_LEASE);
+                wake::notify();
             }
         }
     }
@@ -624,6 +637,23 @@ fn subscriber_alive(stream: &UnixStream) -> bool {
         result if result > 0 => true,
         _ => std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock,
     }
+}
+
+/// Sleep until a client connects, a producer or signal wakes the pump, or
+/// `timeout` passes. Every source is re-checked afterwards, so spurious and
+/// interrupted wakes are harmless.
+fn wait_for_work(listener: &UnixListener, wake_reader: &UnixStream, timeout: Duration) {
+    let mut fds = [listener.as_raw_fd(), wake_reader.as_raw_fd()].map(|fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    // Round up so a deadline is never polled repeatedly with a zero timeout.
+    let millis = timeout.as_micros().div_ceil(1_000).min(i32::MAX as u128) as i32;
+    // SAFETY: `fds` is a valid array of initialized pollfd entries whose
+    // descriptors stay open for the duration of the call.
+    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, millis) };
+    wake::drain(wake_reader);
 }
 
 fn prune_subscribers(subscribers: &Arc<Mutex<Vec<Subscriber>>>) {
@@ -752,8 +782,10 @@ fn main() -> Result<()> {
     let terminate = Arc::new(AtomicBool::new(false));
     let lifecycle = Arc::new(Mutex::new(Lifecycle::Active));
     let controller_capture_deadline = Arc::new(Mutex::new(None::<Instant>));
+    let (wake_reader, signal_waker) = wake::install()?;
     for signal in [SIGINT, SIGTERM, SIGHUP] {
         signal_hook::flag::register(signal, Arc::clone(&terminate))?;
+        signal_hook::low_level::pipe::register(signal, signal_waker.try_clone()?)?;
     }
 
     let (event_tx, event_rx) = mpsc::sync_channel(BUTTON_EVENT_CAPACITY);
@@ -828,13 +860,19 @@ fn main() -> Result<()> {
             }
         }
         prune_subscribers(&subscribers);
-        if lifecycle_is_active(&lifecycle) && Instant::now() >= next_observe {
-            let _ = executor.try_observe();
-            next_observe = Instant::now() + Duration::from_secs(1);
+        // Reschedule even while suspended so a past deadline cannot make
+        // the poll below spin with a zero timeout.
+        if Instant::now() >= next_observe {
+            if lifecycle_is_active(&lifecycle) {
+                let _ = executor.try_observe();
+            }
+            next_observe = Instant::now() + OBSERVE_INTERVAL;
         }
-        if lifecycle_is_active(&lifecycle) && Instant::now() >= next_hotplug {
-            let _ = executor.try_hotplug();
-            next_hotplug = Instant::now() + Duration::from_secs(2);
+        if Instant::now() >= next_hotplug {
+            if lifecycle_is_active(&lifecycle) {
+                let _ = executor.try_hotplug();
+            }
+            next_hotplug = Instant::now() + HOTPLUG_INTERVAL;
         }
         while let Ok(event) = event_rx.try_recv() {
             broadcast(&subscribers, event, None, None);
@@ -918,7 +956,14 @@ fn main() -> Result<()> {
             Instant::now(),
             &mut next_steam_retry,
         );
-        thread::sleep(Duration::from_millis(25));
+        let timeout = if capture_requested || !capture.is_idle() {
+            CAPTURE_PUMP_INTERVAL
+        } else {
+            next_observe
+                .min(next_hotplug)
+                .saturating_duration_since(Instant::now())
+        };
+        wait_for_work(&listener, &wake_reader, timeout);
     }
 
     *lifecycle.lock().unwrap() = Lifecycle::ShuttingDown;
@@ -947,7 +992,7 @@ mod tests {
         Barrier, BpfAction, CaptureCoordinator, CapturePhase, CaptureStatus, DeadlineReader,
         Lifecycle, MAX_ACTIVE_CLIENTS, MAX_FRAME_BYTES, MAX_SUBSCRIBERS, SingletonLock,
         bind_socket, encode_frame, lifecycle_is_active, next_barrier, read_request_frame,
-        reconcile_failed_suspend, reserve_slot, subscriber_alive,
+        reconcile_failed_suspend, reserve_slot, subscriber_alive, wait_for_work,
     };
     use std::fs;
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -986,6 +1031,32 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn idle_pump_sleeps_until_timeout_wake_or_connection() {
+        use std::io::Write;
+
+        let dir = TestDir::new();
+        let listener = UnixListener::bind(dir.path("sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (reader, writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+
+        let started = Instant::now();
+        wait_for_work(&listener, &reader, Duration::from_millis(60));
+        assert!(started.elapsed() >= Duration::from_millis(55));
+
+        (&writer).write_all(&[1, 1]).unwrap();
+        let started = Instant::now();
+        wait_for_work(&listener, &reader, Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // The wake was drained, so only a connection ends the next wait early.
+        let _client = UnixStream::connect(dir.path("sock")).unwrap();
+        let started = Instant::now();
+        wait_for_work(&listener, &reader, Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

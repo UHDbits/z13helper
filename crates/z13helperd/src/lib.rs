@@ -13,3 +13,4 @@ pub mod service;
 pub mod state;
 pub mod steam;
 pub mod sysfs;
+pub mod wake;

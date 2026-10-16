@@ -21,6 +21,7 @@ pub const REQUEST_QUEUE_DEADLINE: Duration = Duration::from_secs(10);
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LIFECYCLE_EVENTS: usize = 8;
+const TELEMETRY_MAX_AGE: Duration = Duration::from_millis(900);
 pub const MAX_RETAINED_OUTCOMES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -232,6 +233,7 @@ impl EventQueue {
             // StateChanged is a snapshot invalidation, so coalescing is both
             // bounded and truthful; the next GetState reads the latest cache.
             self.state_changed = true;
+            crate::wake::notify();
         }
     }
 
@@ -244,6 +246,7 @@ impl EventQueue {
             tracing::warn!("lifecycle event queue full; dropped oldest notification");
         }
         self.lifecycle.push_back(event);
+        crate::wake::notify();
     }
 
     fn drain(&mut self) -> Vec<ExecutorEvent> {
@@ -536,6 +539,7 @@ fn run_owner(
     events: Arc<Mutex<EventQueue>>,
     outcomes: Arc<OutcomeStore>,
 ) {
+    let mut observed_at = None;
     while let Ok(operation) = receiver.recv() {
         admission.lock().unwrap().release_queue_slot();
         match operation {
@@ -574,20 +578,20 @@ fn run_owner(
                 // The owner never waits for a client to acknowledge progress;
                 // the bounded reply channel can hold started and completed.
                 let _ = reply.send(WireResponse::progress(request_id, RequestOutcome::Started));
+                // The pump observes slowly while nobody reads state; a reader
+                // gets telemetry no older than one GUI poll interval.
+                if matches!(*command, Command::GetState)
+                    && observed_at.is_none_or(|at: Instant| at.elapsed() >= TELEMETRY_MAX_AGE)
+                {
+                    observe(backend, &events, &mut observed_at);
+                }
                 let response = execute(backend, request_id, *command);
                 complete_command(&events, &outcomes, key, &effects, &response);
                 // A response receiver may be gone. Effects were committed
                 // above and remain independent of this socket write.
                 let _ = reply.send(response);
             }
-            Operation::Observe => {
-                if backend.observe() {
-                    events
-                        .lock()
-                        .unwrap()
-                        .publish_effects(&[Effect::StateChanged]);
-                }
-            }
+            Operation::Observe => observe(backend, &events, &mut observed_at),
             Operation::Hotplug => backend.restore_hotplugged_lighting(),
             Operation::Lifecycle(LifecycleOperation::Suspend) => {
                 backend.shutdown();
@@ -625,6 +629,16 @@ fn run_owner(
     // that path the sole backend owner must release direct EC control.
     backend.shutdown();
     admission.lock().unwrap().mode = AdmissionMode::Stopped;
+}
+
+fn observe(backend: &mut Backend, events: &Mutex<EventQueue>, observed_at: &mut Option<Instant>) {
+    *observed_at = Some(Instant::now());
+    if backend.observe() {
+        events
+            .lock()
+            .unwrap()
+            .publish_effects(&[Effect::StateChanged]);
+    }
 }
 
 fn complete_command(

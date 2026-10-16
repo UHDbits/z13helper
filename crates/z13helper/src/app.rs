@@ -350,6 +350,39 @@ impl AppState {
         self.start_apply(token);
     }
 
+    /// Re-send the active profile when the daemon reports another one, as
+    /// after a restart without its state file. Call only once the power
+    /// source is confirmed: a completed apply is remembered for that source.
+    pub fn reapply_if_daemon_differs(self: &Rc<Self>) {
+        let client = self.client.clone();
+        let state = self.clone();
+        worker::blocking(
+            move || client.get_state(),
+            move |result| {
+                let Ok(status) = result else {
+                    return;
+                };
+                let expected = {
+                    let config = state.config.borrow();
+                    let Some(profile) = config.find(&state.active_profile_id()) else {
+                        return;
+                    };
+                    ApplyRequest::from_profile(profile, config.disable_high_power_fan_protection)
+                        .profile_label()
+                        .to_owned()
+                };
+                if status.profile.as_deref() != Some(expected.as_str()) {
+                    tracing::info!(
+                        daemon = ?status.profile,
+                        %expected,
+                        "daemon is not running the active profile; reapplying"
+                    );
+                    state.apply_active();
+                }
+            },
+        );
+    }
+
     fn start_apply(self: &Rc<Self>, token: ApplyToken) {
         let profile = self.config.borrow().find(&token.id).cloned();
         let disable_high_power = self.config.borrow().disable_high_power_fan_protection;

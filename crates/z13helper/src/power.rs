@@ -98,15 +98,18 @@ fn monotonic_millis() -> u64 {
 fn on_confirmed_transition(state: &Rc<AppState>, on_battery: bool) {
     state.on_battery.set(on_battery);
     state.apply_panel_overdrive_policy();
-    if !state.config.borrow().auto_switch_on_power_source {
-        return;
-    }
-    let id = if on_battery {
-        state.config.borrow().last_profile_on_battery.clone()
-    } else {
-        state.config.borrow().last_profile_on_ac.clone()
+    let id = {
+        let config = state.config.borrow();
+        if on_battery {
+            config.last_profile_on_battery.clone()
+        } else {
+            config.last_profile_on_ac.clone()
+        }
     };
-    if state.active_profile_id() == id {
+    if !state.config.borrow().auto_switch_on_power_source || state.active_profile_id() == id {
+        // Nothing to switch, but the first confirmation after startup is
+        // also when a daemon that lost its state is noticed and repaired.
+        state.reapply_if_daemon_differs();
         return;
     }
     let name = state

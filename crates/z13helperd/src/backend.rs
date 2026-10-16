@@ -20,6 +20,8 @@ use crate::sysfs::Sysfs;
 const MAX_WARNINGS: usize = 32;
 const MAX_WARNING_CHARS: usize = 1024;
 const MAX_FACTORY_CURVE_PROFILES: usize = 8;
+static SYSTEM_BUS: std::sync::Mutex<Option<zbus::blocking::Connection>> =
+    std::sync::Mutex::new(None);
 const BATTERY_LIMIT_RANGE: std::ops::RangeInclusive<i32> = 40..=100;
 
 fn push_warning(warnings: &mut Vec<String>, warning: impl Into<String>) {
@@ -138,10 +140,41 @@ impl PlatformHardware {
         self.direct_snapshot = snapshot;
     }
 
+    /// Reuse one system bus connection instead of authenticating a new one
+    /// on every observe; any PPD failure drops it so the next call reconnects.
+    fn system_bus() -> Result<zbus::blocking::Connection, String> {
+        let mut bus = SYSTEM_BUS.lock().unwrap();
+        if let Some(connection) = bus.as_ref() {
+            return Ok(connection.clone());
+        }
+        let connection = zbus::blocking::Connection::system().map_err(|error| error.to_string())?;
+        *bus = Some(connection.clone());
+        Ok(connection)
+    }
+
+    fn forget_system_bus<T>(result: Result<T, String>) -> Result<T, String> {
+        if result.is_err() {
+            SYSTEM_BUS.lock().unwrap().take();
+        }
+        result
+    }
+
     fn ppd_proxy() -> Result<zbus::blocking::Proxy<'static>, String> {
         const NAME: &str = "net.hadess.PowerProfiles";
         const PATH: &str = "/net/hadess/PowerProfiles";
-        let connection = zbus::blocking::Connection::system().map_err(|error| error.to_string())?;
+        // Uncached proxies skip the AddMatch/GetAll round trips a cached
+        // proxy would repeat each time one is built.
+        let proxy = |connection: &zbus::blocking::Connection,
+                     interface: &'static str|
+         -> zbus::Result<zbus::blocking::Proxy<'static>> {
+            zbus::blocking::proxy::Builder::new(connection)
+                .destination(NAME)?
+                .path(PATH)?
+                .interface(interface)?
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+        };
+        let connection = Self::system_bus()?;
         let running = zbus::blocking::fdo::DBusProxy::new(&connection)
             .and_then(|dbus| Ok(dbus.name_has_owner(NAME.try_into()?)?))
             .map_err(|error| error.to_string())?;
@@ -150,21 +183,26 @@ impl PlatformHardware {
             // D-Bus activation during startup deadlocks the apply-settings unit
             // that multi-user.target waits for. Activate it without waiting;
             // the next observe tick reads it once it is up.
-            let _ =
-                zbus::blocking::Proxy::new(&connection, NAME, PATH, "org.freedesktop.DBus.Peer")
-                    .and_then(|peer| peer.call_noreply("Ping", &()));
+            let _ = proxy(&connection, "org.freedesktop.DBus.Peer")
+                .and_then(|peer| peer.call_noreply("Ping", &()));
             return Err("power-profiles-daemon is not running yet".into());
         }
-        zbus::blocking::Proxy::new(&connection, NAME, PATH, NAME).map_err(|error| error.to_string())
+        proxy(&connection, NAME).map_err(|error| error.to_string())
     }
 
     fn ppd_set_blocking(profile: &str) -> Result<(), String> {
-        Self::ppd_proxy()?
-            .set_property("ActiveProfile", profile)
-            .map_err(|error| error.to_string())
+        Self::forget_system_bus(Self::ppd_proxy().and_then(|proxy| {
+            proxy
+                .set_property("ActiveProfile", profile)
+                .map_err(|error| error.to_string())
+        }))
     }
 
     fn read_ppd() -> Result<(Vec<String>, Option<String>), String> {
+        Self::forget_system_bus(Self::read_ppd_once())
+    }
+
+    fn read_ppd_once() -> Result<(Vec<String>, Option<String>), String> {
         use zbus::zvariant::OwnedValue;
 
         let proxy = Self::ppd_proxy()?;
@@ -481,18 +519,7 @@ impl Backend {
         };
         self.persisted.desired = Some(request.clone());
         self.persisted.state.generation = self.persisted.state.generation.saturating_add(1);
-        self.persisted.state.profile = Some(
-            if request.power_limits.is_some()
-                || request.fan_curves.is_some()
-                || request.undervolt.is_some()
-                || request.cpu_temp_limit != z13helper_core::profile::default_cpu_temp_limit()
-            {
-                "custom"
-            } else {
-                request.ppd_profile.as_deref().unwrap_or("unmanaged")
-            }
-            .into(),
-        );
+        self.persisted.state.profile = Some(request.profile_label().into());
         self.persisted.state.overrides = OverrideState {
             power: request.power_limits.is_some(),
             fans: request.fan_curves.is_some(),
@@ -847,6 +874,7 @@ impl Backend {
     }
 
     pub fn restore_hotplugged_lighting(&mut self) {
+        self.hardware.aura.refresh();
         let connected = self.hardware.aura.take_reconnected();
         for device in connected {
             let state = self
@@ -924,7 +952,6 @@ impl Backend {
         if let Ok(rpms) = sensors::read_fan_rpms() {
             self.persisted.state.fan_rpms = rpms;
         }
-        self.hardware.aura.refresh();
         self.hardware.refresh_ppd();
         self.persisted.state.undervolt_available = self.hardware.undervolt_available;
         self.persisted.state.ppd_profile = self.hardware.ppd_profile.clone();

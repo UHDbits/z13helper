@@ -425,6 +425,7 @@ fn report_status(
 ) {
     if *reported != Some(current) && sender.send(current).is_ok() {
         *reported = Some(current);
+        crate::wake::notify();
     }
 }
 
@@ -840,6 +841,7 @@ fn emit_press(
     sender: &SyncSender<ControllerAction>,
 ) {
     let _ = sender.try_send(action);
+    crate::wake::notify();
     if matches!(
         action,
         ControllerAction::Up
@@ -860,6 +862,7 @@ fn emit_repeats(devices: &mut [ControllerDevice], sender: &SyncSender<Controller
         for (action, deadline) in &mut device.held {
             if now >= *deadline {
                 let _ = sender.try_send(*action);
+                crate::wake::notify();
                 *deadline = now + REPEAT_INTERVAL;
             }
         }
@@ -901,6 +904,7 @@ fn read_events(
         let (event_type, code, value) = decode_event(&event);
         if event_type == EV_KEY && code == KEY_PROG3 && value == 1 {
             let _ = sender.try_send(DaemonEventKind::GuiToggle);
+            crate::wake::notify();
         }
     }
     Ok(())
